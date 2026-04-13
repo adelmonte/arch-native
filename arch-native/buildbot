@@ -1579,19 +1579,12 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
 
 
 def main():
-    # Use the same color argparse uses for section headings ("options:" etc.)
-    # so our custom "commands:" header matches exactly.  _colorize is the
-    # internal module Python 3.14+ argparse delegates to; fall back gracefully
-    # on older versions or when colors are disabled.
     try:
         from _colorize import can_colorize, get_theme
-        if can_colorize():
-            _t = get_theme().argparse
-            _b = lambda s: f"{_t.heading}{s}{_t.reset}"
-        else:
-            _b = lambda s: s
+        _t = get_theme().argparse if can_colorize() else None
     except ImportError:
-        _b = lambda s: s
+        _t = None
+    _b = (lambda s: f"{_t.heading}{s}{_t.reset}") if _t else (lambda s: s)
 
     _DESC = f"""\
 {_b("commands:")}
