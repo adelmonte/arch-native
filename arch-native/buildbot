@@ -1579,8 +1579,17 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
 
 
 def main():
-    _DESC = """\
-commands:
+    # Match Python 3.13 argparse color detection exactly so our custom
+    # description header is bold iff argparse bolds "options:".
+    _use_color = (
+        "NO_COLOR" not in os.environ
+        and sys.stdout.isatty()
+        and os.environ.get("TERM") != "dumb"
+    )
+    _b = (lambda s: f"\x1b[1m{s}\x1b[0m") if _use_color else (lambda s: s)
+
+    _DESC = f"""\
+{_b("commands:")}
     buildbot status
     buildbot doctor
     buildbot built    [-n N]
@@ -1591,7 +1600,7 @@ commands:
     buildbot clear    <PKG> [--all] [--dry-run]
     buildbot sync     [--reset] [--dry-run]
     buildbot init
-    buildbot patch    {create|show|check} <PKG>"""
+    buildbot patch    {{create|show|check}} <PKG>"""
 
     parser = argparse.ArgumentParser(
         prog="buildbot",
