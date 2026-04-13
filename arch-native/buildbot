@@ -186,6 +186,27 @@ def strip_local_pkgrel_bump(version: str) -> str:
     return f"{pkgver}-{base_pkgrel}"
 
 
+def prune_stale_queue_entries(config: dict, manifest_names: set) -> tuple[int, int]:
+    """
+    Remove pending and failed entries for packages no longer in the manifest.
+    Returns (pruned_pending, pruned_failed).
+    """
+    pending = load_pending(config["pending_path"])
+    new_pending = [p for p in pending if p.get("name") in manifest_names]
+    pruned_pending = len(pending) - len(new_pending)
+
+    failed = load_failed(config["failed_path"])
+    new_failed = {k: v for k, v in failed.items() if k in manifest_names}
+    pruned_failed = len(failed) - len(new_failed)
+
+    if pruned_pending:
+        save_pending(config["pending_path"], new_pending)
+    if pruned_failed:
+        save_failed(config["failed_path"], new_failed)
+
+    return pruned_pending, pruned_failed
+
+
 def prune_old_build_logs(log_dir: str, retention_days: int):
     """Remove per-package build logs older than retention_days."""
     if retention_days <= 0:
@@ -578,12 +599,19 @@ def cmd_sync(args, config: dict) -> int:
         return 2
 
     manifest = load_manifest(config["manifest_path"])
+    manifest_names = {p["name"] for p in manifest}
     built = get_built_state(config["state_path"])
     pkgbase_map = build_pkgbase_map()
     needed = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
 
     lock_ctx = _queue_lock(config) if not args.dry_run else nullcontext()
     with lock_ctx:
+        # Prune stale entries for packages no longer installed
+        if not args.dry_run:
+            pp, pf = prune_stale_queue_entries(config, manifest_names)
+            if pp or pf:
+                print(f"pruned stale entries: {pp} pending, {pf} failed removed")
+
         existing = [] if args.reset else load_pending(config["pending_path"])
         existing_names = {p.get("name") for p in existing}
 
@@ -1179,6 +1207,13 @@ def run_daemon(config_path: str, debug: bool):
                     log.debug("No manifest file at %s", manifest_path)
 
             if manifest:
+                manifest_names = {p["name"] for p in manifest}
+
+                # Prune stale pending/failed entries for uninstalled packages
+                pp, pf = prune_stale_queue_entries(config, manifest_names)
+                if pp or pf:
+                    log.info("Pruned stale queue entries: %d pending, %d failed removed", pp, pf)
+
                 built = get_built_state(config["state_path"])
                 new_pkgs = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
 
