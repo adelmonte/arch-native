@@ -47,4 +47,8 @@ package() {
     # Man page
     install -Dm644 "$startdir/buildbot.1" \
         "$pkgdir/usr/share/man/man1/buildbot.1"
+
+    # System user
+    install -Dm644 "$startdir/sysusers.conf" \
+        "$pkgdir/usr/lib/sysusers.d/arch-native.conf"
 }

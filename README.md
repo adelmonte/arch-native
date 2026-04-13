@@ -61,6 +61,7 @@ The package installs:
 - `/usr/lib/systemd/system/arch-native.service`
 - `/usr/share/arch-native/` — nginx example, artix-meson, chroot-pacman.conf
 - `/etc/arch-native.conf` — default config (marked as `backup`, upgrades produce `.pacnew`)
+- `/usr/lib/sysusers.d/arch-native.conf` — creates the `buildbot` system user (via pacman's sysusers hook)
 
 ### 2. Edit the config
 
