@@ -2,6 +2,7 @@
 buildbot_lib.py — Core library for the personal package buildbot.
 """
 
+import fnmatch
 import json
 import logging
 import os
@@ -14,6 +15,10 @@ from pathlib import Path
 
 log = logging.getLogger("buildbot")
 
+
+def _in_blacklist(name: str, blacklist: list[str]) -> bool:
+    """Check if name matches any blacklist entry (exact match or fnmatch pattern)."""
+    return any(name == entry or fnmatch.fnmatch(name, entry) for entry in blacklist)
 
 
 def _load_json_file(path: str, default, label: str):
@@ -309,11 +314,11 @@ def diff_manifest(
             continue
 
         # Skip blacklisted packages and split packages whose pkgbase is blacklisted
-        if name in blacklist:
+        if _in_blacklist(name, blacklist):
             continue
         if pkgbase_map:
             pkgbase = pkgbase_map.get(name)
-            if pkgbase and pkgbase != name and pkgbase in blacklist:
+            if pkgbase and pkgbase != name and _in_blacklist(pkgbase, blacklist):
                 continue
 
         if name not in built:
@@ -660,11 +665,11 @@ def is_eligible(
     if srcinfo["arch"] == ["any"]:
         return False, "arch=any"
 
-    if pkg["name"] in blacklist:
+    if _in_blacklist(pkg["name"], blacklist):
         return False, "blacklisted"
 
     pkgbase = srcinfo.get("pkgbase", "")
-    if pkgbase and pkgbase != pkg["name"] and pkgbase in blacklist:
+    if pkgbase and pkgbase != pkg["name"] and _in_blacklist(pkgbase, blacklist):
         return False, f"pkgbase '{pkgbase}' is blacklisted"
 
     all_deps = srcinfo.get("depends", []) + srcinfo.get("makedepends", [])
