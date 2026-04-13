@@ -1570,82 +1570,160 @@ def run_daemon(config_path: str, debug: bool):
     log.info("Buildbot shutting down cleanly.")
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Hide the auto-generated subcommand list; we supply our own table."""
+    def _format_action(self, action):
+        if hasattr(action, '_name_parser_map'):
+            return ""
+        return super()._format_action(action)
+
+
 def main():
+    _DESC = """\
+commands:
+    buildbot status
+    buildbot doctor
+    buildbot built    [-n N]
+    buildbot logs     <PKG> [-f]
+    buildbot queue    [-n N]
+    buildbot failed   [-n N]
+    buildbot retry    <PKG> [--all] [--dry-run]
+    buildbot clear    <PKG> [--all] [--dry-run]
+    buildbot sync     [--reset] [--dry-run]
+    buildbot init
+    buildbot patch    {create|show|check} <PKG>"""
+
     parser = argparse.ArgumentParser(
         prog="buildbot",
-        description="arch-native package build daemon. No command starts the daemon.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="buildbot <command> [...]",
+        description=_DESC,
+        epilog="use 'buildbot <command> --help' for available options",
+        formatter_class=_HelpFormatter,
     )
     parser.add_argument(
         "--config",
         default="/etc/arch-native.conf",
         metavar="FILE",
-        help="config file (default: /etc/arch-native.conf)",
+        help="config file  (default: /etc/arch-native.conf)",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="verbose logging (daemon mode only)",
+        help="verbose logging  (daemon only)",
     )
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    sub.add_parser("status", help="service state, current build, and queue counts")
-    sub.add_parser("doctor", help="health check: paths, GPG, chroot keyring, JSON integrity")
+    sub.add_parser("status",
+        formatter_class=_HelpFormatter,
+        description="Show service state, the package currently building, queue counts, "
+                    "and stats from the most recent poll cycle.")
+    sub.add_parser("doctor",
+        formatter_class=_HelpFormatter,
+        description="Verify that all required paths exist, JSON state files are valid, "
+                    "the GPG home has correct permissions (0700), and the chroot pacman "
+                    "keyring is initialised.  Safe to run while the service is active.")
 
-    p_built = sub.add_parser("built", help="list successfully built packages")
+    p_built = sub.add_parser("built",
+        usage="buildbot built [-n N]",
+        formatter_class=_HelpFormatter,
+        description="List packages successfully rebuilt by arch-native, newest first.")
     p_built.add_argument("-n", type=int, default=0, dest="limit", metavar="N",
-        help="max entries to show (default: all)")
+        help="max entries to show  (default: all)")
 
-    p_logs = sub.add_parser("logs", help="show the latest build log for a package")
+    p_logs = sub.add_parser("logs",
+        usage="buildbot logs <PKG> [-f]",
+        formatter_class=_HelpFormatter,
+        description="Print the latest build log for PKG.  "
+                    "Use -f to follow in real time.")
     p_logs.add_argument("package", metavar="PKG")
     p_logs.add_argument("-f", "--follow", action="store_true",
-        help="follow the log (like tail -f)")
+        help="follow the log in real time  (like tail -f)")
 
-    p_queue = sub.add_parser("queue", help="list the pending build queue")
+    p_queue = sub.add_parser("queue",
+        usage="buildbot queue [-n N]",
+        formatter_class=_HelpFormatter,
+        description="List the pending build queue.")
     p_queue.add_argument("-n", type=int, default=25, dest="limit", metavar="N",
-        help="max entries to show (default: 25)")
+        help="max entries to show  (default: 25)")
 
-    p_failed = sub.add_parser("failed", help="list failed builds")
+    p_failed = sub.add_parser("failed",
+        usage="buildbot failed [-n N]",
+        formatter_class=_HelpFormatter,
+        description="List failed builds with failure reason and retry count.")
     p_failed.add_argument("-n", type=int, default=0, dest="limit", metavar="N",
-        help="max entries (default: all)")
+        help="max entries to show  (default: all)")
 
-    p_retry = sub.add_parser("retry", help="move failed packages back to the queue")
+    p_retry = sub.add_parser("retry",
+        usage="buildbot retry <PKG> [--all] [--dry-run]",
+        formatter_class=_HelpFormatter,
+        description="Re-queue failed package(s) for another build attempt.  "
+                    "Requires the service to be stopped first.")
     p_retry.add_argument("packages", nargs="*", metavar="PKG")
-    p_retry.add_argument("--all", action="store_true", help="retry every failed package")
-    p_retry.add_argument("--dry-run", action="store_true")
+    p_retry.add_argument("--all", action="store_true",
+        help="re-queue every failed package")
+    p_retry.add_argument("--dry-run", action="store_true",
+        help="show what would be re-queued without writing")
 
-    p_clear = sub.add_parser("clear", help="remove packages from the failed list")
+    p_clear = sub.add_parser("clear",
+        usage="buildbot clear <PKG> [--all] [--dry-run]",
+        formatter_class=_HelpFormatter,
+        description="Remove package(s) from the failed list without re-queuing them.  "
+                    "Requires the service to be stopped first.")
     p_clear.add_argument("packages", nargs="*", metavar="PKG")
-    p_clear.add_argument("--all", action="store_true", help="clear the entire failed list")
-    p_clear.add_argument("--dry-run", action="store_true")
+    p_clear.add_argument("--all", action="store_true",
+        help="clear the entire failed list")
+    p_clear.add_argument("--dry-run", action="store_true",
+        help="show what would be cleared without writing")
 
     p_sync = sub.add_parser("sync",
-        help="recompute the pending queue from the manifest")
+        usage="buildbot sync [--reset] [--dry-run]",
+        formatter_class=_HelpFormatter,
+        description="Diff the installed package list against built.json and queue any "
+                    "new or updated packages.  Requires the service to be stopped first.")
     p_sync.add_argument("--reset", action="store_true",
-        help="clear the queue first, then rebuild from scratch")
-    p_sync.add_argument("--dry-run", action="store_true")
+        help="clear the existing queue first, then rebuild from scratch")
+    p_sync.add_argument("--dry-run", action="store_true",
+        help="show what would be queued without writing")
 
     sub.add_parser("init",
-        help="bootstrap a new installation: create chroot, init keyring, set up dirs")
+        formatter_class=_HelpFormatter,
+        description="Initialise a new arch-native installation: create the directory "
+                    "layout under /var/lib/arch-native/, build the clean devtools chroot, "
+                    "initialise the pacman keyring, and generate the GPG signing key.  "
+                    "Safe to re-run — skips steps already complete.")
 
-    p_patch = sub.add_parser("patch", help="manage local PKGBUILD patches")
+    p_patch = sub.add_parser("patch",
+        usage="buildbot patch {create|show|check} <PKG>",
+        formatter_class=_HelpFormatter,
+        description="Manage local PKGBUILD patches stored in "
+                    "/var/lib/arch-native/pkgbuilds/local/.")
     patch_sub = p_patch.add_subparsers(dest="patch_cmd", metavar="SUBCOMMAND")
 
     p_pc = patch_sub.add_parser("create",
-        help="create a local patch by editing the upstream PKGBUILD in $EDITOR")
+        usage="buildbot patch create [--force] <PKG>",
+        formatter_class=_HelpFormatter,
+        description="Open the upstream PKGBUILD for PKG in $EDITOR and save the diff "
+                    "as a local patch.")
     p_pc.add_argument("pkgname", metavar="PKG")
     p_pc.add_argument("--force", action="store_true",
-        help="overwrite existing patch with a fresh copy of upstream")
+        help="overwrite an existing patch with a fresh copy of upstream")
 
-    p_ps = patch_sub.add_parser("show", help="print the local patch for a package")
+    p_ps = patch_sub.add_parser("show",
+        usage="buildbot patch show <PKG>",
+        formatter_class=_HelpFormatter,
+        description="Print the local patch for PKG.")
     p_ps.add_argument("pkgname", metavar="PKG")
 
     p_pck = patch_sub.add_parser("check",
-        help="verify local patch(es) still apply against current upstream")
+        usage="buildbot patch check <PKG>  |  buildbot patch check --all",
+        formatter_class=_HelpFormatter,
+        description="Verify that the local patch for PKG (or all patches with --all) "
+                    "still applies cleanly against the current upstream PKGBUILD.")
     p_pck_group = p_pck.add_mutually_exclusive_group(required=True)
     p_pck_group.add_argument("pkgname", nargs="?", metavar="PKG")
-    p_pck_group.add_argument("--all", action="store_true", help="check every local patch")
+    p_pck_group.add_argument("--all", action="store_true",
+        help="check every local patch")
 
     args = parser.parse_args()
     if args.command:

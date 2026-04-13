@@ -1,0 +1,213 @@
+.TH BUILDBOT 1 "April 2026" "arch\-native" "User Commands"
+.\" ────────────────────────────────────────────────────────────────────────
+.SH NAME
+buildbot \- arch\-native package build daemon and CLI
+.SH SYNOPSIS
+.B buildbot
+.I COMMAND
+.RI [ options ]
+.br
+.B buildbot
+.RB [ \-\-config
+.IR file ]
+.RB [ \-\-debug ]
+.SH DESCRIPTION
+.B buildbot
+is the daemon and CLI for
+.BR arch\-native ,
+a self\-hosted build system that rebuilds installed Arch (or Artix) Linux
+packages from source with CPU\-optimised compiler flags, signs the resulting
+packages with GPG, and publishes them as a local pacman repository.
+.PP
+Invoked without a
+.I COMMAND
+it starts the build daemon.
+Invoked with a command it runs the CLI and exits immediately.
+.SH COMMANDS
+.SS status
+Show service state, the package currently being built, queue and failure
+counts, and stats from the most recent poll cycle.
+.SS doctor
+Verify that all required paths exist, JSON state files are valid, the GPG
+home has correct permissions (0700), and the chroot pacman keyring is
+initialised.
+Safe to run while the service is active.
+.SS built [\-n \fIN\fR]
+List packages successfully rebuilt by arch\-native, newest first.
+.TP
+.BI \-n " N"
+Limit output to the
+.I N
+most recent entries (default: all).
+.SS logs \fIPKG\fR [\-f]
+Print the latest build log for
+.IR PKG .
+.TP
+.BR \-f ", " \-\-follow
+Follow the log in real time (equivalent to
+.BR "tail \-f" ).
+Useful while a build is in progress.
+.SS queue [\-n \fIN\fR]
+List the pending build queue.
+.TP
+.BI \-n " N"
+Limit output to the first
+.I N
+entries (default: 25).
+.SS failed [\-n \fIN\fR]
+List failed builds with failure reason and retry count.
+.TP
+.BI \-n " N"
+Limit output to the first
+.I N
+entries (default: all).
+.SS retry \fIPKG\fR [\-\-all] [\-\-dry\-run]
+Re\-queue failed package(s) for another build attempt.
+Requires the service to be stopped first.
+.TP
+.B \-\-all
+Re\-queue every failed package.
+.TP
+.B \-\-dry\-run
+Show what would be re\-queued without writing.
+.SS clear \fIPKG\fR [\-\-all] [\-\-dry\-run]
+Remove package(s) from the failed list without re\-queuing them.
+Requires the service to be stopped first.
+.TP
+.B \-\-all
+Clear the entire failed list.
+.TP
+.B \-\-dry\-run
+Show what would be cleared without writing.
+.SS sync [\-\-reset] [\-\-dry\-run]
+Diff the installed package list against
+.I built.json
+and queue any new or updated packages.
+Requires the service to be stopped first.
+.TP
+.B \-\-reset
+Clear the existing queue first, then rebuild from scratch.
+.TP
+.B \-\-dry\-run
+Show what would be queued without writing.
+.SS init
+Initialise a new arch\-native installation: create the directory layout
+under
+.IR /var/lib/arch\-native/ ,
+build the clean devtools chroot, initialise the pacman keyring, and
+generate the GPG signing key.
+Safe to re\-run \(em skips steps already complete.
+.SS "patch {create|show|check} \fIPKG\fR"
+Manage local PKGBUILD patches stored in
+.IR /var/lib/arch\-native/pkgbuilds/local/ .
+.TP
+.BI "patch create " PKG " [\-\-force]"
+Resolve the upstream PKGBUILD for
+.I PKG
+(using
+.BR repo_priority ),
+open it in
+.BR $EDITOR ,
+and save the diff as a local patch.
+.B \-\-force
+overwrites an existing patch with a fresh copy of upstream.
+.TP
+.BI "patch show " PKG
+Print the local patch for
+.IR PKG .
+.TP
+.BI "patch check " "PKG " | " \-\-all"
+Verify that the local patch for
+.I PKG
+(or all patches with
+.BR \-\-all )
+still applies cleanly against the current upstream PKGBUILD.
+.SH OPTIONS
+.TP
+.BI \-\-config " file"
+Path to the configuration file.
+Default:
+.IR /etc/arch\-native.conf .
+.TP
+.B \-\-debug
+Enable verbose (DEBUG\-level) logging.
+Daemon mode only.
+.SH FILES
+.TP
+.I /etc/arch\-native.conf
+Main configuration file.
+.TP
+.I /var/lib/arch\-native/built.json
+Record of every package successfully rebuilt, with version and timestamp.
+.TP
+.I /var/lib/arch\-native/pending.json
+The build queue.
+.TP
+.I /var/lib/arch\-native/failed.json
+Packages that failed to build, with failure reason and retry count.
+.TP
+.I /var/lib/arch\-native/in_progress.json
+Package currently being built; re\-inserted at the front of the queue on
+daemon restart for crash recovery.
+.TP
+.I /var/lib/arch\-native/metrics.json
+Last\-cycle statistics (succeeded, failed, skipped counts and timestamps).
+.TP
+.I /var/lib/arch\-native/logs/<pkg>/
+Per\-package build logs, one file per build attempt.
+LTO\-retry runs are saved as
+.IR YYYYMMDD\-HHMMSS\-nolto.log .
+.TP
+.I /var/lib/arch\-native/pkgbuilds/local/<pkg>/<pkg>.patch
+Local PKGBUILD patches managed by
+.BR "buildbot patch" .
+.SH EXAMPLES
+Check the current build state:
+.PP
+.RS 4
+.EX
+buildbot status
+.EE
+.RE
+.PP
+Follow the build log for firefox as it builds:
+.PP
+.RS 4
+.EX
+buildbot logs firefox \-f
+.EE
+.RE
+.PP
+Re\-queue a single failed package:
+.PP
+.RS 4
+.EX
+sudo systemctl stop arch\-native
+sudo buildbot retry networkmanager
+sudo systemctl start arch\-native
+.EE
+.RE
+.PP
+Rebuild the pending queue after a large package sync:
+.PP
+.RS 4
+.EX
+sudo systemctl stop arch\-native
+sudo buildbot sync \-\-reset
+sudo systemctl start arch\-native
+.EE
+.RE
+.PP
+Create a local patch to fix a build failure:
+.PP
+.RS 4
+.EX
+sudo buildbot patch create xvidcore
+.EE
+.RE
+.SH SEE ALSO
+.BR pacman (8),
+.BR makechrootpkg (1),
+.BR makepkg (8),
+.BR repo\-add (8),
+.BR arch\-native.conf (5)

@@ -35,4 +35,16 @@ package() {
 
     # Default config (pacman marks this as a backup — upgrades create .pacnew)
     install -Dm644 "$startdir/arch-native.conf" "$pkgdir/etc/arch-native.conf"
+
+    # Shell completions
+    install -Dm644 "$startdir/completions/buildbot.bash" \
+        "$pkgdir/usr/share/bash-completion/completions/buildbot"
+    install -Dm644 "$startdir/completions/_buildbot" \
+        "$pkgdir/usr/share/zsh/site-functions/_buildbot"
+    install -Dm644 "$startdir/completions/buildbot.fish" \
+        "$pkgdir/usr/share/fish/vendor_completions.d/buildbot.fish"
+
+    # Man page
+    install -Dm644 "$startdir/buildbot.1" \
+        "$pkgdir/usr/share/man/man1/buildbot.1"
 }

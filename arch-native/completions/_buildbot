@@ -1,0 +1,126 @@
+#compdef buildbot
+# zsh completion for buildbot(1)
+# Source: /usr/share/zsh/site-functions/_buildbot
+
+# ---------------------------------------------------------------------------
+# Dynamic completions
+# ---------------------------------------------------------------------------
+_buildbot_failed_pkgs() {
+    compadd -- ${(f)"$(python3 -c \
+        "import json; [print(k) for k in json.load(open('/var/lib/arch-native/failed.json')).keys()]" \
+        2>/dev/null)"}
+}
+
+_buildbot_built_pkgs() {
+    compadd -- ${(f)"$(python3 -c \
+        "import json; [print(k) for k in json.load(open('/var/lib/arch-native/built.json')).keys()]" \
+        2>/dev/null)"}
+}
+
+_buildbot_local_patches() {
+    compadd -- $(command ls /var/lib/arch-native/pkgbuilds/local/ 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# patch subcommand dispatcher
+# ---------------------------------------------------------------------------
+_buildbot_patch() {
+    local curcontext="$curcontext" state
+    _arguments -C \
+        '1: :_buildbot_patch_cmds' \
+        '*:: :->patch_args' || return
+
+    [[ $state == patch_args ]] || return
+
+    case ${words[1]} in
+        create)
+            _arguments \
+                '--force[overwrite existing patch with fresh upstream copy]' \
+                '1:package:'
+            ;;
+        show)
+            _arguments '1:package:_buildbot_local_patches'
+            ;;
+        check)
+            _arguments \
+                '(1)--all[check every local patch]' \
+                '(--all)1:package:_buildbot_local_patches'
+            ;;
+    esac
+}
+
+_buildbot_patch_cmds() {
+    local cmds=(
+        'create:open upstream PKGBUILD in $EDITOR and save the diff as a local patch'
+        'show:print the local patch for a package'
+        'check:verify a local patch still applies against current upstream'
+    )
+    _describe 'patch subcommand' cmds
+}
+
+# ---------------------------------------------------------------------------
+# Top-level completion
+# ---------------------------------------------------------------------------
+_buildbot() {
+    local curcontext="$curcontext" state
+    _arguments -C \
+        '--config=[config file]:file:_files' \
+        '--debug[verbose logging (daemon mode only)]' \
+        '1: :_buildbot_cmds' \
+        '*:: :->subcmd' || return
+
+    [[ $state == subcmd ]] || return
+    curcontext="${curcontext%:*:*}:buildbot-${words[1]}:"
+
+    case ${words[1]} in
+        status|doctor|init)
+            ;;
+        built|queue|failed)
+            _arguments '-n[max entries to show]:count:'
+            ;;
+        logs)
+            _arguments \
+                '(-f --follow)'{-f,--follow}'[follow the log in real time]' \
+                '1:package:_buildbot_built_pkgs'
+            ;;
+        retry)
+            _arguments \
+                '--all[re-queue every failed package]' \
+                '--dry-run[preview without writing]' \
+                '*:package:_buildbot_failed_pkgs'
+            ;;
+        clear)
+            _arguments \
+                '--all[clear the entire failed list]' \
+                '--dry-run[preview without writing]' \
+                '*:package:_buildbot_failed_pkgs'
+            ;;
+        sync)
+            _arguments \
+                '--reset[clear queue first, then rebuild from scratch]' \
+                '--dry-run[preview without writing]'
+            ;;
+        patch)
+            _buildbot_patch
+            ;;
+    esac
+}
+
+_buildbot_cmds() {
+    local cmds=(
+        'status:service state, queue counts, and last-run stats'
+        'doctor:check paths, JSON files, GPG home, and chroot keyring'
+        'built:list rebuilt packages'
+        'logs:print or follow the build log for a package'
+        'queue:list the pending build queue'
+        'failed:list failed builds'
+        'retry:re-queue failed package(s)'
+        'clear:drop package(s) from the failed list'
+        'sync:rebuild queue from manifest'
+        'init:initialize a new installation'
+        'patch:manage local PKGBUILD patches'
+    )
+    _describe 'command' cmds
+}
+
+_buildbot "$@"
