@@ -40,9 +40,10 @@ The daemon runs on a dedicated build server. A pacman hook on your desktop
 rsync after each transaction. The server resolves, builds, signs, and publishes
 packages for the desktop to pull.
 
-Good for: when your CPU is too new to run its own compiled binaries (cross-
-compiling for a CPU the build server doesn't support), or when you want builds
-to happen on a separate machine.
+Good for: when your desktop CPU is newer than the build server's, so binaries
+compiled for it would SIGILL on the build server (e.g. targeting `pantherlake`
+on a server that only has `znver3`); or when you simply want builds offloaded to
+a separate machine.
 
 ---
 
@@ -202,10 +203,11 @@ distro = arch
 ```ini
 # Order in which PKGBUILD sources are checked (left = higher priority).
 # Supported tiers: local, artix, cachyos, arch
-repo_priority = local,arch
+# Default: local,artix,cachyos,arch
+repo_priority = local,artix,cachyos,arch
 
-# Artix users typically want:
-# repo_priority = local,artix,cachyos,arch
+# Arch (non-Artix) users who don't want the artix/cachyos tiers:
+# repo_priority = local,arch
 ```
 
 ### Blacklists
@@ -316,8 +318,9 @@ pending are counted in both rebuilt and pending.
 ```
 buildbot doctor
 ```
-Checks: paths exist, JSON files are valid, GPG key is present, chroot keyring
-is initialized. Run this after `buildbot init` to confirm setup.
+Checks: paths exist, JSON files are valid, gnupg home has correct permissions
+(0700), chroot keyring is initialized. Run this after `buildbot init` to
+confirm setup.
 
 ```
 buildbot built [-n N]
@@ -359,6 +362,7 @@ sudo buildbot clear firefox
 
 # Recompute the pending queue from the current installed package list.
 # Use --reset to clear existing queue first (removes stale entries).
+# Use --dry-run to preview what would be added without writing anything.
 sudo buildbot sync --reset
 
 sudo systemctl start arch-native
@@ -461,7 +465,7 @@ Build server — main loop (every 300s):
 
 ### PKGBUILD tier resolution
 
-Priority is set by `repo_priority` (default: `local,arch`). First match wins.
+Priority is set by `repo_priority` (default: `local,artix,cachyos,arch`). First match wins.
 
 | Tier | Source | Notes |
 |---|---|---|
