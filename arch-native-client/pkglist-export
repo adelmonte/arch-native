@@ -23,9 +23,9 @@ source "$CONFIG_FILE"
 : "${REMOTE_PATH:?REMOTE_PATH not set in $CONFIG_FILE}"
 
 EXPORT_FILE=$(mktemp /tmp/pkglist-export-XXXXXX.json)
-SSH_OPTS="-o StrictHostKeyChecking=accept-new"
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 if [[ -n "${SSH_KEY:-}" ]]; then
-    SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
+    SSH_OPTS+=(-i "$SSH_KEY")
 fi
 
 REMOTE="${REMOTE_HOST}:${REMOTE_PATH}"
@@ -65,7 +65,7 @@ print(json.dumps(packages, indent=2))
 
 PKG_COUNT=$(python3 -c "import json; print(len(json.load(open('$EXPORT_FILE'))))")
 
-rsync -az --checksum -e "ssh ${SSH_OPTS}" "$EXPORT_FILE" "$REMOTE"
+rsync -az --checksum -e "ssh ${SSH_OPTS[*]}" "$EXPORT_FILE" "$REMOTE"
 
 rm -f "$EXPORT_FILE"
 logger -t pkglist-export "Synced $PKG_COUNT packages to $REMOTE_HOST"

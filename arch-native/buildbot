@@ -100,7 +100,7 @@ def load_config(path: str) -> dict:
     cfg["poll_interval"] = sec.getint("poll_interval", 300)
     cfg["skip_pgp_on_import_failure"] = sec.getboolean("skip_pgp_on_import_failure", False)
     cfg["upstream_check_interval"] = sec.getint("upstream_check_interval", 3600)
-    cfg["build_timeout"] = sec.getint("build_timeout", 7200)
+    cfg["build_timeout"] = sec.getint("build_timeout", 14400)
     cfg["download_retry_limit"] = sec.getint("download_retry_limit", 3)
     cfg["log_level"] = sec.get("log_level", "INFO")
 
@@ -579,7 +579,8 @@ def cmd_sync(args, config: dict) -> int:
 
     manifest = load_manifest(config["manifest_path"])
     built = get_built_state(config["state_path"])
-    needed = diff_manifest(manifest, built)
+    pkgbase_map = build_pkgbase_map()
+    needed = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
 
     lock_ctx = _queue_lock(config) if not args.dry_run else nullcontext()
     with lock_ctx:
@@ -1106,6 +1107,24 @@ def run_daemon(config_path: str, debug: bool):
 
     recovered = load_in_progress(config)
     if recovered:
+        # Warn if the in-progress record is suspiciously old (indicates a very
+        # long-running or hung build before the crash, not a clean restart).
+        started_at_str = recovered.get("started_at")
+        if started_at_str:
+            try:
+                from datetime import timezone as _tz
+                started_at = datetime.fromisoformat(started_at_str)
+                age_secs = (datetime.now(_tz.utc) - started_at).total_seconds()
+                timeout = config.get("build_timeout") or 0
+                stale_threshold = timeout * 2 if timeout else 86400  # 24h if timeout disabled
+                if age_secs > stale_threshold:
+                    log.warning(
+                        "in_progress record for %s is %.1fh old (started_at=%s) — "
+                        "may be from a hung build; re-queuing anyway",
+                        recovered.get("name"), age_secs / 3600, started_at_str,
+                    )
+            except Exception:
+                pass
         pending = load_pending(config["pending_path"])
         pending_names = {p.get("name") for p in pending}
         if recovered.get("name") not in pending_names:
@@ -1149,9 +1168,13 @@ def run_daemon(config_path: str, debug: bool):
                     current_mtime = os.stat(manifest_path).st_mtime
                     if current_mtime != last_manifest_mtime:
                         log.info("Manifest change detected (mtime: %s)", datetime.fromtimestamp(current_mtime))
-                        last_manifest_mtime = current_mtime
-                        manifest = load_manifest(manifest_path)
-                        log.info("Loaded manifest with %d packages", len(manifest))
+                        new_manifest = load_manifest(manifest_path)
+                        if new_manifest:
+                            last_manifest_mtime = current_mtime
+                            manifest = new_manifest
+                            log.info("Loaded manifest with %d packages", len(manifest))
+                        else:
+                            log.warning("Manifest at %s loaded empty — may be mid-write, will retry", manifest_path)
                 else:
                     log.debug("No manifest file at %s", manifest_path)
 

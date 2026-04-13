@@ -790,10 +790,14 @@ def bump_pkgrel(pkgbuild_path: str, srcinfo: dict) -> str:
     else:
         new_rel = f"{current_rel}.1"
 
-    content = RE_PKGREL.sub(f"pkgrel={new_rel}", content)
+    new_content = RE_PKGREL.sub(f"pkgrel={new_rel}", content)
+    if new_content == content:
+        raise RuntimeError(
+            f"bump_pkgrel: could not find pkgrel= in {pkgbuild_path} — PKGBUILD may be malformed"
+        )
 
     with open(pkgbuild_path, "w") as f:
-        f.write(content)
+        f.write(new_content)
 
     epoch = srcinfo.get("epoch", "")
     pkgver = srcinfo["pkgver"]
@@ -1095,10 +1099,18 @@ def save_pending(pending_path: str, pending: list[dict]):
 # ---------------------------------------------------------------------------
 def vercmp(a: str, b: str) -> int:
     """Wrap the system vercmp binary. Returns -1, 0, or 1."""
-    result = subprocess.run(
-        ["vercmp", a, b], capture_output=True, text=True
-    )
-    return int(result.stdout.strip())
+    try:
+        result = subprocess.run(
+            ["vercmp", a, b], capture_output=True, text=True
+        )
+        output = result.stdout.strip()
+        if not output:
+            raise ValueError(f"vercmp produced no output for {a!r} vs {b!r} (exit {result.returncode})")
+        return int(output)
+    except FileNotFoundError:
+        raise RuntimeError("vercmp binary not found — is pacman installed?") from None
+    except ValueError as e:
+        raise RuntimeError(f"vercmp returned unexpected output: {e}") from None
 
 
 # ---------------------------------------------------------------------------
