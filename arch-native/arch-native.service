@@ -1,0 +1,17 @@
+[Unit]
+Description=arch-native package build daemon
+After=network.target nginx.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/buildbot --config /etc/arch-native.conf
+Restart=on-failure
+RestartSec=30
+User=root
+StandardOutput=journal
+StandardError=journal
+KillMode=control-group
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

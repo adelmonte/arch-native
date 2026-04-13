@@ -1,0 +1,2 @@
+Server = https://mirror1.artixlinux.org/repos/$repo/os/$arch
+Server = https://mirror.pascalpuffke.de/artix-linux/$repo/os/$arch

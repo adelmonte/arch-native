@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Remove
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Syncing package list to arch-native build server...
+When = PostTransaction
+Exec = /usr/bin/pkglist-export

@@ -1,0 +1,11 @@
+# arch-native-client configuration
+# Copy this file to /etc/arch-native-client.conf and fill in your values.
+
+# SSH user and host (or IP) of the arch-native build server
+REMOTE_HOST="user@build-server"
+
+# Path on the remote host where the package manifest is written
+REMOTE_PATH="/var/lib/arch-native/manifests/client.json"
+
+# SSH private key to use for the rsync connection (leave empty to use ssh-agent / default key)
+# SSH_KEY="/home/user/.ssh/id_ed25519"

@@ -1,0 +1,38 @@
+# Maintainer: adelmonte
+pkgname=arch-native
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Rebuild installed Arch packages from source with CPU-optimized flags"
+arch=('any')
+license=('MIT')
+depends=('python' 'devtools' 'pacman' 'gnupg' 'rsync')
+optdepends=(
+    'nginx: to serve the local repo over HTTP'
+    'artix-mirrorlist: for Artix Linux chroot support'
+)
+backup=('etc/arch-native.conf')
+install=arch-native.install
+
+package() {
+    # Binary
+    install -Dm755 "$startdir/buildbot"         "$pkgdir/usr/bin/buildbot"
+
+    # Library
+    install -Dm644 "$startdir/buildbot_lib.py"  "$pkgdir/usr/lib/arch-native/buildbot_lib.py"
+
+    # Systemd service
+    install -Dm644 "$startdir/arch-native.service" \
+        "$pkgdir/usr/lib/systemd/system/arch-native.service"
+
+    # Shared files (arch/artix support files)
+    install -Dm755 "$startdir/artix-meson"      "$pkgdir/usr/share/arch-native/artix-meson"
+    install -Dm644 "$startdir/artix-mirrorlist" "$pkgdir/usr/share/arch-native/artix-mirrorlist"
+    install -Dm644 "$startdir/chroot-pacman.conf" \
+        "$pkgdir/usr/share/arch-native/chroot-pacman.conf"
+
+    # nginx config example
+    install -Dm644 "$startdir/nginx.conf"       "$pkgdir/usr/share/arch-native/nginx.conf.example"
+
+    # Default config (pacman marks this as a backup — upgrades create .pacnew)
+    install -Dm644 "$startdir/arch-native.conf" "$pkgdir/etc/arch-native.conf"
+}

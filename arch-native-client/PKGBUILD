@@ -1,0 +1,22 @@
+# Maintainer: adelmonte
+pkgname=arch-native-client
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Client-side pacman hook for arch-native: syncs installed package list to the build server"
+arch=('any')
+license=('MIT')
+depends=('rsync' 'pacman' 'python')
+install=arch-native-client.install
+
+package() {
+    # Sync script
+    install -Dm755 "$startdir/pkglist-export"   "$pkgdir/usr/bin/pkglist-export"
+
+    # Pacman hook (fires after every transaction)
+    install -Dm644 "$startdir/pkglist-export.hook" \
+        "$pkgdir/usr/share/libalpm/hooks/pkglist-export.hook"
+
+    # Example config
+    install -Dm644 "$startdir/arch-native-client.conf.example" \
+        "$pkgdir/usr/share/arch-native-client/arch-native-client.conf.example"
+}

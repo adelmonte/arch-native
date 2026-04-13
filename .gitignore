@@ -1,0 +1,15 @@
+*.pyc
+__pycache__/
+*.swp
+*.swo
+.DS_Store
+
+# personal (keep local only)
+FORGE.md
+deploy
+
+# makepkg build artifacts
+*.pkg.tar.zst
+*.pkg.tar.xz
+pkg/
+src/

@@ -1,0 +1,1637 @@
+#!/usr/bin/env python3
+"""
+buildbot — arch-native package build daemon.
+
+Watches a client manifest (remote mode) or local pacman DB (local mode),
+resolves PKGBUILDs, builds packages in a clean chroot with the configured
+-march, signs them, and publishes to a pacman repo.
+"""
+
+import argparse
+import configparser
+import json
+import logging
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from contextlib import contextmanager, nullcontext
+
+sys.path.insert(0, "/usr/lib/arch-native")
+from buildbot_lib import (
+    load_manifest,
+    read_local_packages,
+    generate_makepkg_conf,
+    get_built_state,
+    save_built_state,
+    diff_manifest,
+    build_pkgbase_map,
+    resolve_pkgbuild,
+    parse_srcinfo,
+    is_eligible,
+    prepare_gnupg_home,
+    import_pgp_keys,
+    bump_pkgrel,
+    build_package,
+    sign_packages,
+    add_to_repo,
+    update_built_state,
+    load_failed,
+    save_failed,
+    load_pending,
+    save_pending,
+    vercmp,
+    upgrade_chroot,
+    ignore_special_files,
+)
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+shutdown_flag = False
+log = logging.getLogger("buildbot")
+
+def handle_sigterm(signum, frame):
+    global shutdown_flag
+    log.info("Received signal %d, finishing current work and shutting down...", signum)
+    shutdown_flag = True
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+def load_config(path: str) -> dict:
+    cp = configparser.ConfigParser()
+    cp.read(path)
+
+    # Accept either [arch-native] or legacy [buildbot] section name
+    if "arch-native" in cp:
+        sec = cp["arch-native"]
+    elif "buildbot" in cp:
+        sec = cp["buildbot"]
+    else:
+        raise KeyError(f"Config file {path!r} must have an [arch-native] section")
+
+    DATA = "/var/lib/arch-native"
+    cfg = {}
+    cfg["repo_name"] = sec.get("repo_name", "forge")
+    repo_name = cfg["repo_name"]
+    cfg["march"] = sec.get("march", "native")
+    cfg["chroot_dir"] = sec.get("chroot_dir", f"{DATA}/chroots")
+    cfg["chroot_root"] = sec.get("chroot_root", f"{DATA}/chroots/root")
+    cfg["repo_dir"] = sec.get("repo_dir", f"{DATA}/repo")
+    cfg["repo_db"] = sec.get("repo_db", f"{DATA}/repo/{repo_name}.db.tar.zst")
+    cfg["pkgbuilds_dir"] = sec.get("pkgbuilds_dir", f"{DATA}/pkgbuilds")
+    cfg["makepkg_configs_dir"] = sec.get("makepkg_configs_dir", f"{DATA}/makepkg-configs")
+    cfg["manifest_path"] = sec.get("manifest_path", f"{DATA}/manifests/client.json")
+    cfg["gnupg_home"] = sec.get("gnupg_home", f"{DATA}/gnupg")
+    cfg["build_user"] = sec.get("build_user", "buildbot")
+    cfg["state_path"] = sec.get("state_path", f"{DATA}/built.json")
+    cfg["pending_path"] = sec.get("pending_path", f"{DATA}/pending.json")
+    cfg["failed_path"] = sec.get("failed_path", f"{DATA}/failed.json")
+    cfg["log_dir"] = sec.get("log_dir", f"{DATA}/logs")
+    cfg["metrics_path"] = sec.get("metrics_path", f"{DATA}/metrics.json")
+    cfg["in_progress_path"] = sec.get("in_progress_path", f"{DATA}/in_progress.json")
+    cfg["log_retention_days"] = sec.getint("log_retention_days", 7)
+    cfg["poll_interval"] = sec.getint("poll_interval", 300)
+    cfg["skip_pgp_on_import_failure"] = sec.getboolean("skip_pgp_on_import_failure", False)
+    cfg["upstream_check_interval"] = sec.getint("upstream_check_interval", 3600)
+    cfg["build_timeout"] = sec.getint("build_timeout", 7200)
+    cfg["download_retry_limit"] = sec.getint("download_retry_limit", 3)
+    cfg["log_level"] = sec.get("log_level", "INFO")
+
+    # Mode: local = build on the same machine you run the packages on.
+    # remote = dedicated build server (current/default setup).
+    mode = sec.get("mode", "remote").strip().lower()
+    if mode not in ("local", "remote"):
+        log.warning("Unknown mode '%s', defaulting to 'remote'", mode)
+        mode = "remote"
+    cfg["mode"] = mode
+
+    # In local mode default march to native if not explicitly set
+    if mode == "local" and not sec.get("march"):
+        cfg["march"] = "native"
+
+    # Distro: controls Artix-specific chroot fixups.
+    # "artix" installs libelogind/elogind/libudev and deploys artix-meson.
+    # "arch" skips all of that for a clean Arch chroot.
+    distro = sec.get("distro", "artix").strip().lower()
+    if distro not in ("artix", "arch"):
+        log.warning("Unknown distro '%s', defaulting to 'artix'", distro)
+        distro = "artix"
+    cfg["distro"] = distro
+
+    # chroot_extra_packages: additional packages installed in the chroot each cycle.
+    # Defaults to Artix-specific set when distro=artix; empty for arch.
+    # Override in config to add/remove packages without changing distro setting.
+    extra_raw = sec.get("chroot_extra_packages", None)
+    if extra_raw is not None:
+        cfg["chroot_extra_packages"] = [s.strip() for s in extra_raw.split(",") if s.strip()]
+    elif distro == "artix":
+        cfg["chroot_extra_packages"] = ["libelogind", "libudev", "elogind"]
+    else:
+        cfg["chroot_extra_packages"] = []
+
+    # Path to pacman.conf deployed into the chroot. Defaults to the bundled
+    # Artix-specific config; Arch users should supply their own.
+    cfg["chroot_pacman_conf"] = sec.get("chroot_pacman_conf", "")
+
+    repo_priority_str = sec.get("repo_priority", "local,artix,cachyos,arch")
+    allowed_tiers = ["local", "artix", "cachyos", "arch"]
+    repo_priority = []
+    for raw in repo_priority_str.split(","):
+        tier = raw.strip().lower()
+        if not tier:
+            continue
+        if tier not in allowed_tiers:
+            log.warning("Ignoring unknown repo tier '%s' in repo_priority", tier)
+            continue
+        if tier not in repo_priority:
+            repo_priority.append(tier)
+    if not repo_priority:
+        repo_priority = allowed_tiers
+    cfg["repo_priority"] = repo_priority
+
+    blacklist_str = sec.get("blacklist", "gcc,glibc,coreutils,linux-api-headers")
+    cfg["blacklist"] = [s.strip() for s in blacklist_str.split(",") if s.strip()]
+
+    lto_blacklist_str = sec.get("lto_blacklist", "")
+    cfg["lto_blacklist"] = [
+        s.strip() for s in lto_blacklist_str.split(",") if s.strip()
+    ]
+
+    return cfg
+
+
+def strip_local_pkgrel_bump(version: str) -> str:
+    """Normalize local dot-bumped pkgrel back to upstream version form."""
+    if "-" not in version:
+        return version
+
+    pkgver, pkgrel = version.rsplit("-", 1)
+    if "." not in pkgrel:
+        return version
+
+    parts = pkgrel.split(".")
+    if len(parts) < 2 or not parts[-1].isdigit():
+        return version
+
+    base_pkgrel = ".".join(parts[:-1])
+    if not base_pkgrel:
+        return version
+    return f"{pkgver}-{base_pkgrel}"
+
+
+def prune_old_build_logs(log_dir: str, retention_days: int):
+    """Remove per-package build logs older than retention_days."""
+    if retention_days <= 0:
+        return 0
+    cutoff = time.time() - (retention_days * 86400)
+    removed = 0
+    for root, dirs, files in os.walk(log_dir):
+        rel = os.path.relpath(root, log_dir)
+        if rel == ".":
+            continue
+        for f in files:
+            if not f.endswith(".log"):
+                continue
+            fp = os.path.join(root, f)
+            try:
+                if os.stat(fp).st_mtime < cutoff:
+                    os.remove(fp)
+                    removed += 1
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log.debug("Failed pruning log %s: %s", fp, e)
+    return removed
+
+
+def write_metrics(config: dict, payload: dict):
+    """Write lightweight runtime metrics for external monitoring."""
+    tmp = config["metrics_path"] + ".tmp"
+    os.makedirs(os.path.dirname(config["metrics_path"]), exist_ok=True)
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, config["metrics_path"])
+
+
+def write_in_progress(config: dict, pkg: dict):
+    """Persist currently active package to recover from abrupt restarts."""
+    path = config["in_progress_path"]
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = dict(pkg)
+    payload["started_at"] = datetime.now(timezone.utc).isoformat()
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_in_progress(config: dict):
+    path = config["in_progress_path"]
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            raw = f.read().strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+        if not isinstance(data, dict) or "name" not in data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def clear_in_progress(config: dict):
+    try:
+        os.remove(config["in_progress_path"])
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Upstream version checking
+# ---------------------------------------------------------------------------
+def check_upstream_updates(manifest, built, config):
+    """
+    For each built package in the manifest, compare built version against
+    current upstream. Returns list of packages needing rebuild.
+    """
+    updates = []
+    repo_priority = config.get("repo_priority", ["local", "artix", "cachyos", "arch"])
+
+    blacklist = config.get("blacklist", [])
+    for pkg in manifest:
+        name = pkg["name"]
+        # Skip AUR packages and blacklisted packages
+        if pkg.get("repo") == "unknown":
+            continue
+        if name in blacklist:
+            continue
+        if name not in built:
+            continue
+
+        built_ver = built[name]["version"]
+        # Strip our dot-bump to get the base version for comparison
+        # e.g., "3.4.1-1.1" -> base upstream is "3.4.1-1"
+        base_ver = built_ver
+        ver_parts = built_ver.rsplit("-", 1)
+        if len(ver_parts) == 2 and "." in ver_parts[1]:
+            pkgrel_parts = ver_parts[1].split(".")
+            base_ver = ver_parts[0] + "-" + pkgrel_parts[0]
+
+        upstream_ver = None
+
+        for tier in repo_priority:
+            if upstream_ver is not None:
+                break
+
+            if tier == "local":
+                local_dir = os.path.join(config["pkgbuilds_dir"], "local", name)
+                if os.path.isfile(os.path.join(local_dir, "PKGBUILD")):
+                    try:
+                        si = parse_srcinfo(local_dir, config["build_user"])
+                        epoch = si.get("epoch", "")
+                        if epoch:
+                            upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
+                        else:
+                            upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
+                    except Exception as e:
+                        log.debug("[%s] failed to parse local srcinfo: %s", name, e)
+
+            elif tier == "artix":
+                artix_dir = os.path.join(config["pkgbuilds_dir"], "artix", name)
+                candidates = [
+                    os.path.join(artix_dir, "PKGBUILD"),
+                    os.path.join(artix_dir, "trunk", "PKGBUILD"),
+                ]
+                src_dir = None
+                for candidate in candidates:
+                    if os.path.isfile(candidate):
+                        src_dir = os.path.dirname(candidate)
+                        break
+                if src_dir:
+                    try:
+                        si = parse_srcinfo(src_dir, config["build_user"])
+                        epoch = si.get("epoch", "")
+                        if epoch:
+                            upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
+                        else:
+                            upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
+                    except Exception as e:
+                        log.debug("[%s] failed to parse Artix srcinfo: %s", name, e)
+
+            elif tier == "cachyos":
+                cachyos_dir = os.path.join(config["pkgbuilds_dir"], "cachyos")
+                for root, dirs, files in os.walk(cachyos_dir):
+                    dirs[:] = [d for d in dirs if d != ".git"]
+                    if os.path.basename(root) == name and "PKGBUILD" in files:
+                        try:
+                            si = parse_srcinfo(root, config["build_user"])
+                            epoch = si.get("epoch", "")
+                            if epoch:
+                                upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
+                            else:
+                                upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
+                        except Exception as e:
+                            log.debug("[%s] failed to parse CachyOS srcinfo: %s", name, e)
+                        break
+
+            elif tier == "arch":
+                arch_dir = os.path.join(config["pkgbuilds_dir"], "arch", name)
+                if os.path.isdir(arch_dir):
+                    import subprocess
+                    subprocess.run(
+                        ["git", "pull", "--ff-only"],
+                        cwd=arch_dir,
+                        capture_output=True,
+                    )
+                    try:
+                        si = parse_srcinfo(arch_dir, config["build_user"])
+                        epoch = si.get("epoch", "")
+                        if epoch:
+                            upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
+                        else:
+                            upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
+                    except Exception as e:
+                        log.debug("[%s] failed to parse Arch srcinfo: %s", name, e)
+
+        if upstream_ver:
+            normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
+            if vercmp(upstream_ver, base_ver) > 0 and vercmp(normalized_upstream, base_ver) == 0:
+                log.debug(
+                    "[%s] ignoring local pkgrel bump in source tree: %s",
+                    name,
+                    upstream_ver,
+                )
+            elif vercmp(normalized_upstream, base_ver) > 0:
+                log.info(
+                    "[%s] upstream update detected: %s -> %s",
+                    name,
+                    base_ver,
+                    normalized_upstream,
+                )
+                updates.append({**pkg, "build_reason": "update"})
+
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+def _service_active() -> bool:
+    for svc in ("arch-native", "buildbot"):  # check new name first, then legacy
+        result = subprocess.run(["systemctl", "is-active", svc], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip() == "active":
+            return True
+    return False
+
+
+def _load_json_strict(path: str):
+    with open(path, "r") as f:
+        raw = f.read().strip()
+    if not raw:
+        raise ValueError("empty file")
+    return json.loads(raw)
+
+
+@contextmanager
+def _queue_lock(config: dict, timeout: int = 10):
+    lock_path = os.path.join(os.path.dirname(config["state_path"]), "queue.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "w") as lockf:
+        start = time.time()
+        while True:
+            try:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() - start > timeout:
+                    raise RuntimeError("timed out waiting for queue lock")
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+
+def _manifest_map(config: dict) -> dict:
+    manifest = load_manifest(config["manifest_path"])
+    return {p["name"]: p for p in manifest}
+
+
+def _queue_item_for(name: str, manifest_map: dict, fallback_version: str = "unknown") -> dict:
+    if name in manifest_map:
+        pkg = dict(manifest_map[name])
+    else:
+        pkg = {"name": name, "version": fallback_version, "repo": "unknown", "reason": "unknown"}
+    pkg["build_reason"] = pkg.get("build_reason", "retry")
+    return pkg
+
+
+def cmd_status(args, config: dict) -> int:
+    pending = load_pending(config["pending_path"])
+    failed_map = load_failed(config["failed_path"])
+    built = get_built_state(config["state_path"])
+    in_progress = load_in_progress(config)
+    metrics = None
+    if os.path.exists(config["metrics_path"]):
+        try:
+            metrics = _load_json_strict(config["metrics_path"])
+        except Exception:
+            pass
+
+    building = in_progress.get("name") if in_progress else None
+
+    # Count installed packages broken down by state
+    installed_total = 0
+    rebuilt_count = 0
+    blacklisted_count = 0
+    not_queued_count = 0
+    manifest = []
+    try:
+        if config.get("mode") == "local":
+            manifest = read_local_packages()
+        else:
+            manifest = load_manifest(config["manifest_path"])
+        installed_total = len(manifest)
+        blacklist = set(config.get("blacklist", []))
+        pending_names = {p["name"] for p in pending}
+        failed_names = set(failed_map.keys())
+        for p in manifest:
+            name = p["name"]
+            if name in built:
+                rebuilt_count += 1
+            if name in blacklist:
+                blacklisted_count += 1
+            elif name not in built and name not in pending_names and name not in failed_names:
+                not_queued_count += 1
+    except Exception:
+        pass
+
+    w = 10
+    print(f"{'service':<{w}} {'active' if _service_active() else 'inactive'}")
+    print(f"{'building':<{w}} {building or '—'}")
+    if installed_total:
+        print(f"{'rebuilt':<{w}} {rebuilt_count} / {installed_total} installed")
+    else:
+        print(f"{'rebuilt':<{w}} {len(built)}")
+    print(f"{'pending':<{w}} {len(pending)}")
+    print(f"{'failed':<{w}} {len(failed_map)}")
+    if installed_total:
+        print(f"{'blacklisted':<{w}} {blacklisted_count}")
+        print(f"{'not queued':<{w}} {not_queued_count}  (AUR / binary / split-pkg)")
+
+    if metrics:
+        age = int(max(0, time.time() - os.stat(config["metrics_path"]).st_mtime))
+        age_str = f"{age // 60}m ago" if age >= 60 else f"{age}s ago"
+        n_built = metrics.get("succeeded", 0)
+        n_failed = metrics.get("failed", 0)
+        print(f"{'last run':<{w}} {n_built} built, {n_failed} failed  ({age_str})")
+    return 0
+
+
+def cmd_doctor(args, config: dict) -> int:
+    checks = []
+
+    def add(name, ok, detail):
+        checks.append((name, ok, detail))
+
+    add("service", _service_active(), "active" if _service_active() else "inactive")
+
+    # JSON files
+    for path, expected, label in [
+        (config["pending_path"], list, "pending"),
+        (config["failed_path"], dict, "failed"),
+        (config["state_path"], dict, "built_state"),
+    ]:
+        if not os.path.exists(path):
+            add(f"json:{label}", False, "missing")
+            continue
+        try:
+            obj = _load_json_strict(path)
+            add(f"json:{label}", isinstance(obj, expected), f"{type(obj).__name__}")
+        except Exception as e:
+            add(f"json:{label}", False, str(e))
+
+    if config.get("mode") == "local":
+        add("manifest", True, "local mode — reads pacman DB directly")
+    else:
+        add("manifest", os.path.exists(config["manifest_path"]), config["manifest_path"])
+    add("chroot_root", os.path.isdir(config["chroot_root"]), config["chroot_root"])
+    add("repo_dir", os.path.isdir(config["repo_dir"]), config["repo_dir"])
+
+    # GNUPG mode
+    if os.path.isdir(config["gnupg_home"]):
+        mode = os.stat(config["gnupg_home"]).st_mode & 0o777
+        add("gnupg_mode", mode == 0o700, oct(mode))
+    else:
+        add("gnupg_mode", False, "missing")
+
+    # Chroot pacman keyring
+    chroot_root = config.get("chroot_root", "")
+    if os.path.isdir(chroot_root):
+        result = subprocess.run(
+            ["arch-nspawn", chroot_root, "pacman-key", "--list-keys"],
+            capture_output=True, text=True,
+        )
+        keyring_ok = result.returncode == 0 and "pub" in result.stdout
+        add("chroot_keyring", keyring_ok, "populated" if keyring_ok else "empty or uninitialized")
+    else:
+        add("chroot_keyring", False, f"chroot not found: {chroot_root}")
+
+    ok_all = True
+    for name, ok, detail in checks:
+        print(f"{'OK' if ok else 'FAIL':4} {name:14} {detail}")
+        if not ok:
+            ok_all = False
+    return 0 if ok_all else 1
+
+
+def cmd_queue_show(args, config: dict) -> int:
+    pending = load_pending(config["pending_path"])
+    limit = max(1, args.limit) if args.limit else len(pending)
+    print(f"pending  {len(pending)}\n")
+    for idx, pkg in enumerate(pending[:limit], 1):
+        print(f"  {idx:<4} {pkg.get('name','?'):<28} {pkg.get('version','?'):<20} {pkg.get('build_reason','?')}")
+    if limit < len(pending):
+        print(f"  ... {len(pending) - limit} more")
+    return 0
+
+
+def cmd_sync(args, config: dict) -> int:
+    if not args.dry_run and _service_active():
+        print(_STOPPED_MSG)
+        return 2
+
+    manifest = load_manifest(config["manifest_path"])
+    built = get_built_state(config["state_path"])
+    needed = diff_manifest(manifest, built)
+
+    lock_ctx = _queue_lock(config) if not args.dry_run else nullcontext()
+    with lock_ctx:
+        existing = [] if args.reset else load_pending(config["pending_path"])
+        existing_names = {p.get("name") for p in existing}
+
+        added = 0
+        for pkg in needed:
+            if pkg["name"] not in existing_names:
+                existing.append(pkg)
+                existing_names.add(pkg["name"])
+                added += 1
+
+        if not args.dry_run:
+            save_pending(config["pending_path"], existing)
+
+    action = "reset and rebuilt" if args.reset else "updated"
+    suffix = "  (dry run)" if args.dry_run else ""
+    print(f"queue {action}: {added} added, {len(existing)} total{suffix}")
+    return 0
+
+
+_STOPPED_MSG = "error: service is running — stop it first with: sudo systemctl stop arch-native"
+
+
+def cmd_queue_retry_failed(args, config: dict) -> int:
+    targets_from_args = getattr(args, "packages", [])
+    if not args.all and not targets_from_args:
+        print("error: specify package name(s) or --all")
+        return 2
+
+    manifest_map = _manifest_map(config)
+    if not args.dry_run and _service_active():
+        print(_STOPPED_MSG)
+        return 2
+
+    # Build set of manifest package names for filtering (--all only)
+    manifest_names = set(manifest_map.keys())
+
+    lock_ctx = _queue_lock(config) if not args.dry_run else nullcontext()
+    with lock_ctx:
+        pending = load_pending(config["pending_path"])
+        failed = load_failed(config["failed_path"])
+
+        pending_names = {p.get("name") for p in pending}
+        targets = set(failed.keys()) if args.all else set(targets_from_args)
+
+        moved = 0
+        removed_failed = 0
+        skipped_not_installed = 0
+        for name in sorted(targets):
+            rec = failed.get(name)
+            if not rec:
+                continue
+            # --all: skip packages not in the current manifest (stale failed entries)
+            # Explicit names are always retried regardless.
+            if args.all and name not in manifest_names:
+                skipped_not_installed += 1
+                continue
+            if name not in pending_names:
+                pending.append(_queue_item_for(name, manifest_map, rec.get("version", "unknown")))
+                pending_names.add(name)
+                moved += 1
+            del failed[name]
+            removed_failed += 1
+
+        if not args.dry_run:
+            save_pending(config["pending_path"], pending)
+            save_failed(config["failed_path"], failed)
+
+    parts = [f"retry: moved {moved} to pending"]
+    if skipped_not_installed:
+        parts.append(f"skipped {skipped_not_installed} not in manifest")
+    print("  ".join(parts) + ("  (dry run)" if args.dry_run else ""))
+    return 0
+
+
+def _sanitize_reason(reason: str) -> str:
+    """Strip GPG noise and truncate to the first meaningful line."""
+    if not reason:
+        return "unknown"
+    skip_prefixes = ("gpg:", "Warning:", "warning:", "Note:")
+    for line in reason.splitlines():
+        line = line.strip()
+        if line and not any(line.startswith(p) for p in skip_prefixes):
+            return line[:120]
+    return reason.splitlines()[0].strip()[:120]
+
+
+def cmd_failed_list(args, config: dict) -> int:
+    failed = load_failed(config["failed_path"])
+    rows = sorted(
+        failed.items(),
+        key=lambda kv: kv[1].get("timestamp", ""),
+        reverse=True,
+    )
+    limit = max(1, args.limit) if args.limit else len(rows)
+    print(f"failed  {len(failed)}\n")
+    for name, rec in rows[:limit]:
+        retries = rec.get("retries", 0)
+        retry_str = f"{retries}x"
+        ts = rec.get("timestamp", "")[:10]
+        reason = _sanitize_reason(rec.get("reason", "unknown"))
+        print(f"  {name:<28} {rec.get('version','?'):<20} {retry_str:<5} {ts}  {reason}")
+    if limit < len(rows):
+        print(f"  ... {len(rows) - limit} more")
+    return 0
+
+
+def cmd_built(args, config: dict) -> int:
+    built = get_built_state(config["state_path"])
+    rows = sorted(
+        built.items(),
+        key=lambda kv: kv[1].get("built_at", ""),
+        reverse=True,
+    )
+    limit = args.limit if args.limit else len(rows)
+    print(f"built  {len(built)}\n")
+    for name, rec in rows[:limit]:
+        ts = rec.get("built_at", "")[:10]
+        ver = rec.get("version", "?")
+        flags = " [pgp-skipped]" if rec.get("pgp_skipped") else ""
+        # Explain dot-notation pkgrel to the user
+        pkgrel = ver.rsplit("-", 1)[-1] if "-" in ver else ""
+        rel_note = " *" if "." in pkgrel else ""
+        print(f"  {name:<30} {ver:<24}{ts}{flags}{rel_note}")
+    if limit < len(rows):
+        print(f"  ... {len(rows) - limit} more")
+    if any("." in rec.get("version","").rsplit("-",1)[-1] for _, rec in rows[:limit]):
+        print("\n  * pkgrel x.N = locally bumped rebuild (upstream pkgrel unchanged)")
+    return 0
+
+
+def cmd_logs(args, config: dict) -> int:
+    log_dir = os.path.join(config["log_dir"], args.package)
+    if not os.path.isdir(log_dir):
+        print(f"no logs found for {args.package!r}")
+        return 1
+    logs = sorted(
+        (f for f in os.listdir(log_dir) if f.endswith(".log")),
+        reverse=True,
+    )
+    if not logs:
+        print(f"no logs found for {args.package!r}")
+        return 1
+    log_path = os.path.join(log_dir, logs[0])
+    if args.follow:
+        os.execlp("tail", "tail", "-f", log_path)
+    else:
+        with open(log_path, "r", errors="replace") as f:
+            sys.stdout.write(f.read())
+    return 0
+
+
+def cmd_failed_clear(args, config: dict) -> int:
+    targets_from_args = getattr(args, "packages", [])
+    if not args.all and not targets_from_args:
+        print("error: specify package name(s) or --all")
+        return 2
+    if not args.dry_run and _service_active():
+        print(_STOPPED_MSG)
+        return 2
+
+    lock_ctx = _queue_lock(config) if not args.dry_run else nullcontext()
+    with lock_ctx:
+        failed = load_failed(config["failed_path"])
+        if args.all:
+            removed = len(failed)
+            new_failed = {}
+        else:
+            targets = set(targets_from_args)
+            removed = sum(1 for n in targets if n in failed)
+            new_failed = {k: v for k, v in failed.items() if k not in targets}
+
+        if not args.dry_run:
+            save_failed(config["failed_path"], new_failed)
+
+    print(f"cleared {removed} from failed" + ("  (dry run)" if args.dry_run else ""))
+    return 0
+
+
+def cmd_init(args, config: dict) -> int:
+    """
+    Bootstrap a new arch-native installation:
+      1. Create /var/lib/arch-native directory layout
+      2. Create the makechrootpkg chroot with mkarchroot
+      3. Initialize the chroot's pacman keyring
+      4. Set up the build user's GPG homedir
+    Safe to re-run — skips steps that are already done.
+    """
+    import shutil
+
+    chroot_root = config["chroot_root"]
+    chroot_dir  = config["chroot_dir"]
+    repo_dir    = config["repo_dir"]
+    log_dir     = config["log_dir"]
+    gnupg_home  = config["gnupg_home"]
+    build_user  = config["build_user"]
+    distro      = config["distro"]
+
+    # 1. Create directory layout
+    for d in [chroot_dir, repo_dir, log_dir, gnupg_home,
+              config["pkgbuilds_dir"], config["makepkg_configs_dir"],
+              os.path.dirname(config["manifest_path"])]:
+        os.makedirs(d, exist_ok=True)
+        print(f"  dir  {d}")
+
+    # 2. Create chroot with mkarchroot if it doesn't exist
+    if os.path.isdir(chroot_root):
+        print(f"  skip chroot already exists: {chroot_root}")
+    else:
+        pacman_conf = config.get("chroot_pacman_conf", "")
+        if not pacman_conf:
+            for candidate in [
+                "/etc/arch-native/chroot-pacman.conf",
+                "/usr/share/arch-native/chroot-pacman.conf",
+            ]:
+                if os.path.isfile(candidate):
+                    pacman_conf = candidate
+                    break
+        if not pacman_conf or not os.path.isfile(pacman_conf):
+            print("error: no chroot pacman.conf found")
+            print("  Set chroot_pacman_conf in buildbot.conf, e.g.:")
+            print("    chroot_pacman_conf = /etc/arch-native/chroot-pacman.conf")
+            return 1
+        print(f"  creating chroot at {chroot_root} ...")
+        result = subprocess.run(
+            ["mkarchroot", "-C", pacman_conf, chroot_root, "base-devel"],
+            text=True,
+        )
+        if result.returncode != 0:
+            print("error: mkarchroot failed")
+            return 1
+        print("  chroot created")
+
+    # 3. Initialize chroot pacman keyring
+    print("  initializing chroot pacman keyring ...")
+    for cmd in [
+        ["arch-nspawn", chroot_root, "pacman-key", "--init"],
+        ["arch-nspawn", chroot_root, "pacman-key", "--populate"],
+    ]:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  warning: {' '.join(cmd[2:])} returned {result.returncode}")
+            print(f"    {result.stderr.strip()[:200]}")
+        else:
+            print(f"  ok  {' '.join(cmd[2:])}")
+
+    # 4. Set up build user GPG homedir
+    prepare_gnupg_home(gnupg_home, build_user)
+    print(f"  gnupg homedir ready: {gnupg_home}")
+
+    # 5. Artix-specific: deploy artix-meson if distro=artix
+    if distro == "artix":
+        for src_candidate in [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "artix-meson"),
+            "/usr/share/arch-native/artix-meson",
+        ]:
+            if os.path.isfile(src_candidate):
+                dest = os.path.join(chroot_root, "usr/local/bin/artix-meson")
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src_candidate, dest)
+                os.chmod(dest, 0o755)
+                print("  deployed artix-meson into chroot")
+                break
+
+    print("\narch-native init complete. Next steps:")
+    if distro == "artix":
+        print("  1. Ensure /etc/arch-native.conf has correct paths and march=")
+    else:
+        print("  1. Set chroot_pacman_conf in /etc/arch-native.conf to your pacman.conf")
+        print("     (must include [core] [extra] repos)")
+    print("  2. Import your signing key into the build user's GPG homedir")
+    print(f"     gpg --homedir {gnupg_home} --import /path/to/key.gpg")
+    print("  3. Start the service: sudo systemctl enable --now arch-native")
+    return 0
+
+
+def cmd_patch(args, config: dict) -> int:
+    subcmd = getattr(args, "patch_cmd", None)
+    if subcmd == "create":
+        return _cmd_patch_create(args, config)
+    if subcmd == "show":
+        return _cmd_patch_show(args, config)
+    if subcmd == "check":
+        return _cmd_patch_check(args, config)
+    print("error: specify a subcommand: create, show, check")
+    return 2
+
+
+def _cmd_patch_create(args, config: dict) -> int:
+    """Interactively create a local patch by editing the upstream PKGBUILD."""
+    import shutil as _shutil
+    pkgname = args.pkgname
+    pkgbuilds_dir = config["pkgbuilds_dir"]
+    local_dir = os.path.join(pkgbuilds_dir, "local", pkgname)
+    patch_file = os.path.join(local_dir, f"{pkgname}.patch")
+
+    if os.path.isfile(patch_file) and not args.force:
+        print(f"error: patch already exists: {patch_file}")
+        print(f"  edit it directly, or use --force to overwrite from the current upstream")
+        return 1
+
+    if os.path.isfile(os.path.join(local_dir, "PKGBUILD")):
+        print(f"warning: {local_dir} already contains a full PKGBUILD copy.")
+        print(f"  after creating the patch, remove the PKGBUILD file to avoid confusion.")
+
+    upstream_priority = [t for t in config["repo_priority"] if t != "local"]
+    try:
+        upstream_dir, tier = resolve_pkgbuild(pkgname, pkgbuilds_dir, None, upstream_priority)
+    except FileNotFoundError as e:
+        print(f"error: {e}")
+        return 1
+
+    print(f"  upstream tier: {tier}  ({upstream_dir})")
+
+    with tempfile.TemporaryDirectory(prefix=f"arch-native-patch-{pkgname}-") as tmpdir:
+        work_dir = os.path.join(tmpdir, "work")
+        _shutil.copytree(upstream_dir, work_dir, ignore=ignore_special_files)
+        orig = os.path.join(tmpdir, "PKGBUILD.orig")
+        _shutil.copy2(os.path.join(work_dir, "PKGBUILD"), orig)
+
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
+        print(f"  opening {editor} ...")
+        ret = subprocess.run([editor, os.path.join(work_dir, "PKGBUILD")])
+        if ret.returncode != 0:
+            print("editor exited non-zero, aborting")
+            return 1
+
+        diff = subprocess.run(
+            ["diff", "-u", "--label", "a/PKGBUILD", "--label", "b/PKGBUILD",
+             orig, os.path.join(work_dir, "PKGBUILD")],
+            capture_output=True, text=True,
+        )
+        if diff.returncode == 0:
+            print("no changes made")
+            return 0
+        if diff.returncode != 1:
+            print(f"diff error: {diff.stderr}")
+            return 1
+
+        os.makedirs(local_dir, exist_ok=True)
+        with open(patch_file, "w") as f:
+            f.write(diff.stdout)
+
+    print(f"  saved: {patch_file}")
+    return 0
+
+
+def _cmd_patch_show(args, config: dict) -> int:
+    pkgname = args.pkgname
+    patch_file = os.path.join(config["pkgbuilds_dir"], "local", pkgname, f"{pkgname}.patch")
+    if not os.path.isfile(patch_file):
+        print(f"no local patch for {pkgname!r}  (looked in {patch_file})")
+        return 1
+    with open(patch_file) as f:
+        sys.stdout.write(f.read())
+    return 0
+
+
+def _cmd_patch_check(args, config: dict) -> int:
+    """Verify that local patches still apply against current upstream."""
+    import shutil as _shutil
+    pkgbuilds_dir = config["pkgbuilds_dir"]
+    upstream_priority = [t for t in config["repo_priority"] if t != "local"]
+
+    if args.all:
+        local_root = os.path.join(pkgbuilds_dir, "local")
+        if not os.path.isdir(local_root):
+            print("no local/ patches directory")
+            return 0
+        pkgnames = [
+            d for d in os.listdir(local_root)
+            if not d.startswith("_")
+            and os.path.isfile(os.path.join(local_root, d, f"{d}.patch"))
+        ]
+        if not pkgnames:
+            print("no local patches found")
+            return 0
+    else:
+        pkgnames = [args.pkgname]
+
+    any_failed = False
+    for pkgname in sorted(pkgnames):
+        patch_file = os.path.join(pkgbuilds_dir, "local", pkgname, f"{pkgname}.patch")
+        if not os.path.isfile(patch_file):
+            print(f"  {pkgname:<28} NO PATCH FILE")
+            any_failed = True
+            continue
+        try:
+            upstream_dir, tier = resolve_pkgbuild(pkgname, pkgbuilds_dir, None, upstream_priority)
+        except FileNotFoundError:
+            print(f"  {pkgname:<28} upstream not found")
+            any_failed = True
+            continue
+
+        with tempfile.TemporaryDirectory(prefix=f"arch-native-check-{pkgname}-") as tmpdir:
+            work_dir = os.path.join(tmpdir, "work")
+            _shutil.copytree(upstream_dir, work_dir, ignore=ignore_special_files)
+            dry = subprocess.run(
+                ["patch", "--dry-run", "-p1", "--input", patch_file],
+                capture_output=True, text=True, cwd=work_dir,
+            )
+
+        if dry.returncode == 0:
+            print(f"  {pkgname:<28} ok  (tier: {tier})")
+        else:
+            first_err = next(
+                (l for l in (dry.stdout + dry.stderr).splitlines() if l.strip()),
+                "patch failed"
+            )
+            print(f"  {pkgname:<28} FAIL  {first_err}")
+            any_failed = True
+
+    return 1 if any_failed else 0
+
+
+def run_cli(args, config: dict) -> int:
+    dispatch = {
+        "status":  cmd_status,
+        "doctor":  cmd_doctor,
+        "built":   cmd_built,
+        "logs":    cmd_logs,
+        "queue":   cmd_queue_show,
+        "failed":  cmd_failed_list,
+        "retry":   cmd_queue_retry_failed,
+        "clear":   cmd_failed_clear,
+        "sync":    cmd_sync,
+        "init":    cmd_init,
+        "patch":   cmd_patch,
+    }
+    fn = dispatch.get(args.command)
+    if fn:
+        return fn(args, config)
+    print("error: unknown command")
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def run_daemon(config_path: str, debug: bool):
+    global shutdown_flag
+
+    config = load_config(config_path)
+
+    # Logging setup
+    level = logging.DEBUG if debug else getattr(logging, config["log_level"])
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # File handler
+    os.makedirs(config["log_dir"], exist_ok=True)
+    fh = logging.FileHandler(os.path.join(config["log_dir"], "buildbot.log"))
+    fh.setFormatter(formatter)
+
+    # Stdout handler (for journalctl)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(formatter)
+
+    log.setLevel(level)
+    log.addHandler(fh)
+    log.addHandler(sh)
+
+    # Signal handlers
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+    log.info(
+        "Buildbot starting (march=%s, mode=%s, distro=%s, poll=%ds, build_user=%s, repo_priority=%s)",
+        config["march"], config["mode"], config["distro"], config["poll_interval"],
+        config["build_user"], ",".join(config["repo_priority"]),
+    )
+
+    prepare_gnupg_home(config["gnupg_home"], config["build_user"])
+
+    # Generate makepkg.conf from current config (handles march=native, local !check, etc.)
+    makepkg_conf_name = f"makepkg.{config['march'].replace('=','')}.conf"
+    makepkg_conf_path = os.path.join(config["makepkg_configs_dir"], makepkg_conf_name)
+    generate_makepkg_conf(config, makepkg_conf_path)
+    config["_makepkg_conf"] = makepkg_conf_path
+
+    # Deploy distro-specific files into the chroot root (once at startup).
+    chroot_root = config["chroot_root"]
+    if os.path.isdir(chroot_root):
+        # artix-meson wrapper — only needed for Artix
+        if config["distro"] == "artix":
+            artix_meson_src = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "artix-meson"
+            )
+            if os.path.isfile(artix_meson_src):
+                dest = os.path.join(chroot_root, "usr/local/bin/artix-meson")
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                import shutil as _shutil
+                _shutil.copy2(artix_meson_src, dest)
+                os.chmod(dest, 0o755)
+                log.info("Deployed artix-meson into chroot")
+
+        # chroot pacman.conf — only redeploy if explicitly configured.
+        # The install/deploy script handles the initial copy; this path is for
+        # users who configure a custom chroot_pacman_conf in buildbot.conf.
+        pacman_conf_src = config.get("chroot_pacman_conf", "")
+        if pacman_conf_src:
+            if os.path.isfile(pacman_conf_src):
+                dest = os.path.join(chroot_root, "etc/pacman.conf")
+                import shutil as _shutil
+                _shutil.copy2(pacman_conf_src, dest)
+                log.info("Deployed pacman.conf into chroot from %s", pacman_conf_src)
+            else:
+                log.warning("chroot_pacman_conf not found: %s", pacman_conf_src)
+    write_metrics(config, {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "starting",
+        "pending_start": 0,
+        "pending_end": 0,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped_previous_failure": 0,
+        "skipped_ineligible": 0,
+        "skipped_missing_keys": 0,
+    })
+
+    recovered = load_in_progress(config)
+    if recovered:
+        pending = load_pending(config["pending_path"])
+        pending_names = {p.get("name") for p in pending}
+        if recovered.get("name") not in pending_names:
+            pending.insert(0, recovered)
+            save_pending(config["pending_path"], pending)
+            log.warning("Recovered interrupted package back to queue: %s", recovered.get("name"))
+        clear_in_progress(config)
+
+    last_manifest_mtime = 0
+    last_upstream_check = 0
+    manifest = []
+
+    # Build pkgname->pkgbase map for split package resolution
+    log.info("Building pkgbase map from sync databases...")
+    pkgbase_map = build_pkgbase_map()
+
+    while not shutdown_flag:
+        cycle_start = time.time()
+
+        # ----- Step 1: Chroot upgrade -----
+        log.info("Upgrading chroot...")
+        upgrade_chroot(config["chroot_root"], config.get("chroot_extra_packages", []))
+
+        if shutdown_flag:
+            break
+
+        # ----- Step 2: Manifest check -----
+        try:
+            if config["mode"] == "local":
+                # Local mode: read pacman DB directly every cycle
+                new_manifest = read_local_packages()
+                manifest_changed = (len(new_manifest) != len(manifest) or
+                    {p["name"] for p in new_manifest} != {p["name"] for p in manifest})
+                if manifest_changed:
+                    manifest = new_manifest
+                    log.info("Local package list updated: %d packages", len(manifest))
+            else:
+                # Remote mode: watch manifest file for changes
+                manifest_path = config["manifest_path"]
+                if os.path.exists(manifest_path):
+                    current_mtime = os.stat(manifest_path).st_mtime
+                    if current_mtime != last_manifest_mtime:
+                        log.info("Manifest change detected (mtime: %s)", datetime.fromtimestamp(current_mtime))
+                        last_manifest_mtime = current_mtime
+                        manifest = load_manifest(manifest_path)
+                        log.info("Loaded manifest with %d packages", len(manifest))
+                else:
+                    log.debug("No manifest file at %s", manifest_path)
+
+            if manifest:
+                built = get_built_state(config["state_path"])
+                new_pkgs = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
+
+                if new_pkgs:
+                    pending = load_pending(config["pending_path"])
+                    failed_now = load_failed(config["failed_path"])
+                    pending_names = {p["name"] for p in pending}
+                    queued = queued_new = queued_update = skipped_existing = skipped_failed = 0
+                    for pkg in new_pkgs:
+                        if pkg["name"] in pending_names:
+                            skipped_existing += 1
+                            continue
+                        # Don't re-add if already failed at this exact version
+                        if failed_now.get(pkg["name"], {}).get("version") == pkg["version"]:
+                            skipped_failed += 1
+                            continue
+                        pending.append(pkg)
+                        queued += 1
+                        if pkg["build_reason"] == "new":
+                            queued_new += 1
+                        elif pkg["build_reason"] == "update":
+                            queued_update += 1
+                    save_pending(config["pending_path"], pending)
+                    log.info(
+                        "Manifest queue update: queued=%d (new=%d update=%d), skipped_existing=%d, skipped_failed=%d",
+                        queued, queued_new, queued_update, skipped_existing, skipped_failed,
+                    )
+                else:
+                    log.info("No new or updated packages to build")
+        except Exception as e:
+            log.error("Error processing manifest: %s", e)
+
+        if shutdown_flag:
+            break
+
+        # ----- Step 3: Upstream update check -----
+        now = time.time()
+        if manifest and (now - last_upstream_check) >= config["upstream_check_interval"]:
+            log.info("Checking for upstream updates...")
+            last_upstream_check = now
+            try:
+                # Update enabled git-backed source repos
+                if "cachyos" in config["repo_priority"]:
+                    cachyos_dir = os.path.join(config["pkgbuilds_dir"], "cachyos")
+                    if os.path.isdir(os.path.join(cachyos_dir, ".git")):
+                        import subprocess
+                        subprocess.run(
+                            ["git", "-C", cachyos_dir, "pull", "--ff-only"],
+                            capture_output=True,
+                        )
+
+                built = get_built_state(config["state_path"])
+                updates = check_upstream_updates(manifest, built, config)
+
+                if updates:
+                    pending = load_pending(config["pending_path"])
+                    failed_now = load_failed(config["failed_path"])
+                    pending_names = {p["name"] for p in pending}
+                    queued = skipped_existing = skipped_failed = 0
+                    for pkg in updates:
+                        if pkg["name"] in pending_names:
+                            skipped_existing += 1
+                            continue
+                        if failed_now.get(pkg["name"], {}).get("version") == pkg["version"]:
+                            skipped_failed += 1
+                            continue
+                        pending.append(pkg)
+                        queued += 1
+                    save_pending(config["pending_path"], pending)
+                    log.info(
+                        "Upstream update queue: queued=%d, skipped_existing=%d, skipped_failed=%d",
+                        queued, skipped_existing, skipped_failed,
+                    )
+            except Exception as e:
+                log.error("Error checking upstream updates: %s", e)
+
+        if shutdown_flag:
+            break
+
+        # ----- Step 4: Queue processing -----
+        pending = load_pending(config["pending_path"])
+        failed = load_failed(config["failed_path"])
+        cycle_stats = {
+            "pending_start": len(pending),
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "skipped_previous_failure": 0,
+            "skipped_ineligible": 0,
+            "skipped_missing_keys": 0,
+        }
+        writes_since_prune = 0
+        write_metrics(config, {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "processing",
+            "pending_start": cycle_stats["pending_start"],
+            "pending_end": len(pending),
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "skipped_previous_failure": 0,
+            "skipped_ineligible": 0,
+            "skipped_missing_keys": 0,
+        })
+
+        while pending and not shutdown_flag:
+            pkg = pending.pop(0)
+            save_pending(config["pending_path"], pending)
+            write_in_progress(config, pkg)
+            name = pkg["name"]
+
+            # Skip if currently failed at this version
+            if name in failed and failed[name].get("version") == pkg["version"]:
+                cycle_stats["skipped_previous_failure"] += 1
+                log.info("[%s] skipping (previously failed at %s)", name, pkg["version"])
+                clear_in_progress(config)
+                continue
+
+            build_start = time.time()
+            cycle_stats["attempted"] += 1
+            log.info("[%s] === BUILD STARTING ===", name)
+            pkgbuild_path = None
+            pkgbuild_backup = None
+
+            try:
+                # a. Resolve PKGBUILD (with pkgbase fallback for split packages)
+                pkgbuild_dir, tier = resolve_pkgbuild(
+                    name,
+                    config["pkgbuilds_dir"],
+                    pkgbase_map,
+                    config["repo_priority"],
+                )
+                log.info("[%s] PKGBUILD tier: %s (%s)", name, tier, pkgbuild_dir)
+
+                # b. Parse .SRCINFO
+                srcinfo = parse_srcinfo(pkgbuild_dir, config["build_user"])
+                log.debug("[%s] parsed srcinfo: %s-%s (arch: %s)", name, srcinfo["pkgver"], srcinfo["pkgrel"], srcinfo["arch"])
+
+                # c. Eligibility check
+                eligible, reason = is_eligible(pkg, srcinfo, config["blacklist"])
+                if not eligible:
+                    cycle_stats["skipped_ineligible"] += 1
+                    log.info("[%s] not eligible: %s", name, reason)
+                    continue
+
+                log.debug("[%s] eligible", name)
+
+                # d. Import PGP keys
+                pgp_skipped = False
+                if srcinfo["validpgpkeys"]:
+                    log.info("[%s] importing %d PGP key(s)", name, len(srcinfo["validpgpkeys"]))
+                    missing_keys = import_pgp_keys(srcinfo["validpgpkeys"], config["gnupg_home"], config["build_user"])
+                    if missing_keys:
+                        if config.get("skip_pgp_on_import_failure"):
+                            log.warning(
+                                "[%s] PGP keys not found on any keyserver (%s); "
+                                "skip_pgp_on_import_failure=true — will build with --skippgpcheck",
+                                name, ",".join(missing_keys),
+                            )
+                            pgp_skipped = True
+                        else:
+                            cycle_stats["skipped_missing_keys"] += 1
+                            reason = "missing PGP keys: " + ",".join(missing_keys)
+                            log.error("[%s] %s", name, reason)
+                            failed[name] = {
+                                "version": pkg.get("version", "unknown"),
+                                "reason": reason,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "retries": failed.get(name, {}).get("retries", 0) + 1,
+                            }
+                            save_failed(config["failed_path"], failed)
+                            continue
+                else:
+                    log.info("[%s] no PGP keys required", name)
+
+                # e. Bump pkgrel
+                pkgbuild_path = os.path.join(pkgbuild_dir, "PKGBUILD")
+                with open(pkgbuild_path, "r") as f:
+                    pkgbuild_backup = f.read()
+                old_pkgrel = srcinfo["pkgrel"]
+                new_version = bump_pkgrel(pkgbuild_path, srcinfo)
+                log.debug("[%s] pkgrel bumped: %s -> %s", name, old_pkgrel, new_version.rsplit("-", 1)[-1])
+
+                # f. Build
+                log.info("[%s] build starting...", name)
+                success, pkg_files, failure_type = build_package(pkg, pkgbuild_dir, config, skippgpcheck=pgp_skipped)
+
+                if success:
+                    # g. Success path
+                    duration = time.time() - build_start
+
+                    sign_packages(pkg_files, config["gnupg_home"], config["build_user"])
+                    log.info("[%s] signed %d package(s)", name, len(pkg_files))
+
+                    moved = add_to_repo(
+                        pkg_files, config["repo_db"], config["repo_dir"]
+                    )
+                    log.info("[%s] added to repo", name)
+
+                    built = get_built_state(config["state_path"])
+                    all_subpkgs = srcinfo.get("packages", [])
+                    built = update_built_state(built, pkg, new_version, moved, all_pkgnames=all_subpkgs, pgp_skipped=pgp_skipped)
+                    save_built_state(config["state_path"], built)
+
+                    # Remove from failed if it was there (including subpackages)
+                    names_to_clear = set(all_subpkgs) | {name}
+                    for n in names_to_clear:
+                        if n in failed:
+                            del failed[n]
+                    save_failed(config["failed_path"], failed)
+
+                    # Remove sibling subpackages from pending queue
+                    if len(all_subpkgs) > 1:
+                        built_names = set(all_subpkgs)
+                        pending = [p for p in pending if p["name"] not in built_names]
+                        save_pending(config["pending_path"], pending)
+                        log.info("[%s] cleared %d sibling subpackages from queue", name, len(built_names) - 1)
+
+                    cycle_stats["succeeded"] += 1
+                    pgp_note = " [PGP SKIPPED — no keyserver]" if pgp_skipped else ""
+                    log.info(
+                        "[%s] build successful in %ds (tier: %s)%s",
+                        name,
+                        int(duration),
+                        tier,
+                        pgp_note,
+                    )
+                else:
+                    # h. Failure path
+                    duration = time.time() - build_start
+
+                    if failure_type == "download":
+                        # Transient network failure — re-queue instead of failing
+                        retry_count = pkg.get("download_retries", 0) + 1
+                        limit = config.get("download_retry_limit", 3)
+                        if retry_count <= limit:
+                            requeue = dict(pkg)
+                            requeue["download_retries"] = retry_count
+                            pending.append(requeue)
+                            save_pending(config["pending_path"], pending)
+                            cycle_stats["failed"] += 1
+                            log.warning(
+                                "[%s] download failed after %ds — re-queued (attempt %d/%d)",
+                                name, int(duration), retry_count, limit,
+                            )
+                        else:
+                            failed[name] = {
+                                "version": pkg["version"],
+                                "reason": f"download failed after {limit} attempts",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "retries": failed.get(name, {}).get("retries", 0) + 1,
+                            }
+                            save_failed(config["failed_path"], failed)
+                            cycle_stats["failed"] += 1
+                            log.error(
+                                "[%s] download FAILED %d times — giving up (tier: %s)",
+                                name, limit, tier,
+                            )
+                        continue
+
+                    # Compile/link/etc failure — pull last non-empty line from log as reason
+                    build_reason = "build failed"
+                    log_dir_pkg = os.path.join(config["log_dir"], name)
+                    if os.path.isdir(log_dir_pkg):
+                        logs = sorted(
+                            (f for f in os.listdir(log_dir_pkg) if f.endswith(".log")),
+                            reverse=True,
+                        )
+                        if logs:
+                            try:
+                                with open(os.path.join(log_dir_pkg, logs[0]), "r", errors="replace") as lf:
+                                    lines = [l.rstrip() for l in lf if l.strip()]
+                                if lines:
+                                    build_reason = _sanitize_reason(lines[-1])
+                            except Exception:
+                                pass
+                    if failure_type == "timeout":
+                        build_reason = f"build timed out after {config.get('build_timeout', 0)}s"
+                    failed[name] = {
+                        "version": pkg["version"],
+                        "reason": build_reason,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "retries": failed.get(name, {}).get("retries", 0) + 1,
+                    }
+                    save_failed(config["failed_path"], failed)
+                    cycle_stats["failed"] += 1
+                    log.error(
+                        "[%s] build FAILED after %ds (tier: %s)",
+                        name,
+                        int(duration),
+                        tier,
+                    )
+
+            except FileNotFoundError as e:
+                cycle_stats["failed"] += 1
+                log.error("[%s] PKGBUILD not found: %s", name, e)
+                failed[name] = {
+                    "version": pkg.get("version", "unknown"),
+                    "reason": _sanitize_reason(str(e)),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "retries": failed.get(name, {}).get("retries", 0) + 1,
+                }
+                save_failed(config["failed_path"], failed)
+            except Exception as e:
+                cycle_stats["failed"] += 1
+                log.error("[%s] unexpected error: %s", name, e, exc_info=True)
+                failed[name] = {
+                    "version": pkg.get("version", "unknown"),
+                    "reason": _sanitize_reason(str(e)),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "retries": failed.get(name, {}).get("retries", 0) + 1,
+                }
+                save_failed(config["failed_path"], failed)
+            finally:
+                clear_in_progress(config)
+                if pkgbuild_path and pkgbuild_backup is not None:
+                    try:
+                        with open(pkgbuild_path, "w") as f:
+                            f.write(pkgbuild_backup)
+                    except Exception as e:
+                        log.warning("[%s] failed to restore PKGBUILD after build: %s", name, e)
+
+            # Reload pending in case it was modified externally
+            pending = load_pending(config["pending_path"])
+            writes_since_prune += 1
+            if writes_since_prune >= 20:
+                removed_now = prune_old_build_logs(config["log_dir"], config["log_retention_days"])
+                if removed_now:
+                    log.info("Pruned %d old build log(s) during queue processing", removed_now)
+                writes_since_prune = 0
+
+            write_metrics(config, {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "processing",
+                "pending_start": cycle_stats["pending_start"],
+                "pending_end": len(pending),
+                "attempted": cycle_stats.get("attempted", 0),
+                "succeeded": cycle_stats.get("succeeded", 0),
+                "failed": cycle_stats.get("failed", 0),
+                "skipped_previous_failure": cycle_stats.get("skipped_previous_failure", 0),
+                "skipped_ineligible": cycle_stats.get("skipped_ineligible", 0),
+                "skipped_missing_keys": cycle_stats.get("skipped_missing_keys", 0),
+            })
+
+        if shutdown_flag:
+            break
+
+        # ----- Step 5: Sleep -----
+        elapsed = time.time() - cycle_start
+        sleep_time = max(0, config["poll_interval"] - elapsed)
+
+        pending_end = len(load_pending(config["pending_path"]))
+        metrics = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "sleeping",
+            "cycle_seconds": int(elapsed),
+            "sleep_seconds": int(sleep_time),
+            "pending_start": cycle_stats.get("pending_start", 0),
+            "pending_end": pending_end,
+            "attempted": cycle_stats.get("attempted", 0),
+            "succeeded": cycle_stats.get("succeeded", 0),
+            "failed": cycle_stats.get("failed", 0),
+            "skipped_previous_failure": cycle_stats.get("skipped_previous_failure", 0),
+            "skipped_ineligible": cycle_stats.get("skipped_ineligible", 0),
+            "skipped_missing_keys": cycle_stats.get("skipped_missing_keys", 0),
+        }
+        write_metrics(config, metrics)
+
+        removed_logs = prune_old_build_logs(config["log_dir"], config["log_retention_days"])
+        log.info(
+            "Cycle complete: pending %d -> %d, attempted=%d ok=%d failed=%d skipped(prev=%d ineligible=%d missing_keys=%d), pruned_logs=%d, sleeping %ds",
+            metrics["pending_start"],
+            metrics["pending_end"],
+            metrics["attempted"],
+            metrics["succeeded"],
+            metrics["failed"],
+            metrics["skipped_previous_failure"],
+            metrics["skipped_ineligible"],
+            metrics["skipped_missing_keys"],
+            removed_logs,
+            int(sleep_time),
+        )
+
+        # Interruptible sleep
+        sleep_end = time.time() + sleep_time
+        while time.time() < sleep_end and not shutdown_flag:
+            time.sleep(1)
+
+    log.info("Buildbot shutting down cleanly.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="buildbot",
+        description="arch-native package build daemon. No command starts the daemon.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        default="/etc/arch-native.conf",
+        metavar="FILE",
+        help="config file (default: /etc/arch-native.conf)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="verbose logging (daemon mode only)",
+    )
+
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    sub.add_parser("status", help="service state, current build, and queue counts")
+    sub.add_parser("doctor", help="health check: paths, GPG, chroot keyring, JSON integrity")
+
+    p_built = sub.add_parser("built", help="list successfully built packages")
+    p_built.add_argument("-n", type=int, default=0, dest="limit", metavar="N",
+        help="max entries to show (default: all)")
+
+    p_logs = sub.add_parser("logs", help="show the latest build log for a package")
+    p_logs.add_argument("package", metavar="PKG")
+    p_logs.add_argument("-f", "--follow", action="store_true",
+        help="follow the log (like tail -f)")
+
+    p_queue = sub.add_parser("queue", help="list the pending build queue")
+    p_queue.add_argument("-n", type=int, default=25, dest="limit", metavar="N",
+        help="max entries to show (default: 25)")
+
+    p_failed = sub.add_parser("failed", help="list failed builds")
+    p_failed.add_argument("-n", type=int, default=0, dest="limit", metavar="N",
+        help="max entries (default: all)")
+
+    p_retry = sub.add_parser("retry", help="move failed packages back to the queue")
+    p_retry.add_argument("packages", nargs="*", metavar="PKG")
+    p_retry.add_argument("--all", action="store_true", help="retry every failed package")
+    p_retry.add_argument("--dry-run", action="store_true")
+
+    p_clear = sub.add_parser("clear", help="remove packages from the failed list")
+    p_clear.add_argument("packages", nargs="*", metavar="PKG")
+    p_clear.add_argument("--all", action="store_true", help="clear the entire failed list")
+    p_clear.add_argument("--dry-run", action="store_true")
+
+    p_sync = sub.add_parser("sync",
+        help="recompute the pending queue from the manifest")
+    p_sync.add_argument("--reset", action="store_true",
+        help="clear the queue first, then rebuild from scratch")
+    p_sync.add_argument("--dry-run", action="store_true")
+
+    sub.add_parser("init",
+        help="bootstrap a new installation: create chroot, init keyring, set up dirs")
+
+    p_patch = sub.add_parser("patch", help="manage local PKGBUILD patches")
+    patch_sub = p_patch.add_subparsers(dest="patch_cmd", metavar="SUBCOMMAND")
+
+    p_pc = patch_sub.add_parser("create",
+        help="create a local patch by editing the upstream PKGBUILD in $EDITOR")
+    p_pc.add_argument("pkgname", metavar="PKG")
+    p_pc.add_argument("--force", action="store_true",
+        help="overwrite existing patch with a fresh copy of upstream")
+
+    p_ps = patch_sub.add_parser("show", help="print the local patch for a package")
+    p_ps.add_argument("pkgname", metavar="PKG")
+
+    p_pck = patch_sub.add_parser("check",
+        help="verify local patch(es) still apply against current upstream")
+    p_pck_group = p_pck.add_mutually_exclusive_group(required=True)
+    p_pck_group.add_argument("pkgname", nargs="?", metavar="PKG")
+    p_pck_group.add_argument("--all", action="store_true", help="check every local patch")
+
+    args = parser.parse_args()
+    if args.command:
+        config = load_config(args.config)
+        rc = run_cli(args, config)
+        raise SystemExit(rc)
+
+    run_daemon(args.config, args.debug)
+
+
+if __name__ == "__main__":
+    main()
