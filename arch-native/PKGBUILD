@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Rebuild installed Arch packages from source with CPU-optimized flags"
 arch=('any')
 license=('MIT')
-depends=('python' 'devtools' 'pacman' 'gnupg' 'rsync')
+depends=('python' 'devtools' 'pacman' 'gnupg' 'rsync' 'git')
 optdepends=(
     'nginx: to serve the local repo over HTTP'
     'artix-mirrorlist: for Artix Linux chroot support'

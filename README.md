@@ -468,12 +468,22 @@ Build server — main loop (every 300s):
 
 Priority is set by `repo_priority` (default: `local,artix,cachyos,arch`). First match wins.
 
-| Tier | Source | Notes |
-|---|---|---|
-| `local` | `pkgbuilds/local/<pkg>/<pkg>.patch` or `PKGBUILD` | `.patch` preferred; full copy logs a deprecation warning |
-| `artix` | `gitea.artixlinux.org/packages/<pkg>.git` | Cloned on demand, depth=1 |
-| `cachyos` | CachyOS PKGBUILDs monorepo | Walked with `os.walk` |
-| `arch` | `pkgctl repo clone --protocol=https` | Fetched on demand |
+| Tier | How it works |
+|---|---|
+| `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`. Applied on top of the upstream PKGBUILD at build time. |
+| `artix` | `git clone --depth=1` from `gitea.artixlinux.org/packages/<pkg>.git` on demand. Cached after first fetch. |
+| `cachyos` | Walks a locally cloned CachyOS PKGBUILDs monorepo. **Must be cloned manually** (see below). Updated each upstream check cycle via `git pull`. |
+| `arch` | `pkgctl repo clone --protocol=https <pkg>` (from `devtools`) on demand. Cached after first fetch. |
+
+The `artix` and `arch` tiers clone on demand — no setup needed. The `cachyos` tier
+requires a one-time manual clone before it can find anything:
+
+```bash
+sudo git clone --depth=1 https://github.com/CachyOS/CachyOS-PKGBUILDS \
+    /var/lib/arch-native/pkgbuilds/cachyos
+```
+
+If you don't use CachyOS, remove `cachyos` from `repo_priority` in the config.
 
 For split packages (e.g. `gcc-libs`): if a pkgname isn't found directly, the
 daemon looks up its pkgbase in the pacman sync DB and retries with that. After
