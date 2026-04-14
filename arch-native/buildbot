@@ -712,7 +712,17 @@ def cmd_failed_list(args, config: dict) -> int:
         retry_str = f"{retries}x"
         ts = rec.get("timestamp", "")[:10]
         reason = _sanitize_reason(rec.get("reason", "unknown"))
+        log_path = rec.get("log_path", "")
+        # Fall back to finding the latest log if stored path is gone
+        if not log_path or not os.path.isfile(log_path):
+            log_dir_pkg = os.path.join(config["log_dir"], name)
+            if os.path.isdir(log_dir_pkg):
+                logs = sorted((f for f in os.listdir(log_dir_pkg) if f.endswith(".log")), reverse=True)
+                if logs:
+                    log_path = os.path.join(log_dir_pkg, logs[0])
         print(f"  {name:<28} {rec.get('version','?'):<20} {retry_str:<5} {ts}  {reason}")
+        if log_path:
+            print(f"  {'':28} {log_path}")
     if limit < len(rows):
         print(f"  ... {len(rows) - limit} more")
     return 0
@@ -1476,6 +1486,7 @@ def run_daemon(config_path: str, debug: bool):
 
                     # Compile/link/etc failure — pull last non-empty line from log as reason
                     build_reason = "build failed"
+                    log_path_for_record = None
                     log_dir_pkg = os.path.join(config["log_dir"], name)
                     if os.path.isdir(log_dir_pkg):
                         logs = sorted(
@@ -1483,10 +1494,15 @@ def run_daemon(config_path: str, debug: bool):
                             reverse=True,
                         )
                         if logs:
+                            log_path_for_record = os.path.join(log_dir_pkg, logs[0])
                             try:
-                                with open(os.path.join(log_dir_pkg, logs[0]), "r", errors="replace") as lf:
+                                with open(log_path_for_record, "r", errors="replace") as lf:
                                     lines = [l.rstrip() for l in lf if l.strip()]
-                                if lines:
+                                # Skip transient "Build failed, check /chroot/path" lines
+                                meaningful = [l for l in lines if not l.startswith("==> ERROR: Build failed, check ")]
+                                if meaningful:
+                                    build_reason = _sanitize_reason(meaningful[-1])
+                                elif lines:
                                     build_reason = _sanitize_reason(lines[-1])
                             except Exception:
                                 pass
@@ -1495,6 +1511,7 @@ def run_daemon(config_path: str, debug: bool):
                     failed[name] = {
                         "version": pkg["version"],
                         "reason": build_reason,
+                        "log_path": log_path_for_record,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "retries": failed.get(name, {}).get("retries", 0) + 1,
                     }

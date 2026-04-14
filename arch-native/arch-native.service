@@ -11,7 +11,7 @@ User=root
 StandardOutput=journal
 StandardError=journal
 KillMode=control-group
-TimeoutStopSec=180
+TimeoutStopSec=14400
 
 [Install]
 WantedBy=multi-user.target

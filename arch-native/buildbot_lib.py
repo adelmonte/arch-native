@@ -1021,7 +1021,7 @@ def sign_packages(pkg_files: list[str], gnupg_home: str, build_user: str = "buil
 def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str):
     """
     Move packages + sigs to repo dir, then run repo-add.
-    Flags: -v (verbose) -p (prevent replace) -n (new only)
+    Flags: -v (verbose) -p (prevent downgrade)
     """
     moved = []
     for f in pkg_files:
@@ -1032,7 +1032,7 @@ def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str):
         if os.path.exists(sig):
             shutil.move(sig, os.path.join(repo_dir, os.path.basename(sig)))
 
-    cmd = ["repo-add", "-v", "-p", "-n", repo_db_path] + moved
+    cmd = ["repo-add", "-v", "-p", repo_db_path] + moved
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 and result.returncode != 1:
         raise RuntimeError(f"repo-add failed: {result.stderr}")
