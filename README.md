@@ -237,6 +237,17 @@ download_retry_limit = 3
 # --skippgpcheck. Source hashes (sha256/sha512) are still verified.
 # Packages built this way are flagged pgp_skipped:true in built.json.
 skip_pgp_on_import_failure = true
+
+# Auto-prune stale package files from the repo dir.
+# When a package is rebuilt with a new version, repo-add updates the database
+# but doesn't delete the old .pkg.tar.zst file. Auto-pruning removes orphans
+# (and their .sig files) immediately after each successful build, keeping only
+# the most recent version per package. Default: true.
+autoprune = true
+
+# How many recent versions to retain per package (must be >= 1). Default: 1.
+# Set to 2+ if you want a rollback fallback in the repo dir.
+autoprune_keep = 1
 ```
 
 ### Timing

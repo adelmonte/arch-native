@@ -1029,16 +1029,20 @@ def _pkgname_from_filename(filename: str) -> str:
     return parts[0] if len(parts) == 4 else basename
 
 
-def _prune_stale_versions(repo_dir: str, newly_added: list[str]) -> list[str]:
-    """For each newly added pkg, delete other version files for the same pkgname."""
-    new_basenames = {os.path.basename(f) for f in newly_added}
-    new_pkgnames  = {_pkgname_from_filename(f) for f in newly_added}
+def _prune_stale_versions(repo_dir: str, newly_added: list[str], keep: int = 1) -> list[str]:
+    """For each newly added pkg, keep the `keep` newest files for the same pkgname,
+    delete the rest (and their .sig siblings)."""
+    new_pkgnames = {_pkgname_from_filename(f) for f in newly_added}
 
     pruned = []
-    for f in Path(repo_dir).glob("*.pkg.tar.zst"):
-        if f.name in new_basenames:
-            continue
-        if _pkgname_from_filename(f.name) in new_pkgnames:
+    for pkgname in new_pkgnames:
+        files = sorted(
+            (f for f in Path(repo_dir).glob("*.pkg.tar.zst")
+             if _pkgname_from_filename(f.name) == pkgname),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        for f in files[keep:]:
             f.unlink()
             sig = Path(str(f) + ".sig")
             if sig.exists():
@@ -1048,10 +1052,11 @@ def _prune_stale_versions(repo_dir: str, newly_added: list[str]) -> list[str]:
     return pruned
 
 
-def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str):
+def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str,
+                autoprune: bool = True, autoprune_keep: int = 1):
     """
-    Move packages + sigs to repo dir, run repo-add, then delete older versions
-    of the same pkgname so the repo dir doesn't accumulate orphaned files.
+    Move packages + sigs to repo dir, run repo-add, then optionally prune older
+    versions of the same pkgname so the repo dir doesn't accumulate orphans.
     Flags: -v (verbose) -p (prevent downgrade)
     """
     moved = []
@@ -1069,7 +1074,8 @@ def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str):
         raise RuntimeError(f"repo-add failed: {result.stderr}")
     log.info("repo-add: added %d package(s)", len(moved))
 
-    _prune_stale_versions(repo_dir, moved)
+    if autoprune:
+        _prune_stale_versions(repo_dir, moved, keep=autoprune_keep)
     return moved
 
 

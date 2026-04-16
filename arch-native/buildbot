@@ -102,6 +102,8 @@ def load_config(path: str) -> dict:
     cfg["upstream_check_interval"] = sec.getint("upstream_check_interval", 3600)
     cfg["build_timeout"] = sec.getint("build_timeout", 14400)
     cfg["download_retry_limit"] = sec.getint("download_retry_limit", 3)
+    cfg["autoprune"] = sec.getboolean("autoprune", True)
+    cfg["autoprune_keep"] = max(1, sec.getint("autoprune_keep", 1))
     cfg["log_level"] = sec.get("log_level", "INFO")
 
     # Mode: local = build on the same machine you run the packages on.
@@ -464,65 +466,83 @@ def _queue_item_for(name: str, manifest_map: dict, fallback_version: str = "unkn
 
 
 def cmd_status(args, config: dict) -> int:
-    pending = load_pending(config["pending_path"])
-    failed_map = load_failed(config["failed_path"])
-    built = get_built_state(config["state_path"])
+    import fnmatch
+    # Colors — match `buildbot --help`
+    try:
+        from _colorize import can_colorize, get_theme
+        if can_colorize():
+            ap = get_theme().argparse
+            HEAD, LBL, R = ap.heading, ap.label, ap.reset
+            BOLD, DIM = "\033[1m", "\033[2m"
+            GRN, RED  = "\033[32m", "\033[31m"
+        else:
+            HEAD = LBL = R = BOLD = DIM = GRN = RED = ""
+    except ImportError:
+        HEAD = LBL = R = BOLD = DIM = GRN = RED = ""
+
+    from datetime import timezone as _tz
+    now = datetime.now(_tz.utc)
+
+    def _age(s):
+        if s < 60:    return f"{s}s"
+        if s < 3600:  return f"{s // 60}m"
+        if s < 86400: return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+        return f"{s // 86400}d{(s % 86400) // 3600:02d}h"
+
+    # ─── gather ─────────────────────────────────────────────────────
+    pending     = load_pending(config["pending_path"])
+    failed_map  = load_failed(config["failed_path"])
+    built       = get_built_state(config["state_path"])
     in_progress = load_in_progress(config)
-    metrics = None
+    active      = _service_active()
+    timeout     = int(config.get("build_timeout") or 0)
+
     metrics_mtime = None
     if os.path.exists(config["metrics_path"]):
+        try: metrics_mtime = os.stat(config["metrics_path"]).st_mtime
+        except Exception: pass
+
+    building = in_progress.get("name") if in_progress else None
+    elapsed = 0
+    if in_progress and in_progress.get("started_at"):
         try:
-            metrics = _load_json_strict(config["metrics_path"])
-            metrics_mtime = os.stat(config["metrics_path"]).st_mtime
+            started = datetime.fromisoformat(in_progress["started_at"])
+            elapsed = int((now - started).total_seconds())
         except Exception:
             pass
 
-    building = in_progress.get("name") if in_progress else None
+    stale_build  = bool(building and not active)
+    timed_out    = bool(building and timeout and elapsed > timeout)
 
-    # Elapsed time on current build
-    elapsed_str = ""
-    if in_progress:
-        started_at_str = in_progress.get("started_at")
-        if started_at_str:
-            try:
-                from datetime import timezone as _tz
-                started_at = datetime.fromisoformat(started_at_str)
-                elapsed = int((datetime.now(_tz.utc) - started_at).total_seconds())
-                if elapsed < 5:
-                    elapsed_str = "just started"
-                elif elapsed >= 3600:
-                    elapsed_str = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m elapsed"
-                elif elapsed >= 60:
-                    elapsed_str = f"{elapsed // 60}m elapsed"
-                else:
-                    elapsed_str = f"{elapsed}s elapsed"
-            except Exception:
-                pass
+    new_pkgs     = [p for p in pending if p.get("build_reason") == "new"]
+    update_pkgs  = [p for p in pending if p.get("build_reason") == "update"]
+    retry_pkgs   = [p for p in pending if p.get("build_reason") not in ("new", "update")]
+    next_pkg     = pending[0]["name"] if pending else None
 
-    # Count installed packages broken down by state
-    installed_total = 0
-    rebuilt_count = 0
-    manifest = []
+    recent = []
+    for n, e in built.items():
+        if not (isinstance(e, dict) and e.get("built_at")):
+            continue
+        try:
+            ts = datetime.fromisoformat(e["built_at"])
+            recent.append((n, e.get("version", "?"), int((now - ts).total_seconds())))
+        except Exception:
+            continue
+    recent.sort(key=lambda x: x[2])
+
+    installed_total = rebuilt_count = blacklisted_count = 0
+    blacklist = config.get("blacklist", [])
+    def _bl(name):
+        return any(name == e or fnmatch.fnmatch(name, e) for e in blacklist)
     try:
-        if config.get("mode") == "local":
-            manifest = read_local_packages()
-        else:
-            manifest = load_manifest(config["manifest_path"])
+        manifest = (read_local_packages() if config.get("mode") == "local"
+                    else load_manifest(config["manifest_path"]))
         installed_total = len(manifest)
-        for p in manifest:
-            if p["name"] in built:
-                rebuilt_count += 1
+        rebuilt_count = sum(1 for p in manifest if p["name"] in built)
+        blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
     except Exception:
         pass
 
-    # Pending breakdown by reason
-    new_count    = sum(1 for p in pending if p.get("build_reason") == "new")
-    update_count = sum(1 for p in pending if p.get("build_reason") == "update")
-    next_pkg     = pending[0]["name"] if pending else None
-
-    pct = rebuilt_count / installed_total if installed_total else 0
-
-    # Repo size
     repo_name = os.path.basename(config["repo_db"]).split(".db")[0]
     repo_size = ""
     try:
@@ -532,89 +552,95 @@ def cmd_status(args, config: dict) -> int:
     except Exception:
         pass
 
-    # Next scan countdown (daemon wakes up periodically to scan installed
-    # packages and queue any that are new or have upstream updates)
     scan_str = ""
-    if metrics_mtime:
-        remaining = int(config.get("poll_interval", 300) - (time.time() - metrics_mtime))
-        if remaining > 0:
-            scan_str = f"next scan in {remaining // 60}m {remaining % 60:02d}s" if remaining >= 60 else f"next scan in {remaining}s"
-        else:
-            scan_str = "scanning now"
+    if active and metrics_mtime:
+        rem = int(config.get("poll_interval", 300) - (now.timestamp() - metrics_mtime))
+        scan_str = f"in {_age(rem)}" if rem > 0 else "scanning now"
 
-    # Most recently completed package (read from built.json built_at timestamps)
-    last_completed = None
-    last_completed_age = None
-    if built:
-        try:
-            from datetime import timezone as _tz
-            latest_name, latest_entry = max(
-                ((n, e) for n, e in built.items() if isinstance(e, dict) and e.get("built_at")),
-                key=lambda kv: kv[1]["built_at"], default=(None, None))
-            if latest_name:
-                ts = datetime.fromisoformat(latest_entry["built_at"])
-                age = int((datetime.now(_tz.utc) - ts).total_seconds())
-                if age >= 86400:  last_completed_age = f"{age // 86400}d ago"
-                elif age >= 3600: last_completed_age = f"{age // 3600}h ago"
-                elif age >= 60:   last_completed_age = f"{age // 60}m ago"
-                else:             last_completed_age = f"{age}s ago"
-                last_completed = latest_name
-        except Exception:
-            pass
+    # ─── render ─────────────────────────────────────────────────────
+    def section(title, count=None):
+        suffix = f"  {DIM}{count}{R}" if count is not None else ""
+        print(f"{HEAD}{title}{R}{suffix}")
 
-    L = 11  # label column width ("Last build:" = 11)
+    def row(k, v, w=10):
+        print(f"  {LBL}{k:<{w}}{R}  {v}")
 
-    def row(label, value):
-        print(f"  {label:<{L}}  {value}")
-
-    print(f"arch-native  {'active' if _service_active() else 'inactive'}")
+    # Header
+    dot = f"{GRN}●{R}" if active else f"{RED}●{R}"
+    state = "active" if active else f"{RED}inactive{R}"
+    print(f"{BOLD}arch-native{R}  {dot} {state}")
     print()
 
     # Building
-    if building and elapsed_str:
-        row("Building:", f"{building}  ({elapsed_str})")
+    if stale_build:
+        section("Building")
+        row("status", f"{RED}stale — daemon not running{R}")
+        row("package", building)
+        row("started", f"{_age(elapsed)} ago")
+    elif timed_out:
+        section("Building")
+        row("package", f"{RED}{building}{R}")
+        row("elapsed", f"{RED}{_age(elapsed)}  ⚠ exceeded build_timeout ({_age(timeout)}){R}")
     elif building:
-        row("Building:", building)
+        section("Building")
+        row("package", f"{BOLD}{building}{R}")
+        row("elapsed", _age(elapsed) if elapsed else "just started")
     else:
-        row("Building:", "—")
-
-    # Queue
-    if pending:
-        parts = []
-        if new_count:    parts.append(f"{new_count} new")
-        if update_count: parts.append(f"{update_count} update{'s' if update_count != 1 else ''}")
-        if next_pkg:     parts.append(f"next: {next_pkg}")
-        detail = "  (" + " · ".join(parts) + ")" if parts else ""
-        row("Queue:", f"{len(pending)} waiting{detail}")
-    else:
-        row("Queue:", "0")
-
-    # Rebuilt
-    if installed_total:
-        row("Rebuilt:", f"{rebuilt_count} of {installed_total}  ({pct:.0%})")
-    else:
-        row("Rebuilt:", str(len(built)))
-
-    # Failed — show names if any, hint at command
-    if failed_map:
-        names = sorted(failed_map.keys())
-        SHOW = 4
-        if len(names) <= SHOW:
-            failed_val = " · ".join(names)
-        else:
-            failed_val = " · ".join(names[:SHOW]) + f"  (+{len(names) - SHOW} more · run: buildbot failed)"
-        row("Failed:", failed_val)
-    else:
-        row("Failed:", "0")
-
+        section("Building", f"{DIM}idle{R}")
     print()
 
-    if last_completed:
-        row("Last built:", f"{last_completed}  ·  {last_completed_age}")
+    # Queue
+    section("Queue", f"{len(pending)} pending")
+    if pending:
+        row("new", str(len(new_pkgs)))
+        row("updates", str(len(update_pkgs)))
+        if retry_pkgs:
+            row("retries", str(len(retry_pkgs)))
+        if next_pkg:
+            row("next", f"{BOLD}{next_pkg}{R}")
+    print()
 
-    repo_parts = [p for p in [repo_name, repo_size, scan_str] if p]
-    if repo_parts:
-        row("Repo:", " · ".join(repo_parts))
+    # Recently built
+    if recent:
+        section("Recently built")
+        top = recent[:5]
+        nw  = max(len(n) for n, _, _ in top)
+        vw  = max(len(v) for _, v, _ in top)
+        for n, v, age in top:
+            print(f"  {n:<{nw}}  {DIM}{v:<{vw}}{R}  {DIM}{_age(age)} ago{R}")
+        print()
+
+    # Failed — show top-N most recent with reason + age
+    if failed_map:
+        section("Failed", str(len(failed_map)))
+        rows = sorted(failed_map.items(),
+                      key=lambda kv: kv[1].get("timestamp", ""), reverse=True)
+        SHOW = 5
+        nw = max((len(n) for n, _ in rows[:SHOW]), default=0)
+        for n, rec in rows[:SHOW]:
+            age = ""
+            ts = rec.get("timestamp", "")
+            if ts:
+                try:
+                    age = f"{_age(int((now - datetime.fromisoformat(ts)).total_seconds()))} ago"
+                except Exception: pass
+            reason = _sanitize_reason(rec.get("reason", "unknown"))[:60]
+            print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {reason}")
+        if len(rows) > SHOW:
+            print(f"  {DIM}+{len(rows) - SHOW} more — run: buildbot failed{R}")
+        print()
+
+    # Repo / scan
+    section(f"Repo  {DIM}{repo_name}{R}")
+    if installed_total:
+        pct = rebuilt_count / installed_total * 100
+        row("rebuilt", f"{rebuilt_count} / {installed_total}  ({pct:.0f}%)")
+        if blacklisted_count:
+            row("skipped", f"{blacklisted_count} / {installed_total}  {DIM}(blacklist — see /etc/arch-native.conf){R}")
+    if repo_size:
+        row("size", repo_size)
+    if scan_str:
+        row("next scan", scan_str)
 
     return 0
 
@@ -1516,7 +1542,9 @@ def run_daemon(config_path: str, debug: bool):
                     log.info("[%s] signed %d package(s)", name, len(pkg_files))
 
                     moved = add_to_repo(
-                        pkg_files, config["repo_db"], config["repo_dir"]
+                        pkg_files, config["repo_db"], config["repo_dir"],
+                        autoprune=config["autoprune"],
+                        autoprune_keep=config["autoprune_keep"],
                     )
                     log.info("[%s] added to repo", name)
 
