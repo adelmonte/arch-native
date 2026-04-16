@@ -469,9 +469,11 @@ def cmd_status(args, config: dict) -> int:
     built = get_built_state(config["state_path"])
     in_progress = load_in_progress(config)
     metrics = None
+    metrics_mtime = None
     if os.path.exists(config["metrics_path"]):
         try:
             metrics = _load_json_strict(config["metrics_path"])
+            metrics_mtime = os.stat(config["metrics_path"]).st_mtime
         except Exception:
             pass
 
@@ -503,25 +505,82 @@ def cmd_status(args, config: dict) -> int:
     except Exception:
         pass
 
-    w = 10
-    print(f"{'service':<{w}} {'active' if _service_active() else 'inactive'}")
-    print(f"{'building':<{w}} {building or '—'}")
+    # Pending breakdown by reason
+    new_count    = sum(1 for p in pending if p.get("build_reason") == "new")
+    update_count = sum(1 for p in pending if p.get("build_reason") == "update")
+    next_pkg     = pending[0]["name"] if pending else None
+
+    # Progress bar
+    BAR_W = 22
+    pct   = rebuilt_count / installed_total if installed_total else 0
+    bar   = "█" * int(pct * BAR_W) + "░" * (BAR_W - int(pct * BAR_W))
+
+    # Repo name + size
+    repo_name = os.path.basename(config["repo_db"]).split(".db")[0]
+    repo_size = ""
+    try:
+        r = subprocess.run(["du", "-sh", config["repo_dir"]], capture_output=True, text=True)
+        if r.returncode == 0:
+            repo_size = r.stdout.split()[0]
+    except Exception:
+        pass
+
+    # Next poll countdown
+    poll_str = ""
+    if metrics_mtime:
+        remaining = int(config.get("poll_interval", 300) - (time.time() - metrics_mtime))
+        if remaining > 0:
+            poll_str = f"next poll in {remaining // 60}m {remaining % 60:02d}s" if remaining >= 60 else f"next poll in {remaining}s"
+        else:
+            poll_str = "polling now"
+
+    # Last run age
+    age_str = ""
+    if metrics_mtime:
+        age = int(max(0, time.time() - metrics_mtime))
+        age_str = f"{age // 60}m ago" if age >= 60 else f"{age}s ago"
+
+    L = 8  # label column width, right-aligned
+
+    def row(label, value):
+        print(f"  {label:>{L}}  {value}")
+
+    print(f"● arch-native — package build daemon")
+    row("status",   "active" if _service_active() else "inactive")
+
     if installed_total:
-        print(f"{'rebuilt':<{w}} {rebuilt_count} / {installed_total} installed")
+        row("rebuilt", f"[{bar}] {rebuilt_count} / {installed_total}  ({pct:.0%})")
     else:
-        print(f"{'rebuilt':<{w}} {len(built)}")
-    print(f"{'pending':<{w}} {len(pending)}")
-    print(f"{'failed':<{w}} {len(failed_map)}")
+        row("rebuilt", str(len(built)))
+
+    row("building", building or "—")
+
+    if pending:
+        parts = []
+        if new_count:    parts.append(f"{new_count} new")
+        if update_count: parts.append(f"{update_count} updates")
+        if next_pkg:     parts.append(f"next: {next_pkg}")
+        detail = "  (" + "  ·  ".join(parts) + ")" if parts else ""
+        row("pending", f"{len(pending)}{detail}")
+    else:
+        row("pending", "0")
+
+    health = f"{len(failed_map)}"
     if installed_total:
-        print(f"{'blacklisted':<{w}} {blacklisted_count}")
-        print(f"{'not queued':<{w}} {not_queued_count}  (AUR / binary / split-pkg)")
+        health += f"  ·  blacklisted  {blacklisted_count}  ·  not queued  {not_queued_count}"
+    row("failed", health)
 
     if metrics:
-        age = int(max(0, time.time() - os.stat(config["metrics_path"]).st_mtime))
-        age_str = f"{age // 60}m ago" if age >= 60 else f"{age}s ago"
-        n_built = metrics.get("succeeded", 0)
+        n_built  = metrics.get("succeeded", 0)
         n_failed = metrics.get("failed", 0)
-        print(f"{'last run':<{w}} {n_built} built, {n_failed} failed  ({age_str})")
+        parts = [f"{n_built} built", f"{n_failed} failed"]
+        if age_str: parts.append(age_str)
+        row("last run", "  ·  ".join(parts))
+
+    repo_parts = [p for p in [repo_name, repo_size, poll_str] if p]
+    if repo_parts:
+        row("repo", "  ·  ".join(repo_parts))
+
     return 0
 
 
