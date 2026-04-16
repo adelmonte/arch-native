@@ -479,11 +479,27 @@ def cmd_status(args, config: dict) -> int:
 
     building = in_progress.get("name") if in_progress else None
 
+    # Elapsed time on current build
+    elapsed_str = ""
+    if in_progress:
+        started_at_str = in_progress.get("started_at")
+        if started_at_str:
+            try:
+                from datetime import timezone as _tz
+                started_at = datetime.fromisoformat(started_at_str)
+                elapsed = int((datetime.now(_tz.utc) - started_at).total_seconds())
+                if elapsed >= 3600:
+                    elapsed_str = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m"
+                elif elapsed >= 60:
+                    elapsed_str = f"{elapsed // 60}m"
+                else:
+                    elapsed_str = f"{elapsed}s"
+            except Exception:
+                pass
+
     # Count installed packages broken down by state
     installed_total = 0
     rebuilt_count = 0
-    blacklisted_count = 0
-    not_queued_count = 0
     manifest = []
     try:
         if config.get("mode") == "local":
@@ -491,17 +507,9 @@ def cmd_status(args, config: dict) -> int:
         else:
             manifest = load_manifest(config["manifest_path"])
         installed_total = len(manifest)
-        blacklist = set(config.get("blacklist", []))
-        pending_names = {p["name"] for p in pending}
-        failed_names = set(failed_map.keys())
         for p in manifest:
-            name = p["name"]
-            if name in built:
+            if p["name"] in built:
                 rebuilt_count += 1
-            if name in blacklist:
-                blacklisted_count += 1
-            elif name not in built and name not in pending_names and name not in failed_names:
-                not_queued_count += 1
     except Exception:
         pass
 
@@ -512,7 +520,7 @@ def cmd_status(args, config: dict) -> int:
 
     pct = rebuilt_count / installed_total if installed_total else 0
 
-    # Repo name + size
+    # Repo size
     repo_name = os.path.basename(config["repo_db"]).split(".db")[0]
     repo_size = ""
     try:
@@ -531,49 +539,70 @@ def cmd_status(args, config: dict) -> int:
         else:
             poll_str = "polling now"
 
-    # Last run age
+    # Last build age
     age_str = ""
     if metrics_mtime:
         age = int(max(0, time.time() - metrics_mtime))
         age_str = f"{age // 60}m ago" if age >= 60 else f"{age}s ago"
 
-    L = 10  # label column width, right-aligned ("last build" = 10)
+    L = 11  # label column width ("Last build:" = 11)
 
     def row(label, value):
-        print(f"  {label:>{L}}  {value}")
+        print(f"  {label:<{L}}  {value}")
 
-    print(f"● arch-native — package build daemon")
-    row("status",   "active" if _service_active() else "inactive")
+    print(f"arch-native  {'active' if _service_active() else 'inactive'}")
+    print()
 
-    if installed_total:
-        row("rebuilt", f"{rebuilt_count} / {installed_total} ({pct:.0%})")
+    # Building
+    if building and elapsed_str:
+        row("Building:", f"{building}  ({elapsed_str} elapsed)")
+    elif building:
+        row("Building:", building)
     else:
-        row("rebuilt", str(len(built)))
+        row("Building:", "—")
 
-    row("building", building or "—")
-
+    # Queue
     if pending:
         parts = []
         if new_count:    parts.append(f"{new_count} new")
-        if update_count: parts.append(f"{update_count} updates")
+        if update_count: parts.append(f"{update_count} update{'s' if update_count != 1 else ''}")
         if next_pkg:     parts.append(f"next: {next_pkg}")
         detail = "  (" + " · ".join(parts) + ")" if parts else ""
-        row("pending", f"{len(pending)}{detail}")
+        row("Queue:", f"{len(pending)} waiting{detail}")
     else:
-        row("pending", "0")
+        row("Queue:", "0")
 
-    row("failed", str(len(failed_map)))
+    # Rebuilt
+    if installed_total:
+        row("Rebuilt:", f"{rebuilt_count} of {installed_total}  ({pct:.0%})")
+    else:
+        row("Rebuilt:", str(len(built)))
 
+    # Failed — show names if any, hint at command
+    if failed_map:
+        names = sorted(failed_map.keys())
+        SHOW = 4
+        if len(names) <= SHOW:
+            failed_val = " · ".join(names)
+        else:
+            failed_val = " · ".join(names[:SHOW]) + f"  (+{len(names) - SHOW} more · run: buildbot failed)"
+        row("Failed:", failed_val)
+    else:
+        row("Failed:", "0")
+
+    print()
+
+    # Last build
     if metrics:
         n_built  = metrics.get("succeeded", 0)
         n_failed = metrics.get("failed", 0)
         parts = [f"{n_built} built", f"{n_failed} failed"]
         if age_str: parts.append(age_str)
-        row("last build", " · ".join(parts))
+        row("Last build:", " · ".join(parts))
 
     repo_parts = [p for p in [repo_name, repo_size, poll_str] if p]
     if repo_parts:
-        row("repo", " · ".join(repo_parts))
+        row("Repo:", " · ".join(repo_parts))
 
     return 0
 
@@ -638,9 +667,12 @@ def cmd_doctor(args, config: dict) -> int:
 def cmd_queue_show(args, config: dict) -> int:
     pending = load_pending(config["pending_path"])
     limit = max(1, args.limit) if args.limit else len(pending)
+    visible = pending[:limit]
     print(f"pending  {len(pending)}\n")
-    for idx, pkg in enumerate(pending[:limit], 1):
-        print(f"  {idx:<4} {pkg.get('name','?'):<28} {pkg.get('version','?'):<20} {pkg.get('build_reason','?')}")
+    name_w    = max((len(p.get("name",    "?")) for p in visible), default=20)
+    version_w = max((len(p.get("version", "?")) for p in visible), default=12)
+    for idx, pkg in enumerate(visible, 1):
+        print(f"  {idx:<4} {pkg.get('name','?'):<{name_w}}  {pkg.get('version','?'):<{version_w}}  {pkg.get('build_reason','?')}")
     if limit < len(pending):
         print(f"  ... {len(pending) - limit} more")
     return 0
