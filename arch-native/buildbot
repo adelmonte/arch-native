@@ -488,12 +488,14 @@ def cmd_status(args, config: dict) -> int:
                 from datetime import timezone as _tz
                 started_at = datetime.fromisoformat(started_at_str)
                 elapsed = int((datetime.now(_tz.utc) - started_at).total_seconds())
-                if elapsed >= 3600:
-                    elapsed_str = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m"
+                if elapsed < 5:
+                    elapsed_str = "just started"
+                elif elapsed >= 3600:
+                    elapsed_str = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m elapsed"
                 elif elapsed >= 60:
-                    elapsed_str = f"{elapsed // 60}m"
+                    elapsed_str = f"{elapsed // 60}m elapsed"
                 else:
-                    elapsed_str = f"{elapsed}s"
+                    elapsed_str = f"{elapsed}s elapsed"
             except Exception:
                 pass
 
@@ -530,20 +532,35 @@ def cmd_status(args, config: dict) -> int:
     except Exception:
         pass
 
-    # Next poll countdown
-    poll_str = ""
+    # Next scan countdown (daemon wakes up periodically to scan installed
+    # packages and queue any that are new or have upstream updates)
+    scan_str = ""
     if metrics_mtime:
         remaining = int(config.get("poll_interval", 300) - (time.time() - metrics_mtime))
         if remaining > 0:
-            poll_str = f"next poll in {remaining // 60}m {remaining % 60:02d}s" if remaining >= 60 else f"next poll in {remaining}s"
+            scan_str = f"next scan in {remaining // 60}m {remaining % 60:02d}s" if remaining >= 60 else f"next scan in {remaining}s"
         else:
-            poll_str = "polling now"
+            scan_str = "scanning now"
 
-    # Last build age
-    age_str = ""
-    if metrics_mtime:
-        age = int(max(0, time.time() - metrics_mtime))
-        age_str = f"{age // 60}m ago" if age >= 60 else f"{age}s ago"
+    # Most recently completed package (read from built.json built_at timestamps)
+    last_completed = None
+    last_completed_age = None
+    if built:
+        try:
+            from datetime import timezone as _tz
+            latest_name, latest_entry = max(
+                ((n, e) for n, e in built.items() if isinstance(e, dict) and e.get("built_at")),
+                key=lambda kv: kv[1]["built_at"], default=(None, None))
+            if latest_name:
+                ts = datetime.fromisoformat(latest_entry["built_at"])
+                age = int((datetime.now(_tz.utc) - ts).total_seconds())
+                if age >= 86400:  last_completed_age = f"{age // 86400}d ago"
+                elif age >= 3600: last_completed_age = f"{age // 3600}h ago"
+                elif age >= 60:   last_completed_age = f"{age // 60}m ago"
+                else:             last_completed_age = f"{age}s ago"
+                last_completed = latest_name
+        except Exception:
+            pass
 
     L = 11  # label column width ("Last build:" = 11)
 
@@ -555,7 +572,7 @@ def cmd_status(args, config: dict) -> int:
 
     # Building
     if building and elapsed_str:
-        row("Building:", f"{building}  ({elapsed_str} elapsed)")
+        row("Building:", f"{building}  ({elapsed_str})")
     elif building:
         row("Building:", building)
     else:
@@ -592,15 +609,10 @@ def cmd_status(args, config: dict) -> int:
 
     print()
 
-    # Last build
-    if metrics:
-        n_built  = metrics.get("succeeded", 0)
-        n_failed = metrics.get("failed", 0)
-        parts = [f"{n_built} built", f"{n_failed} failed"]
-        if age_str: parts.append(age_str)
-        row("Last build:", " · ".join(parts))
+    if last_completed:
+        row("Last built:", f"{last_completed}  ·  {last_completed_age}")
 
-    repo_parts = [p for p in [repo_name, repo_size, poll_str] if p]
+    repo_parts = [p for p in [repo_name, repo_size, scan_str] if p]
     if repo_parts:
         row("Repo:", " · ".join(repo_parts))
 

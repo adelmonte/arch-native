@@ -1018,9 +1018,40 @@ def sign_packages(pkg_files: list[str], gnupg_home: str, build_user: str = "buil
 # ---------------------------------------------------------------------------
 # Repo management
 # ---------------------------------------------------------------------------
+def _pkgname_from_filename(filename: str) -> str:
+    """Extract pkgname from a filename like {name}-{ver}-{rel}-{arch}.pkg.tar.zst"""
+    basename = os.path.basename(filename)
+    for ext in (".pkg.tar.zst", ".pkg.tar.xz"):
+        if basename.endswith(ext):
+            basename = basename[:-len(ext)]
+            break
+    parts = basename.rsplit("-", 3)
+    return parts[0] if len(parts) == 4 else basename
+
+
+def _prune_stale_versions(repo_dir: str, newly_added: list[str]) -> list[str]:
+    """For each newly added pkg, delete other version files for the same pkgname."""
+    new_basenames = {os.path.basename(f) for f in newly_added}
+    new_pkgnames  = {_pkgname_from_filename(f) for f in newly_added}
+
+    pruned = []
+    for f in Path(repo_dir).glob("*.pkg.tar.zst"):
+        if f.name in new_basenames:
+            continue
+        if _pkgname_from_filename(f.name) in new_pkgnames:
+            f.unlink()
+            sig = Path(str(f) + ".sig")
+            if sig.exists():
+                sig.unlink()
+            pruned.append(f.name)
+            log.info("Pruned stale: %s", f.name)
+    return pruned
+
+
 def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str):
     """
-    Move packages + sigs to repo dir, then run repo-add.
+    Move packages + sigs to repo dir, run repo-add, then delete older versions
+    of the same pkgname so the repo dir doesn't accumulate orphaned files.
     Flags: -v (verbose) -p (prevent downgrade)
     """
     moved = []
@@ -1037,6 +1068,8 @@ def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str):
     if result.returncode != 0 and result.returncode != 1:
         raise RuntimeError(f"repo-add failed: {result.stderr}")
     log.info("repo-add: added %d package(s)", len(moved))
+
+    _prune_stale_versions(repo_dir, moved)
     return moved
 
 
