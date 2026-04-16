@@ -510,10 +510,7 @@ def cmd_status(args, config: dict) -> int:
     update_count = sum(1 for p in pending if p.get("build_reason") == "update")
     next_pkg     = pending[0]["name"] if pending else None
 
-    # Progress bar
-    BAR_W = 22
-    pct   = rebuilt_count / installed_total if installed_total else 0
-    bar   = "█" * int(pct * BAR_W) + "░" * (BAR_W - int(pct * BAR_W))
+    pct = rebuilt_count / installed_total if installed_total else 0
 
     # Repo name + size
     repo_name = os.path.basename(config["repo_db"]).split(".db")[0]
@@ -549,7 +546,7 @@ def cmd_status(args, config: dict) -> int:
     row("status",   "active" if _service_active() else "inactive")
 
     if installed_total:
-        row("rebuilt", f"[{bar}] {rebuilt_count} / {installed_total} ({pct:.0%})")
+        row("rebuilt", f"{rebuilt_count} / {installed_total} ({pct:.0%})")
     else:
         row("rebuilt", str(len(built)))
 
