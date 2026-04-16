@@ -540,7 +540,7 @@ def cmd_status(args, config: dict) -> int:
         age = int(max(0, time.time() - metrics_mtime))
         age_str = f"{age // 60}m ago" if age >= 60 else f"{age}s ago"
 
-    L = 8  # label column width, right-aligned
+    L = 10  # label column width, right-aligned ("last cycle" = 10)
 
     def row(label, value):
         print(f"  {label:>{L}}  {value}")
@@ -549,7 +549,7 @@ def cmd_status(args, config: dict) -> int:
     row("status",   "active" if _service_active() else "inactive")
 
     if installed_total:
-        row("rebuilt", f"[{bar}] {rebuilt_count} / {installed_total}  ({pct:.0%})")
+        row("rebuilt", f"[{bar}] {rebuilt_count} / {installed_total} ({pct:.0%})")
     else:
         row("rebuilt", str(len(built)))
 
@@ -560,26 +560,26 @@ def cmd_status(args, config: dict) -> int:
         if new_count:    parts.append(f"{new_count} new")
         if update_count: parts.append(f"{update_count} updates")
         if next_pkg:     parts.append(f"next: {next_pkg}")
-        detail = "  (" + "  ·  ".join(parts) + ")" if parts else ""
+        detail = "  (" + " · ".join(parts) + ")" if parts else ""
         row("pending", f"{len(pending)}{detail}")
     else:
         row("pending", "0")
 
-    health = f"{len(failed_map)}"
+    row("failed", str(len(failed_map)))
+
     if installed_total:
-        health += f"  ·  blacklisted  {blacklisted_count}  ·  not queued  {not_queued_count}"
-    row("failed", health)
+        row("skipped", f"{blacklisted_count} blacklisted · {not_queued_count} not queued (AUR / arch=any / split-pkg)")
 
     if metrics:
         n_built  = metrics.get("succeeded", 0)
         n_failed = metrics.get("failed", 0)
         parts = [f"{n_built} built", f"{n_failed} failed"]
         if age_str: parts.append(age_str)
-        row("last run", "  ·  ".join(parts))
+        row("last cycle", " · ".join(parts))
 
     repo_parts = [p for p in [repo_name, repo_size, poll_str] if p]
     if repo_parts:
-        row("repo", "  ·  ".join(repo_parts))
+        row("repo", " · ".join(repo_parts))
 
     return 0
 
