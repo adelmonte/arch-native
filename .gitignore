@@ -9,7 +9,7 @@ FORGE.md
 deploy
 
 # local AUR release staging (personal reference only)
-.Releases/
+Releases/
 
 # makepkg build artifacts
 *.pkg.tar.zst
