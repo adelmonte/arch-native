@@ -333,19 +333,27 @@ distro = arch
 ### PKGBUILD resolution
 
 ```ini
-# Order in which PKGBUILD sources are checked (left = higher priority).
-# Supported tiers: local, artix, cachyos, arch
+# Tier names can be anything. Each non-local tier needs a <name>_source entry.
 # Default: local,arch
 repo_priority = local,arch
 
-# Git URL template for the artix tier. {pkgname} is substituted at clone time.
-# Change this to point at a different gitea instance or an Artix-compatible fork.
-# artix_clone_url = https://gitea.artixlinux.org/packages/{pkgname}.git
+# Source definition for each tier:
+#   clone <url>   — git clone per package on demand ({pkgname} substituted)
+#   monorepo      — walk pkgbuilds/<tier>/ tree; git-pulled each upstream cycle
+#   pkgctl        — use Arch devtools pkgctl (Arch Linux official repos only)
+#
+# Built-in defaults (no entry needed for these):
+#   artix_source  = clone https://gitea.artixlinux.org/packages/{pkgname}.git
+#   cachyos_source = monorepo
+#   arch_source   = pkgctl
+#
+# Add your own:
+# myfork_source = clone https://git.example.com/packages/{pkgname}.git
+# mypkgs_source = monorepo
 ```
 
 See [PKGBUILD tier resolution](#pkgbuild-tier-resolution) in the Architecture
-section for how each tier works and how to extend the `cachyos` tier with your
-own PKGBUILD collection.
+section for a full explanation of each type.
 
 ### Blacklists
 
@@ -745,52 +753,50 @@ Build server — main loop (poll_interval = 300s):
 
 ### PKGBUILD tier resolution
 
-Priority is set by `repo_priority` (default: `local,arch`). First match wins.
+Priority is set by `repo_priority`. Tier names can be anything — each maps to a
+source type defined in config. First match wins.
 
-| Tier | How it works | Auto-updated? |
+| Source type | How it works | Auto-updated? |
 |---|---|---|
-| `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`. Applied on top of the upstream PKGBUILD at build time. A full `PKGBUILD` file is also supported but patches are preferred — full copies go stale silently. | No — user-managed |
-| `artix` | `git clone --depth=1` from `artix_clone_url` (default: `gitea.artixlinux.org/packages/<pkg>.git`) on first use. Cached in `pkgbuilds/artix/<pkg>/`. Useful for packages that need init-system substitutions. | **No** — snapshot at clone time; manually refresh with `git -C pkgbuilds/artix/<pkg> pull` |
-| `cachyos` | Walks a locally-cloned PKGBUILD monorepo at `pkgbuilds/cachyos/`. Searched by directory name matching pkgname. | Yes — `git pull` run on the whole monorepo each `upstream_check_interval` |
-| `arch` | `pkgctl repo clone --protocol=https <pkg>` (from `devtools`) on first use. Cached in `pkgbuilds/arch/<pkg>/`. | Yes — per-package `git pull` run each `upstream_check_interval` |
+| `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`, applied on top of the upstream PKGBUILD. Full `PKGBUILD` copies also work but go stale silently — prefer patches. | No — user-managed |
+| `clone <url>` | `git clone --depth=1 <url>` on first use, cached in `pkgbuilds/<tier>/<pkg>/`. `{pkgname}` in the URL is substituted at clone time. Checks both the root and a `trunk/` subdirectory for the PKGBUILD. | **No** — snapshot; refresh with `git -C pkgbuilds/<tier>/<pkg> pull` or delete to re-clone |
+| `monorepo` | Walks `pkgbuilds/<tier>/`, matching subdirectories by pkgname. Clone the repo manually once; the daemon pulls it each `upstream_check_interval`. | Yes — whole-repo `git pull` each cycle |
+| `pkgctl` | `pkgctl repo clone --protocol=https <pkg>` from Arch Linux. Requires `devtools`. Cached in `pkgbuilds/<tier>/<pkg>/`. | Yes — per-package `git pull` each cycle |
 
-The `artix` and `arch` tiers clone on demand — no setup needed. The `cachyos`
-tier requires a one-time manual clone:
+**Built-in tier defaults** — these names work with no config entry needed:
 
-> **Note:** artix clones are depth-1 snapshots taken on first use and are **not**
-> pulled automatically. If a package fails to build due to a stale artix PKGBUILD,
-> refresh it manually:
-> ```bash
-> sudo git -C /var/lib/arch-native/pkgbuilds/artix/<pkg> pull
-> ```
-> Or delete the directory to force a fresh clone on the next build.
+| Name | Default source |
+|---|---|
+| `artix` | `clone https://gitea.artixlinux.org/packages/{pkgname}.git` |
+| `cachyos` | `monorepo` — clone manually to `pkgbuilds/cachyos/` |
+| `arch` | `pkgctl` |
+
+**Adding your own tiers** — name them anything, define the source, add to `repo_priority`:
+
+```ini
+# A personal gitea with per-package repos:
+repo_priority = local,myfork,arch
+myfork_source = clone https://git.example.com/packages/{pkgname}.git
+
+# A local PKGBUILD monorepo:
+repo_priority = local,mypkgs,arch
+mypkgs_source = monorepo
+# sudo git clone --depth=1 https://git.example.com/pkgbuilds /var/lib/arch-native/pkgbuilds/mypkgs
+
+# Multiple custom tiers stacked with the built-ins:
+repo_priority = local,myfork,artix,arch
+myfork_source = clone https://git.example.com/packages/{pkgname}.git
+```
+
+To use CachyOS PKGBUILDs (or any compatible monorepo), clone it once and add it to `repo_priority`:
 
 ```bash
 sudo git clone --depth=1 https://github.com/CachyOS/CachyOS-PKGBUILDS \
     /var/lib/arch-native/pkgbuilds/cachyos
 ```
-
-**Using the `cachyos` tier for other repos** — the tier name is `cachyos` but
-the logic works for any PKGBUILD monorepo: a directory tree where packages live
-in subdirectories named after the pkgname, each containing a `PKGBUILD`. If you
-maintain your own PKGBUILD collection (or mirror another distro's), clone it to
-`pkgbuilds/cachyos/` to slot it in between `artix` and `arch`. Only one
-monorepo slot is supported per config; `repo_priority` controls whether it runs
-before or after `artix`.
-
-Enable it in your config:
-
 ```ini
 repo_priority = local,cachyos,arch
 ```
-
-Or, if you also use Artix and want Artix PKGBUILDs to take priority:
-
-```ini
-repo_priority = local,artix,cachyos,arch
-```
-
-If you don't use the `cachyos` tier, leave it out of `repo_priority` entirely.
 
 ### Split packages and pkgbase resolution
 
@@ -909,9 +915,10 @@ that it moves to `failed.json` with a clear reason like
 │   │   └── <pkg>/
 │   │       ├── <pkg>.patch     preferred: diff -u against upstream
 │   │       └── _patched/       working dir (auto-generated, do not edit)
-│   ├── artix/          git clones from gitea.artixlinux.org (tier 2)
-│   ├── cachyos/        locally-cloned PKGBUILD monorepo (tier 3)
-│   └── arch/           pkgctl clones from Arch (tier 4)
+│   ├── <tier>/         one directory per configured tier
+│   │   └── <pkg>/      clone-type: per-package git clone
+│   │   or flat tree    monorepo-type: walked by pkgname
+│   └── ...             pkgctl-type: pkgctl clones (e.g. arch/)
 │
 └── repo/
     ├── <repo_name>.db.tar.zst

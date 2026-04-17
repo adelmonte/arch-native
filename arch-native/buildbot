@@ -142,25 +142,48 @@ def load_config(path: str) -> dict:
     # Artix-specific config; Arch users should supply their own.
     cfg["chroot_pacman_conf"] = sec.get("chroot_pacman_conf", "")
 
-    repo_priority_str = sec.get("repo_priority", "local,artix,cachyos,arch")
-    allowed_tiers = ["local", "artix", "cachyos", "arch"]
+    repo_priority_str = sec.get("repo_priority", "local,arch")
     repo_priority = []
     for raw in repo_priority_str.split(","):
         tier = raw.strip().lower()
-        if not tier:
-            continue
-        if tier not in allowed_tiers:
-            log.warning("Ignoring unknown repo tier '%s' in repo_priority", tier)
-            continue
-        if tier not in repo_priority:
+        if tier and tier not in repo_priority:
             repo_priority.append(tier)
     if not repo_priority:
-        repo_priority = allowed_tiers
+        repo_priority = ["local", "arch"]
     cfg["repo_priority"] = repo_priority
-    cfg["artix_clone_url"] = sec.get(
-        "artix_clone_url",
-        "https://gitea.artixlinux.org/packages/{pkgname}.git",
-    )
+
+    # Built-in source defaults — used when a tier has no explicit <name>_source entry.
+    _builtin = {
+        "artix":   "clone https://gitea.artixlinux.org/packages/{pkgname}.git",
+        "cachyos": "monorepo",
+        "arch":    "pkgctl",
+    }
+    tier_sources = {}
+    for tier in repo_priority:
+        if tier == "local":
+            continue
+        raw_src = sec.get(f"{tier}_source", _builtin.get(tier))
+        if raw_src is None:
+            log.warning(
+                "Tier '%s' has no source configured (add '%s_source' to config) — skipping",
+                tier, tier,
+            )
+            continue
+        parts = raw_src.strip().split(None, 1)
+        kind = parts[0].lower()
+        if kind == "clone":
+            if len(parts) < 2:
+                log.warning("Tier '%s': clone source requires a URL — skipping", tier)
+                continue
+            tier_sources[tier] = {"type": "clone", "url": parts[1]}
+        elif kind in ("monorepo", "pkgctl"):
+            tier_sources[tier] = {"type": kind}
+        else:
+            log.warning(
+                "Tier '%s': unknown source type '%s' (expected: clone <url>, monorepo, pkgctl) — skipping",
+                tier, kind,
+            )
+    cfg["tier_sources"] = tier_sources
 
     blacklist_str = sec.get("blacklist", "gcc,glibc,coreutils,linux-api-headers")
     cfg["blacklist"] = [s.strip() for s in blacklist_str.split(",") if s.strip()]
@@ -292,18 +315,24 @@ def clear_in_progress(config: dict):
 # ---------------------------------------------------------------------------
 # Upstream version checking
 # ---------------------------------------------------------------------------
+def _fmt_srcinfo_ver(si: dict) -> str:
+    epoch = si.get("epoch", "")
+    return f"{epoch}:{si['pkgver']}-{si['pkgrel']}" if epoch else f"{si['pkgver']}-{si['pkgrel']}"
+
+
 def check_upstream_updates(manifest, built, config):
     """
     For each built package in the manifest, compare built version against
     current upstream. Returns list of packages needing rebuild.
     """
     updates = []
-    repo_priority = config.get("repo_priority", ["local", "artix", "cachyos", "arch"])
+    repo_priority = config.get("repo_priority", ["local", "arch"])
+    tier_sources = config.get("tier_sources", {})
+    pkgbuilds_dir = config["pkgbuilds_dir"]
 
     blacklist = config.get("blacklist", [])
     for pkg in manifest:
         name = pkg["name"]
-        # Skip AUR packages and blacklisted packages
         if pkg.get("repo") == "unknown":
             continue
         if name in blacklist:
@@ -312,13 +341,11 @@ def check_upstream_updates(manifest, built, config):
             continue
 
         built_ver = built[name]["version"]
-        # Strip our dot-bump to get the base version for comparison
-        # e.g., "3.4.1-1.1" -> base upstream is "3.4.1-1"
-        base_ver = built_ver
         ver_parts = built_ver.rsplit("-", 1)
         if len(ver_parts) == 2 and "." in ver_parts[1]:
-            pkgrel_parts = ver_parts[1].split(".")
-            base_ver = ver_parts[0] + "-" + pkgrel_parts[0]
+            base_ver = ver_parts[0] + "-" + ver_parts[1].split(".")[0]
+        else:
+            base_ver = built_ver
 
         upstream_ver = None
 
@@ -327,90 +354,63 @@ def check_upstream_updates(manifest, built, config):
                 break
 
             if tier == "local":
-                local_dir = os.path.join(config["pkgbuilds_dir"], "local", name)
+                local_dir = os.path.join(pkgbuilds_dir, "local", name)
                 if os.path.isfile(os.path.join(local_dir, "PKGBUILD")):
                     try:
-                        si = parse_srcinfo(local_dir, config["build_user"])
-                        epoch = si.get("epoch", "")
-                        if epoch:
-                            upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
-                        else:
-                            upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
+                        upstream_ver = _fmt_srcinfo_ver(parse_srcinfo(local_dir, config["build_user"]))
                     except Exception as e:
                         log.debug("[%s] failed to parse local srcinfo: %s", name, e)
+                continue
 
-            elif tier == "artix":
-                artix_dir = os.path.join(config["pkgbuilds_dir"], "artix", name)
-                candidates = [
-                    os.path.join(artix_dir, "PKGBUILD"),
-                    os.path.join(artix_dir, "trunk", "PKGBUILD"),
-                ]
-                src_dir = None
-                for candidate in candidates:
+            src = tier_sources.get(tier)
+            if src is None:
+                continue
+            kind = src["type"]
+            tier_base = os.path.join(pkgbuilds_dir, tier)
+
+            if kind == "clone":
+                pkg_dir = os.path.join(tier_base, name)
+                for subdir in ("", "trunk"):
+                    candidate = (os.path.join(pkg_dir, subdir, "PKGBUILD") if subdir
+                                 else os.path.join(pkg_dir, "PKGBUILD"))
                     if os.path.isfile(candidate):
-                        src_dir = os.path.dirname(candidate)
+                        try:
+                            upstream_ver = _fmt_srcinfo_ver(
+                                parse_srcinfo(os.path.dirname(candidate), config["build_user"])
+                            )
+                        except Exception as e:
+                            log.debug("[%s] failed to parse %s srcinfo: %s", name, tier, e)
                         break
-                if src_dir:
-                    try:
-                        si = parse_srcinfo(src_dir, config["build_user"])
-                        epoch = si.get("epoch", "")
-                        if epoch:
-                            upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
-                        else:
-                            upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
-                    except Exception as e:
-                        log.debug("[%s] failed to parse Artix srcinfo: %s", name, e)
 
-            elif tier == "cachyos":
-                cachyos_dir = os.path.join(config["pkgbuilds_dir"], "cachyos")
-                for root, dirs, files in os.walk(cachyos_dir):
+            elif kind == "monorepo":
+                for root, dirs, files in os.walk(tier_base):
                     dirs[:] = [d for d in dirs if d != ".git"]
                     if os.path.basename(root) == name and "PKGBUILD" in files:
                         try:
-                            si = parse_srcinfo(root, config["build_user"])
-                            epoch = si.get("epoch", "")
-                            if epoch:
-                                upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
-                            else:
-                                upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
+                            upstream_ver = _fmt_srcinfo_ver(
+                                parse_srcinfo(root, config["build_user"])
+                            )
                         except Exception as e:
-                            log.debug("[%s] failed to parse CachyOS srcinfo: %s", name, e)
+                            log.debug("[%s] failed to parse %s srcinfo: %s", name, tier, e)
                         break
 
-            elif tier == "arch":
-                arch_dir = os.path.join(config["pkgbuilds_dir"], "arch", name)
-                if os.path.isdir(arch_dir):
-                    import subprocess
-                    subprocess.run(
-                        ["git", "pull", "--ff-only"],
-                        cwd=arch_dir,
-                        capture_output=True,
-                    )
+            elif kind == "pkgctl":
+                pkg_dir = os.path.join(tier_base, name)
+                if os.path.isdir(pkg_dir):
+                    subprocess.run(["git", "pull", "--ff-only"], cwd=pkg_dir, capture_output=True)
                     try:
-                        si = parse_srcinfo(arch_dir, config["build_user"])
-                        epoch = si.get("epoch", "")
-                        if epoch:
-                            upstream_ver = f"{epoch}:{si['pkgver']}-{si['pkgrel']}"
-                        else:
-                            upstream_ver = f"{si['pkgver']}-{si['pkgrel']}"
+                        upstream_ver = _fmt_srcinfo_ver(
+                            parse_srcinfo(pkg_dir, config["build_user"])
+                        )
                     except Exception as e:
-                        log.debug("[%s] failed to parse Arch srcinfo: %s", name, e)
+                        log.debug("[%s] failed to parse %s srcinfo: %s", name, tier, e)
 
         if upstream_ver:
             normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
             if vercmp(upstream_ver, base_ver) > 0 and vercmp(normalized_upstream, base_ver) == 0:
-                log.debug(
-                    "[%s] ignoring local pkgrel bump in source tree: %s",
-                    name,
-                    upstream_ver,
-                )
+                log.debug("[%s] ignoring local pkgrel bump in source tree: %s", name, upstream_ver)
             elif vercmp(normalized_upstream, base_ver) > 0:
-                log.info(
-                    "[%s] upstream update detected: %s -> %s",
-                    name,
-                    base_ver,
-                    normalized_upstream,
-                )
+                log.info("[%s] upstream update detected: %s -> %s", name, base_ver, normalized_upstream)
                 updates.append({**pkg, "build_reason": "update"})
 
     return updates
@@ -1057,7 +1057,7 @@ def _cmd_patch_create(args, config: dict) -> int:
     try:
         upstream_dir, tier = resolve_pkgbuild(
             pkgname, pkgbuilds_dir, None, upstream_priority,
-            artix_clone_url=config["artix_clone_url"],
+            tier_sources=config["tier_sources"],
         )
     except FileNotFoundError as e:
         print(f"error: {e}")
@@ -1141,7 +1141,7 @@ def _cmd_patch_check(args, config: dict) -> int:
         try:
             upstream_dir, tier = resolve_pkgbuild(
                 pkgname, pkgbuilds_dir, None, upstream_priority,
-                artix_clone_url=config["artix_clone_url"],
+                tier_sources=config["tier_sources"],
             )
         except FileNotFoundError:
             print(f"  {pkgname:<28} upstream not found")
@@ -1398,15 +1398,15 @@ def run_daemon(config_path: str, debug: bool):
             log.info("Checking for upstream updates...")
             last_upstream_check = now
             try:
-                # Update enabled git-backed source repos
-                if "cachyos" in config["repo_priority"]:
-                    cachyos_dir = os.path.join(config["pkgbuilds_dir"], "cachyos")
-                    if os.path.isdir(os.path.join(cachyos_dir, ".git")):
-                        import subprocess
-                        subprocess.run(
-                            ["git", "-C", cachyos_dir, "pull", "--ff-only"],
-                            capture_output=True,
-                        )
+                # Pull all monorepo tiers
+                for tier, src in config["tier_sources"].items():
+                    if src["type"] == "monorepo":
+                        monorepo_dir = os.path.join(config["pkgbuilds_dir"], tier)
+                        if os.path.isdir(os.path.join(monorepo_dir, ".git")):
+                            subprocess.run(
+                                ["git", "-C", monorepo_dir, "pull", "--ff-only"],
+                                capture_output=True,
+                            )
 
                 built = get_built_state(config["state_path"])
                 updates = check_upstream_updates(manifest, built, config)
@@ -1488,7 +1488,7 @@ def run_daemon(config_path: str, debug: bool):
                     config["pkgbuilds_dir"],
                     pkgbase_map,
                     config["repo_priority"],
-                    artix_clone_url=config["artix_clone_url"],
+                    tier_sources=config["tier_sources"],
                 )
                 log.info("[%s] PKGBUILD tier: %s (%s)", name, tier, pkgbuild_dir)
 

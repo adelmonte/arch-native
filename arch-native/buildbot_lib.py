@@ -444,26 +444,41 @@ def _apply_local_patch(pkgname: str, patch_file: str, upstream_dir: str, local_d
     return work_dir
 
 
+# Default tier sources used when no tier_sources config is provided.
+# Each entry: {"type": "clone"|"monorepo"|"pkgctl", ...}
+_DEFAULT_TIER_SOURCES: dict = {
+    "artix":   {"type": "clone", "url": "https://gitea.artixlinux.org/packages/{pkgname}.git"},
+    "cachyos": {"type": "monorepo"},
+    "arch":    {"type": "pkgctl"},
+}
+
+
 def resolve_pkgbuild(
     pkgname: str,
     pkgbuilds_dir: str,
     pkgbase_map: dict = None,
     repo_priority: list[str] = None,
     _tried_pkgbase: bool = False,
-    artix_clone_url: str = "https://gitea.artixlinux.org/packages/{pkgname}.git",
+    tier_sources: dict = None,
 ) -> tuple[str, str]:
     """
     Resolve a PKGBUILD from configured tier priority.
 
-    Supported tiers are: local, artix, cachyos, arch.
+    tier_sources maps tier name → source dict:
+      {"type": "clone",   "url": "https://host/{pkgname}.git"}
+      {"type": "monorepo"}   — walks pkgbuilds/<tier>/ directory tree
+      {"type": "pkgctl"}     — uses Arch devtools pkgctl
+    Falls back to _DEFAULT_TIER_SOURCES when tier_sources is None.
     """
-    default_priority = ["local", "artix", "cachyos", "arch"]
+    sources = tier_sources if tier_sources is not None else _DEFAULT_TIER_SOURCES
+    known = {"local"} | set(sources)
+
     if repo_priority:
-        priority = [tier for tier in repo_priority if tier in default_priority]
+        priority = [t for t in repo_priority if t in known]
         if not priority:
-            priority = default_priority
+            priority = ["local"] + list(sources)
     else:
-        priority = default_priority
+        priority = ["local"] + list(sources)
 
     def _try_pkgbase_fallback() -> tuple[str, str] | None:
         if _tried_pkgbase or not pkgbase_map or pkgname not in pkgbase_map:
@@ -473,14 +488,7 @@ def resolve_pkgbuild(
             return None
         log.info("[%s] pkgname not found, trying pkgbase: %s", pkgname, pkgbase)
         try:
-            return resolve_pkgbuild(
-                pkgbase,
-                pkgbuilds_dir,
-                pkgbase_map,
-                priority,
-                True,
-                artix_clone_url,
-            )
+            return resolve_pkgbuild(pkgbase, pkgbuilds_dir, pkgbase_map, priority, True, tier_sources)
         except FileNotFoundError:
             return None
 
@@ -491,12 +499,11 @@ def resolve_pkgbuild(
             pkgbuild_file = os.path.join(local, "PKGBUILD")
 
             if os.path.isfile(patch_file):
-                # Patch-based override: resolve upstream then apply.
                 upstream_priority = [t for t in priority if t != "local"]
                 try:
                     upstream_dir, _ = resolve_pkgbuild(
                         pkgname, pkgbuilds_dir, pkgbase_map, upstream_priority,
-                        _tried_pkgbase, artix_clone_url,
+                        _tried_pkgbase, tier_sources,
                     )
                 except FileNotFoundError:
                     raise FileNotFoundError(
@@ -515,63 +522,61 @@ def resolve_pkgbuild(
                 log.info("[%s] resolved PKGBUILD from tier: local (full copy)", pkgname)
                 return local, "local"
 
-        elif tier == "artix":
-            artix_dir = os.path.join(pkgbuilds_dir, "artix", pkgname)
-            if not os.path.isdir(artix_dir):
-                url = artix_clone_url.format(pkgname=pkgname)
-                log.debug("[%s] attempting Artix clone: %s", pkgname, url)
-                result = subprocess.run(
-                    ["git", "clone", "--depth=1", url, artix_dir],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    log.debug(
-                        "[%s] Artix clone failed (expected for non-Artix packages)",
-                        pkgname,
+        else:
+            src = sources.get(tier)
+            if src is None:
+                continue
+            kind = src["type"]
+
+            if kind == "clone":
+                tier_dir = os.path.join(pkgbuilds_dir, tier, pkgname)
+                if not os.path.isdir(tier_dir):
+                    url = src["url"].format(pkgname=pkgname)
+                    log.debug("[%s] attempting %s clone: %s", pkgname, tier, url)
+                    result = subprocess.run(
+                        ["git", "clone", "--depth=1", url, tier_dir],
+                        capture_output=True, text=True,
                     )
-            for subdir in ("", "trunk"):
-                if subdir:
-                    candidate = os.path.join(artix_dir, subdir, "PKGBUILD")
-                else:
-                    candidate = os.path.join(artix_dir, "PKGBUILD")
-                if os.path.isfile(candidate):
-                    resolved = os.path.dirname(candidate)
-                    _fix_ownership(resolved)
-                    log.info("[%s] resolved PKGBUILD from tier: artix", pkgname)
-                    return resolved, "artix"
+                    if result.returncode != 0:
+                        log.debug("[%s] %s clone failed (package not in this tier)", pkgname, tier)
+                for subdir in ("", "trunk"):
+                    candidate = (os.path.join(tier_dir, subdir, "PKGBUILD") if subdir
+                                 else os.path.join(tier_dir, "PKGBUILD"))
+                    if os.path.isfile(candidate):
+                        resolved = os.path.dirname(candidate)
+                        _fix_ownership(resolved)
+                        log.info("[%s] resolved PKGBUILD from tier: %s", pkgname, tier)
+                        return resolved, tier
 
-        elif tier == "cachyos":
-            cachyos_dir = os.path.join(pkgbuilds_dir, "cachyos")
-            for root, dirs, files in os.walk(cachyos_dir):
-                dirs[:] = [d for d in dirs if d != ".git"]
-                if os.path.basename(root) == pkgname and "PKGBUILD" in files:
-                    _fix_ownership(root)
-                    log.info("[%s] resolved PKGBUILD from tier: cachyos", pkgname)
-                    return root, "cachyos"
+            elif kind == "monorepo":
+                monorepo_dir = os.path.join(pkgbuilds_dir, tier)
+                for root, dirs, files in os.walk(monorepo_dir):
+                    dirs[:] = [d for d in dirs if d != ".git"]
+                    if os.path.basename(root) == pkgname and "PKGBUILD" in files:
+                        _fix_ownership(root)
+                        log.info("[%s] resolved PKGBUILD from tier: %s", pkgname, tier)
+                        return root, tier
 
-        elif tier == "arch":
-            fallback_result = _try_pkgbase_fallback()
-            if fallback_result is not None:
-                return fallback_result
+            elif kind == "pkgctl":
+                fallback_result = _try_pkgbase_fallback()
+                if fallback_result is not None:
+                    return fallback_result
 
-            arch_root = os.path.join(pkgbuilds_dir, "arch")
-            arch_dir = os.path.join(arch_root, pkgname)
-            if not os.path.isdir(arch_dir):
-                log.debug("[%s] fetching from Arch via pkgctl repo clone", pkgname)
-                os.makedirs(arch_root, exist_ok=True)
-                result = subprocess.run(
-                    ["pkgctl", "repo", "clone", "--protocol=https", pkgname],
-                    capture_output=True,
-                    text=True,
-                    cwd=arch_root,
-                )
-                if result.returncode != 0:
-                    log.error("[%s] pkgctl repo clone failed: %s", pkgname, result.stderr)
-            if os.path.isfile(os.path.join(arch_dir, "PKGBUILD")):
-                _fix_ownership(arch_dir)
-                log.info("[%s] resolved PKGBUILD from tier: arch", pkgname)
-                return arch_dir, "arch"
+                tier_root = os.path.join(pkgbuilds_dir, tier)
+                tier_dir = os.path.join(tier_root, pkgname)
+                if not os.path.isdir(tier_dir):
+                    log.debug("[%s] fetching via pkgctl repo clone", pkgname)
+                    os.makedirs(tier_root, exist_ok=True)
+                    result = subprocess.run(
+                        ["pkgctl", "repo", "clone", "--protocol=https", pkgname],
+                        capture_output=True, text=True, cwd=tier_root,
+                    )
+                    if result.returncode != 0:
+                        log.error("[%s] pkgctl repo clone failed: %s", pkgname, result.stderr)
+                if os.path.isfile(os.path.join(tier_dir, "PKGBUILD")):
+                    _fix_ownership(tier_dir)
+                    log.info("[%s] resolved PKGBUILD from tier: %s", pkgname, tier)
+                    return tier_dir, tier
 
     fallback_result = _try_pkgbase_fallback()
     if fallback_result is not None:
