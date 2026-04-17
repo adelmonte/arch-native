@@ -685,7 +685,7 @@ Desktop — after each pacman transaction:
 Build server — main loop (every 300s):
   1. Upgrade clean chroot        arch-nspawn -Syu
   2. Detect manifest change      diff_manifest() → queue new/updated packages
-  3. Check upstream updates      git pull on cached repos, vercmp
+  3. Check upstream updates      git pull (arch + cachyos), vercmp
   4. Process pending queue:
        resolve_pkgbuild()        check local/ patch, then artix/cachyos/arch
        parse_srcinfo()           extract version, deps, pgp keys
@@ -702,15 +702,23 @@ Build server — main loop (every 300s):
 
 Priority is set by `repo_priority` (default: `local,arch`). First match wins.
 
-| Tier | How it works |
-|---|---|
-| `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`. Applied on top of the upstream PKGBUILD at build time. A full `PKGBUILD` file is also supported but patches are preferred — full copies go stale silently. |
-| `artix` | `git clone --depth=1` from `gitea.artixlinux.org/packages/<pkg>.git` on demand. Cached after first fetch. Useful for packages that need init-system substitutions. |
-| `cachyos` | Walks a locally-cloned PKGBUILD monorepo at `pkgbuilds/cachyos/`. Updated each cycle via `git pull`. |
-| `arch` | `pkgctl repo clone --protocol=https <pkg>` (from `devtools`) on demand. Cached after first fetch. |
+| Tier | How it works | Auto-updated? |
+|---|---|---|
+| `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`. Applied on top of the upstream PKGBUILD at build time. A full `PKGBUILD` file is also supported but patches are preferred — full copies go stale silently. | No — user-managed |
+| `artix` | `git clone --depth=1` from `gitea.artixlinux.org/packages/<pkg>.git` on first use. Cached in `pkgbuilds/artix/<pkg>/`. Useful for packages that need init-system substitutions. | **No** — snapshot at clone time; manually refresh with `git -C pkgbuilds/artix/<pkg> pull` |
+| `cachyos` | Walks a locally-cloned PKGBUILD monorepo at `pkgbuilds/cachyos/`. Searched by directory name matching pkgname. | Yes — `git pull` run on the whole monorepo each `upstream_check_interval` |
+| `arch` | `pkgctl repo clone --protocol=https <pkg>` (from `devtools`) on first use. Cached in `pkgbuilds/arch/<pkg>/`. | Yes — per-package `git pull` run each `upstream_check_interval` |
 
 The `artix` and `arch` tiers clone on demand — no setup needed. The `cachyos`
 tier requires a one-time manual clone:
+
+> **Note:** artix clones are depth-1 snapshots taken on first use and are **not**
+> pulled automatically. If a package fails to build due to a stale artix PKGBUILD,
+> refresh it manually:
+> ```bash
+> sudo git -C /var/lib/arch-native/pkgbuilds/artix/<pkg> pull
+> ```
+> Or delete the directory to force a fresh clone on the next build.
 
 ```bash
 sudo git clone --depth=1 https://github.com/CachyOS/CachyOS-PKGBUILDS \
