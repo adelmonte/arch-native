@@ -527,6 +527,8 @@ def cmd_status(args, config: dict) -> int:
     for n, e in built.items():
         if not (isinstance(e, dict) and e.get("built_at")):
             continue
+        if e.get("status") == "ineligible":
+            continue
         try:
             ts = datetime.fromisoformat(e["built_at"])
             recent.append((n, e.get("version", "?"), int((now - ts).total_seconds())))
