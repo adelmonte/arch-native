@@ -542,7 +542,7 @@ def cmd_status(args, config: dict) -> int:
         manifest = (read_local_packages() if config.get("mode") == "local"
                     else load_manifest(config["manifest_path"]))
         installed_total = len(manifest)
-        rebuilt_count = sum(1 for p in manifest if p["name"] in built)
+        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") != "ineligible")
         blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
     except Exception:
         pass
@@ -858,12 +858,12 @@ def cmd_failed_list(args, config: dict) -> int:
 def cmd_built(args, config: dict) -> int:
     built = get_built_state(config["state_path"])
     rows = sorted(
-        built.items(),
+        ((k, v) for k, v in built.items() if v.get("status") != "ineligible"),
         key=lambda kv: kv[1].get("built_at", ""),
         reverse=True,
     )
     limit = args.limit if args.limit else len(rows)
-    print(f"built  {len(built)}\n")
+    print(f"built  {len(rows)}\n")
     for name, rec in rows[:limit]:
         ts = rec.get("built_at", "")[:10]
         ver = rec.get("version", "?")
@@ -1501,6 +1501,15 @@ def run_daemon(config_path: str, debug: bool):
                 if not eligible:
                     cycle_stats["skipped_ineligible"] += 1
                     log.info("[%s] not eligible: %s", name, reason)
+                    # Record in built state so this package isn't re-queued next cycle
+                    _built = get_built_state(config["state_path"])
+                    _built[name] = {
+                        "version": pkg["version"],
+                        "status": "ineligible",
+                        "built_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    save_built_state(config["state_path"], _built)
+                    clear_in_progress(config)
                     continue
 
                 log.debug("[%s] eligible", name)
