@@ -21,6 +21,11 @@ self-hosted and config-driven.
 
 Build from source with `makepkg -si` from each directory.
 
+**Naming** — three names appear throughout this doc:
+- **arch-native** — the project. What you install.
+- **buildbot** — the binary (`/usr/bin/buildbot`). Both the daemon and the CLI.
+- **forge** — an example `repo_name`. This is just the pacman repo name you choose in the config (`repo_name = forge`). It can be anything. Examples in this doc use `forge`; yours might be `local`, `custom`, or whatever you set.
+
 ---
 
 ## Modes
@@ -150,7 +155,7 @@ See [Service management](#service-management) below for your init system.
 ### 7. Add the repo to pacman.conf
 
 Edit `/etc/pacman.conf` on the machine that will use the packages. Place the
-repo **above** `[core]` so forge packages shadow official ones:
+repo **above** `[core]` so your locally-built packages shadow official ones:
 
 ```ini
 [myrepo]
@@ -779,9 +784,9 @@ Or if you have a large AUR footprint, enumerate them explicitly.
 
 ### pkgrel dot-notation
 
-Upstream `pkgrel=2` → forge rebuilds as `pkgrel=2.1`. pacman sees `2.1 > 2`
-so forge packages take priority over official repos. When upstream bumps to
-`pkgrel=3`, forge rebuilds as `3.1`.
+Upstream `pkgrel=2` → arch-native rebuilds as `pkgrel=2.1`. pacman sees
+`2.1 > 2` so locally-built packages take priority over official repos. When
+upstream bumps to `pkgrel=3`, arch-native rebuilds as `3.1`.
 
 Version comparisons inside the daemon (detecting already-built packages,
 checking upstream updates) strip the local `.N` suffix before comparing:
