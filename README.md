@@ -445,8 +445,25 @@ Repo  forge
   rebuilt    987 / 1189  (83%)
   skipped    47 / 1189  (blacklist — see /etc/arch-native.conf)
   size       12G
-  next scan  in 4m
+  next cycle in 4m
 ```
+
+**next cycle** is the countdown to the next poll cycle. Each cycle:
+
+1. Upgrades the build chroot (`pacman -Syu` inside the clean chroot) so builds
+   always use the latest official packages
+2. Re-reads the installed package list (local mode: pacman DB; remote mode:
+   checks for a new manifest from `pkglist-export`)
+3. Every `upstream_check_interval` (default 1h): pulls cached PKGBUILD repos
+   and compares versions against `built.json` — any package whose upstream
+   PKGBUILD has a newer version than what was last built is re-queued
+   automatically with `build_reason: update`
+4. Drains the full pending queue — all queued packages are built before the
+   daemon sleeps
+
+This means official-repo package updates are picked up automatically once per
+hour without any manual intervention. New packages you install are picked up
+on the next cycle.
 
 The **Building** section shows what is currently being compiled and how long it
 has been running. When nothing is building it shows `idle`.
@@ -682,20 +699,25 @@ Desktop — after each pacman transaction:
   → writes JSON manifest to /tmp, rsyncs to build server
   → build-server:/var/lib/arch-native/manifests/client.json
 
-Build server — main loop (every 300s):
-  1. Upgrade clean chroot        arch-nspawn -Syu
-  2. Detect manifest change      diff_manifest() → queue new/updated packages
-  3. Check upstream updates      git pull (arch + cachyos), vercmp
-  4. Process pending queue:
-       resolve_pkgbuild()        check local/ patch, then artix/cachyos/arch
-       parse_srcinfo()           extract version, deps, pgp keys
-       is_eligible()             skip AUR, blacklisted, already built
-       import_pgp_keys()         fetch from keyservers
-       bump_pkgrel()             x → x.1 (ALHP-style)
-       makechrootpkg             build in ephemeral chroot copy
-       sign_packages()           GPG detach-sign
-       repo-add                  add to pacman DB
-  5. Sleep remainder of 300s
+Build server — main loop (poll_interval = 300s):
+  1. Upgrade clean chroot        arch-nspawn -Syu inside chroots/root/
+  2. Detect package list change  local: read pacman DB; remote: watch manifest mtime
+                                 diff against built.json → queue new/changed packages
+  3. Upstream update check       every upstream_check_interval (default 1h):
+                                   git pull arch/ clones (per-package)
+                                   git pull cachyos/ monorepo
+                                   vercmp each built package against PKGBUILD version
+                                   re-queue anything with a newer upstream version
+  4. Drain full pending queue    repeat until queue empty or shutdown:
+       resolve_pkgbuild()          local patch → artix → cachyos → arch
+       parse_srcinfo()             version, deps, pgp keys
+       is_eligible()               skip blacklisted, already-built-at-this-version
+       import_pgp_keys()           fetch from keyservers
+       bump_pkgrel()               x → x.1 (ALHP-style dot bump)
+       makechrootpkg               build in ephemeral chroot copy (chroots/build-<uuid>/)
+       sign_packages()             GPG detach-sign each .pkg.tar.zst
+       repo-add                    add to pacman DB; autoprune old versions
+  5. Sleep remainder of poll_interval
 ```
 
 ### PKGBUILD tier resolution

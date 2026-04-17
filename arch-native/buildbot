@@ -552,10 +552,10 @@ def cmd_status(args, config: dict) -> int:
     except Exception:
         pass
 
-    scan_str = ""
+    cycle_str = ""
     if active and metrics_mtime:
         rem = int(config.get("poll_interval", 300) - (now.timestamp() - metrics_mtime))
-        scan_str = f"in {_age(rem)}" if rem > 0 else "scanning now"
+        cycle_str = f"in {_age(rem)}" if rem > 0 else "running now"
 
     # ─── render ─────────────────────────────────────────────────────
     def section(title, count=None):
@@ -639,8 +639,8 @@ def cmd_status(args, config: dict) -> int:
             row("skipped", f"{blacklisted_count} / {installed_total}  {DIM}(blacklist — see /etc/arch-native.conf){R}")
     if repo_size:
         row("size", repo_size)
-    if scan_str:
-        row("next scan", scan_str)
+    if cycle_str:
+        row("next cycle", cycle_str)
 
     return 0
 
