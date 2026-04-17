@@ -450,6 +450,7 @@ def resolve_pkgbuild(
     pkgbase_map: dict = None,
     repo_priority: list[str] = None,
     _tried_pkgbase: bool = False,
+    artix_clone_url: str = "https://gitea.artixlinux.org/packages/{pkgname}.git",
 ) -> tuple[str, str]:
     """
     Resolve a PKGBUILD from configured tier priority.
@@ -478,6 +479,7 @@ def resolve_pkgbuild(
                 pkgbase_map,
                 priority,
                 True,
+                artix_clone_url,
             )
         except FileNotFoundError:
             return None
@@ -493,7 +495,8 @@ def resolve_pkgbuild(
                 upstream_priority = [t for t in priority if t != "local"]
                 try:
                     upstream_dir, _ = resolve_pkgbuild(
-                        pkgname, pkgbuilds_dir, pkgbase_map, upstream_priority, _tried_pkgbase
+                        pkgname, pkgbuilds_dir, pkgbase_map, upstream_priority,
+                        _tried_pkgbase, artix_clone_url,
                     )
                 except FileNotFoundError:
                     raise FileNotFoundError(
@@ -515,7 +518,7 @@ def resolve_pkgbuild(
         elif tier == "artix":
             artix_dir = os.path.join(pkgbuilds_dir, "artix", pkgname)
             if not os.path.isdir(artix_dir):
-                url = f"https://gitea.artixlinux.org/packages/{pkgname}.git"
+                url = artix_clone_url.format(pkgname=pkgname)
                 log.debug("[%s] attempting Artix clone: %s", pkgname, url)
                 result = subprocess.run(
                     ["git", "clone", "--depth=1", url, artix_dir],

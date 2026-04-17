@@ -157,6 +157,10 @@ def load_config(path: str) -> dict:
     if not repo_priority:
         repo_priority = allowed_tiers
     cfg["repo_priority"] = repo_priority
+    cfg["artix_clone_url"] = sec.get(
+        "artix_clone_url",
+        "https://gitea.artixlinux.org/packages/{pkgname}.git",
+    )
 
     blacklist_str = sec.get("blacklist", "gcc,glibc,coreutils,linux-api-headers")
     cfg["blacklist"] = [s.strip() for s in blacklist_str.split(",") if s.strip()]
@@ -1051,7 +1055,10 @@ def _cmd_patch_create(args, config: dict) -> int:
 
     upstream_priority = [t for t in config["repo_priority"] if t != "local"]
     try:
-        upstream_dir, tier = resolve_pkgbuild(pkgname, pkgbuilds_dir, None, upstream_priority)
+        upstream_dir, tier = resolve_pkgbuild(
+            pkgname, pkgbuilds_dir, None, upstream_priority,
+            artix_clone_url=config["artix_clone_url"],
+        )
     except FileNotFoundError as e:
         print(f"error: {e}")
         return 1
@@ -1132,7 +1139,10 @@ def _cmd_patch_check(args, config: dict) -> int:
             any_failed = True
             continue
         try:
-            upstream_dir, tier = resolve_pkgbuild(pkgname, pkgbuilds_dir, None, upstream_priority)
+            upstream_dir, tier = resolve_pkgbuild(
+                pkgname, pkgbuilds_dir, None, upstream_priority,
+                artix_clone_url=config["artix_clone_url"],
+            )
         except FileNotFoundError:
             print(f"  {pkgname:<28} upstream not found")
             any_failed = True
@@ -1478,6 +1488,7 @@ def run_daemon(config_path: str, debug: bool):
                     config["pkgbuilds_dir"],
                     pkgbase_map,
                     config["repo_priority"],
+                    artix_clone_url=config["artix_clone_url"],
                 )
                 log.info("[%s] PKGBUILD tier: %s (%s)", name, tier, pkgbuild_dir)
 
