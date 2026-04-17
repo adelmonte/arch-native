@@ -1,9 +1,11 @@
 # arch-native
 
-Rebuilds your installed Arch (or Artix) packages from source with CPU-optimized
-compiler flags, signs them, and publishes them as a local pacman repo. Add that
-repo above `[core]` in `pacman.conf` and your system runs binaries compiled
-specifically for your CPU.
+Rebuilds your installed packages from source with CPU-optimized compiler flags,
+signs them, and publishes them as a local pacman repo. Add that repo above
+`[core]` in `pacman.conf` and your system runs binaries compiled specifically
+for your CPU.
+
+Works on Arch Linux and Artix Linux (and any pacman-based distro).
 
 The build model is [ALHP](https://somegit.dev/ALHP/ALHP.GO) — same idea,
 self-hosted and config-driven.
@@ -58,10 +60,10 @@ cd arch-native && makepkg -si
 The package installs:
 - `/usr/bin/buildbot` — daemon and CLI
 - `/usr/lib/arch-native/buildbot_lib.py` — core library
-- `/usr/lib/systemd/system/arch-native.service`
+- `/usr/lib/systemd/system/arch-native.service` — systemd unit (see [Service management](#service-management) for other init systems)
 - `/usr/share/arch-native/` — nginx example, artix-meson, chroot-pacman.conf
 - `/etc/arch-native.conf` — default config (marked as `backup`, upgrades produce `.pacnew`)
-- `/usr/lib/sysusers.d/arch-native.conf` — creates the `buildbot` system user (via pacman's sysusers hook)
+- `/usr/lib/sysusers.d/arch-native.conf` — creates the `buildbot` system user
 
 ### 2. Edit the config
 
@@ -101,18 +103,51 @@ sudo systemctl reload nginx
 Default config serves the repo at `:8081/repo/`. Edit the port in
 `nginx.conf.example` before copying if needed.
 
-### 4. Initialize and start
+### 4. Initialize
 
 ```bash
 sudo buildbot init
-sudo systemctl enable --now arch-native
 ```
 
 `buildbot init` creates the `/var/lib/arch-native/` directory layout,
-calls `mkarchroot` to create the clean chroot, initializes the pacman keyring,
-and sets up the GPG signing key. Safe to re-run — skips steps already done.
+calls `mkarchroot` to create the clean chroot, and initializes the pacman
+keyring inside it. Safe to re-run — skips steps already done.
 
-### 5. Add the repo to pacman.conf
+### 5. Generate the signing key
+
+After init, generate a GPG key for the `buildbot` user that will sign all
+built packages:
+
+```bash
+sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg \
+    --batch --gen-key <<'EOF'
+%no-protection
+Key-Type: EdDSA
+Key-Curve: ed25519
+Name-Real: arch-native
+Name-Email: arch-native@localhost
+Expire-Date: 0
+EOF
+```
+
+Export the public key into the repo directory so clients can fetch it:
+
+```bash
+sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg \
+    --export --armor > /var/lib/arch-native/repo/buildbot-public.asc
+```
+
+Find the key fingerprint (used in the next step):
+
+```bash
+sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg -K
+```
+
+### 6. Start the service
+
+See [Service management](#service-management) below for your init system.
+
+### 7. Add the repo to pacman.conf
 
 Edit `/etc/pacman.conf` on the machine that will use the packages. Place the
 repo **above** `[core]` so forge packages shadow official ones:
@@ -126,11 +161,83 @@ Server = http://your-build-host:8081/repo
 For local mode the server is `localhost`. For remote mode use the build
 server's hostname or IP.
 
-Trust the signing key (key ID printed by `buildbot doctor`):
+Trust the signing key on each client machine:
 
 ```bash
-sudo pacman-key --recv-keys <KEY-ID>
-sudo pacman-key --lsign-key <KEY-ID>
+# Import from the repo server
+sudo pacman-key --fetch-keys http://your-build-host:8081/repo/buildbot-public.asc
+sudo pacman-key --lsign-key <KEY-FINGERPRINT>
+
+# Or import directly if local mode
+sudo pacman-key --add /var/lib/arch-native/repo/buildbot-public.asc
+sudo pacman-key --lsign-key <KEY-FINGERPRINT>
+```
+
+---
+
+## Service management
+
+`buildbot` is a long-running daemon (`buildbot --config /etc/arch-native.conf`).
+A systemd unit is included; examples for other init systems are below.
+
+### systemd
+
+```bash
+sudo systemctl enable --now arch-native
+sudo systemctl stop arch-native      # to pause for queue edits
+sudo systemctl start arch-native
+```
+
+### dinit
+
+Create `/etc/dinit.d/arch-native`:
+
+```
+type = process
+command = /usr/bin/buildbot
+options = --config /etc/arch-native.conf
+logfile = /var/log/arch-native.log
+restart = true
+```
+
+```bash
+sudo dinitctl enable arch-native
+sudo dinitctl start arch-native
+```
+
+### OpenRC
+
+Create `/etc/init.d/arch-native`:
+
+```bash
+#!/sbin/openrc-run
+description="arch-native package build daemon"
+command=/usr/bin/buildbot
+command_args="--config /etc/arch-native.conf"
+pidfile=/run/arch-native.pid
+command_background=true
+output_log=/var/log/arch-native.log
+error_log=/var/log/arch-native.log
+```
+
+```bash
+sudo chmod +x /etc/init.d/arch-native
+sudo rc-update add arch-native default
+sudo rc-service arch-native start
+```
+
+### runit
+
+Create `/etc/runit/sv/arch-native/run`:
+
+```bash
+#!/bin/sh
+exec /usr/bin/buildbot --config /etc/arch-native.conf 2>&1
+```
+
+```bash
+sudo chmod +x /etc/runit/sv/arch-native/run
+sudo ln -s /etc/runit/sv/arch-native /run/runit/service/
 ```
 
 ---
@@ -161,7 +268,7 @@ REMOTE_HOST="user@build-server"
 REMOTE_PATH="/var/lib/arch-native/manifests/client.json"
 
 # SSH key (optional — omit to use ssh-agent or default key)
-SSH_KEY="/home/user/.ssh/id_ed25519"
+# SSH_KEY="/path/to/id_ed25519"
 ```
 
 The pacman hook fires automatically after every transaction. Test it manually:
@@ -204,22 +311,26 @@ distro = arch
 ```ini
 # Order in which PKGBUILD sources are checked (left = higher priority).
 # Supported tiers: local, artix, cachyos, arch
-# Default: local,artix,cachyos,arch
-repo_priority = local,artix,cachyos,arch
-
-# Arch (non-Artix) users who don't want the artix/cachyos tiers:
-# repo_priority = local,arch
+# Default: local,arch
+repo_priority = local,arch
 ```
+
+See [PKGBUILD tier resolution](#pkgbuild-tier-resolution) in the Architecture
+section for how each tier works and how to extend the `cachyos` tier with your
+own PKGBUILD collection.
 
 ### Blacklists
 
 ```ini
-# Packages never built — toolchain-critical or unfixably broken PKGBUILDs.
+# Packages never built — toolchain-critical, pure-data, or unfixably broken.
 blacklist = gcc,glibc,coreutils,linux-api-headers,binutils
 
 # Packages built without LTO (link-time optimization causes failures).
 lto_blacklist = llvm,rust
 ```
+
+See [Building your blacklist](#building-your-blacklist) for guidance on what
+to add.
 
 ### Build behavior
 
@@ -241,8 +352,8 @@ skip_pgp_on_import_failure = true
 # Auto-prune stale package files from the repo dir.
 # When a package is rebuilt with a new version, repo-add updates the database
 # but doesn't delete the old .pkg.tar.zst file. Auto-pruning removes orphans
-# (and their .sig files) immediately after each successful build, keeping only
-# the most recent version per package. Default: true.
+# (and their .sig files) immediately after each successful build.
+# Default: true.
 autoprune = true
 
 # How many recent versions to retain per package (must be >= 1). Default: 1.
@@ -295,44 +406,70 @@ a non-standard layout:
 
 ## `buildbot` CLI reference
 
-The `buildbot` binary is both the daemon and the CLI. With no subcommand it
-runs as daemon.
+The `buildbot` binary is both the daemon (no subcommand) and the CLI.
 
 ### Monitoring
 
 ```
 buildbot status
 ```
+
 ```
-service    active
-building   firefox
-rebuilt    901 / 1204 installed
-pending    328
-failed     35
-blacklisted 66
-not queued 58  (AUR / binary / split-pkg)
-last run   16 built, 0 failed  (57s ago)
+arch-native  ● active
+
+Building
+  package    firefox
+  elapsed    1h23m
+
+Queue  52 pending
+  new        8
+  updates    44
+  next       thunderbird
+
+Recently built
+  fish          3.7.1-2.1   2h ago
+  curl          8.7.1-1.1   3h ago
+  zstd          1.5.6-1.1   5h ago
+
+Failed  3
+  gpgme      3d ago    build failed: collect2: error: ld returned 1
+  krb5       5d ago    download failed after 3 attempts
+  +1 more — run: buildbot failed
+
+Repo  forge
+  rebuilt    987 / 1189  (83%)
+  skipped    47 / 1189  (blacklist — see /etc/arch-native.conf)
+  size       12G
+  next scan  in 4m
 ```
 
-Fields:
-- **rebuilt** — packages installed on the desktop that have been rebuilt by forge
-- **pending** — queued and waiting
-- **failed** — gave up; see `buildbot failed`
-- **blacklisted** — in the config `blacklist`, never built
-- **not queued** — AUR/binary packages, or split packages whose pkgbase is
-  blacklisted (e.g. `libstdc++` comes from the blacklisted `gcc` pkgbase)
-- **last run** — stats from the most recent poll cycle
+The **Building** section shows what is currently being compiled and how long it
+has been running. When nothing is building it shows `idle`.
 
-Note: rebuilt + pending + failed + blacklisted + not-queued may exceed
-installed because packages that have been rebuilt AND have a new version
-pending are counted in both rebuilt and pending.
+If the daemon stopped while a build was running, the status flags it:
+
+```
+Building
+  status     stale — daemon not running
+  package    firefox
+  started    3d ago
+```
+
+If a build has exceeded `build_timeout`:
+
+```
+Building
+  package    firefox
+  elapsed    5h12m  ⚠ exceeded build_timeout (4h00m)
+```
+
+Both conditions mean the build is stuck and the daemon needs attention.
 
 ```
 buildbot doctor
 ```
 Checks: paths exist, JSON files are valid, gnupg home has correct permissions
-(0700), chroot keyring is initialized. Run this after `buildbot init` to
-confirm setup.
+(0700), chroot keyring is initialized.
 
 ```
 buildbot built [-n N]
@@ -358,10 +495,14 @@ Prints the latest build log for PKG. `-f` follows the log in real time
 
 ### Queue management
 
-These commands require the service to be stopped first:
+These commands require the service to be stopped first (command depends on
+your init system; see [Service management](#service-management)):
 
 ```bash
-sudo systemctl stop arch-native
+# Stop the daemon
+sudo systemctl stop arch-native      # systemd
+# sudo rc-service arch-native stop   # OpenRC
+# sudo dinitctl stop arch-native     # dinit
 
 # Move one failed package back to the queue
 sudo buildbot retry firefox
@@ -377,6 +518,7 @@ sudo buildbot clear firefox
 # Use --dry-run to preview what would be added without writing anything.
 sudo buildbot sync --reset
 
+# Restart the daemon
 sudo systemctl start arch-native
 ```
 
@@ -387,8 +529,54 @@ buildbot init
 ```
 Bootstraps a new installation. Run once after installing the package.
 Creates the directory layout under `/var/lib/arch-native/`, calls
-`mkarchroot` to create the base chroot, initializes the pacman keyring,
-sets up the GPG signing home. Safe to re-run.
+`mkarchroot` to create the base chroot, initializes the pacman keyring.
+Safe to re-run.
+
+---
+
+## Building your blacklist
+
+The blacklist prevents packages from being rebuilt. Get it right early — a
+misconfigured build of a toolchain package can make your system unbootable.
+
+**Always blacklist:**
+- Toolchain and core system packages: `gcc`, `glibc`, `binutils`,
+  `coreutils`, `linux-api-headers`. Rebuilding these with custom `-march` can
+  produce incompatible binaries and break the entire system.
+- AUR and binary packages: they have no upstream PKGBUILD to pull. If you add
+  AUR packages to your pacman config, blacklist them by name.
+- Split packages whose pkgbase is blacklisted: the daemon handles most of this
+  automatically (e.g. `gcc-libs` is skipped because `gcc` is its pkgbase and
+  is blacklisted), but explicit entries are safer.
+
+**Pure-data packages (no compiled code — no benefit from rebuilding):**
+- Fonts and typefaces: `ttf-*`, `otf-*`, `font-*`
+- Icon themes: `*-icon-theme`
+- Cursor themes: `*-cursors`
+- Firmware: `linux-firmware`, `linux-firmware-*`
+- Translations and localizations: `*-translations`, `hunspell-*`,
+  `tesseract-data-*`
+- Keyrings: `*-keyring`
+- Init scripts with no compiled components: `*-dinit`, `*-openrc`, `*-runit`
+
+**Packages that frequently fail with custom flags:**
+- `llvm` and `rust` are in `lto_blacklist` by default; building them with
+  custom `-march` may also cause issues on mismatched host/target setups.
+- Packages with bundled build systems that ignore `CFLAGS` (some Go, Java,
+  or pure-script packages) yield no benefit and are candidates for the
+  blacklist.
+
+**Using glob patterns** — the blacklist supports `fnmatch` wildcards:
+
+```ini
+blacklist = gcc,glibc,binutils,coreutils,linux-api-headers,
+            ttf-*,otf-*,font-*,*-icon-theme,*-cursors,
+            linux-firmware,linux-firmware-*,*-keyring,
+            *-translations,hunspell-*,tesseract-data-*
+```
+
+Run `buildbot status` after editing the blacklist to see the updated skipped
+count. Use `buildbot queue -n 200` to review what is actually queued.
 
 ---
 
@@ -404,13 +592,33 @@ sudo buildbot patch create networkmanager
 ```
 
 This resolves the upstream PKGBUILD for `networkmanager` (according to your
-configured `repo_priority`), opens a copy in `$EDITOR`, and saves the diff
-as `networkmanager.patch` when you exit. Example session:
+configured `repo_priority`), opens a clean copy in `$EDITOR`, and saves the
+diff as `networkmanager.patch` when you exit. Example session:
 
 ```
   upstream tier: artix  (/var/lib/arch-native/pkgbuilds/artix/networkmanager)
   opening vim ...
   saved: /var/lib/arch-native/pkgbuilds/local/networkmanager/networkmanager.patch
+```
+
+### Common patch use-cases
+
+**Disable a failing test:**
+```diff
+-  make check
++  # make check  # broken with -march=native: https://...
+```
+
+**Add a configure flag:**
+```diff
+-  ./configure --prefix=/usr
++  ./configure --prefix=/usr --disable-foo
+```
+
+**Fix a Makefile that ignores CFLAGS:**
+```diff
+-CFLAGS = -O2
++CFLAGS ?= -O2
 ```
 
 ### View a patch
@@ -437,14 +645,24 @@ may have changed. Review and update the patch:
   /var/lib/arch-native/pkgbuilds/local/networkmanager/networkmanager.patch
 ```
 
-Update the patch with `--force`:
+Run `buildbot patch check --all` after each upstream update cycle
+(`upstream_check_interval`) to catch drift early.
+
+### Update a stale patch
 
 ```bash
 sudo buildbot patch create --force networkmanager
 ```
 
-This opens the current upstream with your old changes applied (if they still
-partially apply) or a clean upstream copy to re-apply your fix against.
+This opens a clean copy of the **current upstream** PKGBUILD in `$EDITOR`.
+Re-apply your changes from scratch against the new version and save; the old
+patch is overwritten when you exit.
+
+To see your old changes while editing:
+
+```bash
+sudo buildbot patch show networkmanager   # read the old diff in another terminal
+```
 
 ---
 
@@ -477,29 +695,87 @@ Build server — main loop (every 300s):
 
 ### PKGBUILD tier resolution
 
-Priority is set by `repo_priority` (default: `local,artix,cachyos,arch`). First match wins.
+Priority is set by `repo_priority` (default: `local,arch`). First match wins.
 
 | Tier | How it works |
 |---|---|
-| `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`. Applied on top of the upstream PKGBUILD at build time. |
-| `artix` | `git clone --depth=1` from `gitea.artixlinux.org/packages/<pkg>.git` on demand. Cached after first fetch. |
-| `cachyos` | Walks a locally cloned CachyOS PKGBUILDs monorepo. **Must be cloned manually** (see below). Updated each upstream check cycle via `git pull`. |
+| `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`. Applied on top of the upstream PKGBUILD at build time. A full `PKGBUILD` file is also supported but patches are preferred — full copies go stale silently. |
+| `artix` | `git clone --depth=1` from `gitea.artixlinux.org/packages/<pkg>.git` on demand. Cached after first fetch. Useful for packages that need init-system substitutions. |
+| `cachyos` | Walks a locally-cloned PKGBUILD monorepo at `pkgbuilds/cachyos/`. Updated each cycle via `git pull`. |
 | `arch` | `pkgctl repo clone --protocol=https <pkg>` (from `devtools`) on demand. Cached after first fetch. |
 
-The `artix` and `arch` tiers clone on demand — no setup needed. The `cachyos` tier
-requires a one-time manual clone before it can find anything:
+The `artix` and `arch` tiers clone on demand — no setup needed. The `cachyos`
+tier requires a one-time manual clone:
 
 ```bash
 sudo git clone --depth=1 https://github.com/CachyOS/CachyOS-PKGBUILDS \
     /var/lib/arch-native/pkgbuilds/cachyos
 ```
 
-If you don't use CachyOS, remove `cachyos` from `repo_priority` in the config.
+**Using the `cachyos` tier for other repos** — the tier name is `cachyos` but
+the logic works for any PKGBUILD monorepo: a directory tree where packages live
+in subdirectories named after the pkgname, each containing a `PKGBUILD`. If you
+maintain your own PKGBUILD collection (or mirror another distro's), clone it to
+`pkgbuilds/cachyos/` to slot it in between `artix` and `arch`. Only one
+monorepo slot is supported per config; `repo_priority` controls whether it runs
+before or after `artix`.
 
-For split packages (e.g. `gcc-libs`): if a pkgname isn't found directly, the
-daemon looks up its pkgbase in the pacman sync DB and retries with that. After
-a successful build, all subpackages from `.SRCINFO` are recorded in `built.json`
-and removed from the pending queue.
+Enable it in your config:
+
+```ini
+repo_priority = local,cachyos,arch
+```
+
+Or, if you also use Artix and want Artix PKGBUILDs to take priority:
+
+```ini
+repo_priority = local,artix,cachyos,arch
+```
+
+If you don't use the `cachyos` tier, leave it out of `repo_priority` entirely.
+
+### Split packages and pkgbase resolution
+
+Many packages are split: a single `pkgbase` (one PKGBUILD) produces multiple
+installable pkgnames. Examples:
+
+| pkgbase | pkgnames produced |
+|---|---|
+| `gcc` | `gcc`, `gcc-libs`, `gcc-fortran`, `libgcc`, ... |
+| `llvm` | `llvm`, `llvm-libs`, `clang`, `lld`, ... |
+| `python` | `python`, `python-tests` |
+
+When the daemon encounters a pkgname that isn't found directly, it looks up its
+`pkgbase` in the pacman sync DB and retries with that name. After a successful
+build, **all subpackages** listed in `.SRCINFO` are recorded in `built.json` and
+removed from the pending queue at once.
+
+This means you should **blacklist the pkgbase**, not individual subpackages:
+
+```ini
+# correct — blocks all subpackages
+blacklist = gcc
+
+# wrong — gcc-libs will still try to build via pkgbase=gcc
+blacklist = gcc-libs
+```
+
+Any pkgname whose pkgbase is blacklisted is automatically skipped and counted
+in the "skipped" total in `buildbot status`.
+
+### AUR and binary packages
+
+AUR packages have no upstream PKGBUILD in any of the four tiers. The daemon
+detects them as unresolvable and marks them `not_found` in `failed.json`.
+Binary packages (e.g. `*-bin`) have no source to compile.
+
+Blacklist these to keep them off the failed list:
+
+```ini
+blacklist = ...,*-bin,*-git,*-svn
+```
+
+Or if you have a large AUR footprint, enumerate them explicitly.
 
 ### pkgrel dot-notation
 
@@ -576,7 +852,7 @@ that it moves to `failed.json` with a clear reason like
 │   │       ├── <pkg>.patch     preferred: diff -u against upstream
 │   │       └── _patched/       working dir (auto-generated, do not edit)
 │   ├── artix/          git clones from gitea.artixlinux.org (tier 2)
-│   ├── cachyos/        CachyOS PKGBUILDs repo (tier 3)
+│   ├── cachyos/        locally-cloned PKGBUILD monorepo (tier 3)
 │   └── arch/           pkgctl clones from Arch (tier 4)
 │
 └── repo/
