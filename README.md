@@ -397,6 +397,12 @@ autoprune = true
 # How many recent versions to retain per package (must be >= 1). Default: 1.
 # Set to 2+ if you want a rollback fallback in the repo dir.
 autoprune_keep = 1
+
+# Remove blacklisted packages from the repo db and repo dir each cycle.
+# When a package is added to the blacklist, its built .pkg.tar.zst files and
+# repo-db entry are removed on the next cycle so clients stop seeing it.
+# Default: true.
+autoprune_blacklisted = true
 ```
 
 ### Timing

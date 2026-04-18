@@ -47,6 +47,7 @@ from buildbot_lib import (
     vercmp,
     upgrade_chroot,
     ignore_special_files,
+    prune_blacklisted_from_repo,
 )
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,7 @@ def load_config(path: str) -> dict:
     cfg["download_retry_limit"] = sec.getint("download_retry_limit", 3)
     cfg["autoprune"] = sec.getboolean("autoprune", True)
     cfg["autoprune_keep"] = max(1, sec.getint("autoprune_keep", 1))
+    cfg["autoprune_blacklisted"] = sec.getboolean("autoprune_blacklisted", True)
     cfg["log_level"] = sec.get("log_level", "INFO")
 
     # Mode: local = build on the same machine you run the packages on.
@@ -536,7 +538,7 @@ def cmd_status(args, config: dict) -> int:
             continue
     recent.sort(key=lambda x: x[2])
 
-    installed_total = rebuilt_count = blacklisted_count = 0
+    installed_total = rebuilt_count = blacklisted_count = ineligible_count = 0
     blacklist = config.get("blacklist", [])
     def _bl(name):
         return any(name == e or fnmatch.fnmatch(name, e) for e in blacklist)
@@ -546,6 +548,7 @@ def cmd_status(args, config: dict) -> int:
         installed_total = len(manifest)
         rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") != "ineligible")
         blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
+        ineligible_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "ineligible")
     except Exception:
         pass
 
@@ -643,6 +646,8 @@ def cmd_status(args, config: dict) -> int:
         row("rebuilt", f"{rebuilt_count} / {installed_total}  ({pct:.0f}%)")
         if blacklisted_count:
             row("skipped", f"{blacklisted_count} / {installed_total}  {DIM}(blacklist — see /etc/arch-native.conf){R}")
+        if ineligible_count:
+            row("ineligible", f"{ineligible_count} / {installed_total}  {DIM}(arch=any — not rebuilt){R}")
     if repo_size:
         row("size", repo_size)
     if cycle_str:
@@ -1360,6 +1365,17 @@ def run_daemon(config_path: str, debug: bool):
                     log.info("Pruned stale queue entries: %d pending, %d failed removed", pp, pf)
 
                 built = get_built_state(config["state_path"])
+
+                # Remove newly-blacklisted packages from the repo
+                if config.get("autoprune_blacklisted", True):
+                    removed = prune_blacklisted_from_repo(
+                        config["blacklist"], built,
+                        config["repo_db"], config["repo_dir"],
+                    )
+                    if removed:
+                        for name in removed:
+                            built.pop(name, None)
+                        save_built_state(config["state_path"], built)
                 new_pkgs = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
 
                 if new_pkgs:

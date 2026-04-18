@@ -1087,6 +1087,43 @@ def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str,
     return moved
 
 
+def prune_blacklisted_from_repo(
+    blacklist: list[str],
+    built: dict,
+    repo_db_path: str,
+    repo_dir: str,
+) -> list[str]:
+    """Remove blacklisted packages from the repo db and delete their files.
+
+    Returns the list of package names removed.
+    """
+    to_remove = [
+        name for name in built
+        if _in_blacklist(name, blacklist)
+        and built[name].get("status") != "ineligible"
+    ]
+    if not to_remove:
+        return []
+
+    result = subprocess.run(
+        ["repo-remove", repo_db_path] + to_remove,
+        capture_output=True, text=True,
+    )
+    if result.returncode not in (0, 1):
+        log.warning("repo-remove returned %d: %s", result.returncode, result.stderr)
+
+    for name in to_remove:
+        pkg_files = built[name].get("pkg_files", [])
+        for fname in pkg_files:
+            for path in [os.path.join(repo_dir, fname),
+                         os.path.join(repo_dir, fname + ".sig")]:
+                if os.path.exists(path):
+                    os.remove(path)
+
+    log.info("Removed %d blacklisted package(s) from repo: %s", len(to_remove), ", ".join(to_remove))
+    return to_remove
+
+
 # ---------------------------------------------------------------------------
 # State tracking
 # ---------------------------------------------------------------------------
