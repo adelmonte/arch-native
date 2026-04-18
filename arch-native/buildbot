@@ -1530,6 +1530,21 @@ def run_daemon(config_path: str, debug: bool):
                     clear_in_progress(config)
                     continue
 
+                # c2. Skip if PKGBUILD version is older than what's already installed
+                pkgbuild_ver = f"{srcinfo['pkgver']}-{srcinfo['pkgrel']}"
+                if vercmp(pkgbuild_ver, pkg["version"]) < 0:
+                    cycle_stats["skipped_ineligible"] += 1
+                    log.info("[%s] PKGBUILD %s is older than installed %s — skipping", name, pkgbuild_ver, pkg["version"])
+                    _built = get_built_state(config["state_path"])
+                    _built[name] = {
+                        "version": pkg["version"],
+                        "status": "ineligible",
+                        "built_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    save_built_state(config["state_path"], _built)
+                    clear_in_progress(config)
+                    continue
+
                 log.debug("[%s] eligible", name)
 
                 # d. Import PGP keys
