@@ -48,6 +48,7 @@ from buildbot_lib import (
     upgrade_chroot,
     ignore_special_files,
     prune_blacklisted_from_repo,
+    prune_uninstalled_from_repo,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,6 +107,7 @@ def load_config(path: str) -> dict:
     cfg["autoprune"] = sec.getboolean("autoprune", True)
     cfg["autoprune_keep"] = max(1, sec.getint("autoprune_keep", 1))
     cfg["autoprune_blacklisted"] = sec.getboolean("autoprune_blacklisted", True)
+    cfg["autoprune_uninstalled"] = sec.getboolean("autoprune_uninstalled", True)
     cfg["log_level"] = sec.get("log_level", "INFO")
 
     # Mode: local = build on the same machine you run the packages on.
@@ -1370,6 +1372,17 @@ def run_daemon(config_path: str, debug: bool):
                 if config.get("autoprune_blacklisted", True):
                     removed = prune_blacklisted_from_repo(
                         config["blacklist"], built,
+                        config["repo_db"], config["repo_dir"],
+                    )
+                    if removed:
+                        for name in removed:
+                            built.pop(name, None)
+                        save_built_state(config["state_path"], built)
+
+                # Remove packages no longer in the client manifest from the repo
+                if config.get("autoprune_uninstalled", True):
+                    removed = prune_uninstalled_from_repo(
+                        manifest_names, built,
                         config["repo_db"], config["repo_dir"],
                     )
                     if removed:

@@ -403,6 +403,12 @@ autoprune_keep = 1
 # repo-db entry are removed on the next cycle so clients stop seeing it.
 # Default: true.
 autoprune_blacklisted = true
+
+# Remove packages that are no longer installed on the client from the repo.
+# When a package is uninstalled and drops out of the manifest, its built files
+# and repo-db entry are removed on the next cycle.
+# Default: true.
+autoprune_uninstalled = true
 ```
 
 ### Timing

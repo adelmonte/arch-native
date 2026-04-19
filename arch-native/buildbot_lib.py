@@ -1124,6 +1124,43 @@ def prune_blacklisted_from_repo(
     return to_remove
 
 
+def prune_uninstalled_from_repo(
+    manifest_names: set,
+    built: dict,
+    repo_db_path: str,
+    repo_dir: str,
+) -> list[str]:
+    """Remove packages that are no longer in the client manifest from the repo.
+
+    Returns the list of package names removed.
+    """
+    to_remove = [
+        name for name in built
+        if name not in manifest_names
+        and built[name].get("status") != "ineligible"
+    ]
+    if not to_remove:
+        return []
+
+    result = subprocess.run(
+        ["repo-remove", repo_db_path] + to_remove,
+        capture_output=True, text=True,
+    )
+    if result.returncode not in (0, 1):
+        log.warning("repo-remove returned %d: %s", result.returncode, result.stderr)
+
+    for name in to_remove:
+        pkg_files = built[name].get("pkg_files", [])
+        for fname in pkg_files:
+            for path in [os.path.join(repo_dir, fname),
+                         os.path.join(repo_dir, fname + ".sig")]:
+                if os.path.exists(path):
+                    os.remove(path)
+
+    log.info("Removed %d uninstalled package(s) from repo: %s", len(to_remove), ", ".join(to_remove))
+    return to_remove
+
+
 # ---------------------------------------------------------------------------
 # State tracking
 # ---------------------------------------------------------------------------
