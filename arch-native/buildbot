@@ -1423,6 +1423,7 @@ def run_daemon(config_path: str, debug: bool):
                         if failed_now.get(pkg["name"], {}).get("version") == pkg["version"]:
                             skipped_failed += 1
                             continue
+                        pkg["queued_at"] = datetime.now(timezone.utc).isoformat()
                         pending.append(pkg)
                         queued += 1
                         if pkg["build_reason"] == "new":
@@ -1473,6 +1474,7 @@ def run_daemon(config_path: str, debug: bool):
                         if failed_now.get(pkg["name"], {}).get("version") == pkg["version"]:
                             skipped_failed += 1
                             continue
+                        pkg["queued_at"] = datetime.now(timezone.utc).isoformat()
                         pending.append(pkg)
                         queued += 1
                     save_pending(config["pending_path"], pending)
@@ -1597,11 +1599,14 @@ def run_daemon(config_path: str, debug: bool):
                             cycle_stats["skipped_missing_keys"] += 1
                             reason = "missing PGP keys: " + ",".join(missing_keys)
                             log.error("[%s] %s", name, reason)
+                            _now_iso = datetime.now(timezone.utc).isoformat()
                             failed[name] = {
                                 "version": pkg.get("version", "unknown"),
                                 "reason": reason,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "timestamp": _now_iso,
+                                "first_failed_at": failed.get(name, {}).get("first_failed_at", _now_iso),
                                 "retries": failed.get(name, {}).get("retries", 0) + 1,
+                                "error_type": "missing_keys",
                             }
                             save_failed(config["failed_path"], failed)
                             continue
@@ -1673,6 +1678,7 @@ def run_daemon(config_path: str, debug: bool):
                         if retry_count <= limit:
                             requeue = dict(pkg)
                             requeue["download_retries"] = retry_count
+                            requeue["queued_at"] = datetime.now(timezone.utc).isoformat()
                             pending.append(requeue)
                             save_pending(config["pending_path"], pending)
                             cycle_stats["failed"] += 1
@@ -1681,11 +1687,14 @@ def run_daemon(config_path: str, debug: bool):
                                 name, int(duration), retry_count, limit,
                             )
                         else:
+                            _now_iso = datetime.now(timezone.utc).isoformat()
                             failed[name] = {
                                 "version": pkg["version"],
                                 "reason": f"download failed after {limit} attempts",
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "timestamp": _now_iso,
+                                "first_failed_at": failed.get(name, {}).get("first_failed_at", _now_iso),
                                 "retries": failed.get(name, {}).get("retries", 0) + 1,
+                                "error_type": "download",
                             }
                             save_failed(config["failed_path"], failed)
                             cycle_stats["failed"] += 1
@@ -1719,12 +1728,15 @@ def run_daemon(config_path: str, debug: bool):
                                 pass
                     if failure_type == "timeout":
                         build_reason = f"build timed out after {config.get('build_timeout', 0)}s"
+                    _now_iso = datetime.now(timezone.utc).isoformat()
                     failed[name] = {
                         "version": pkg["version"],
                         "reason": build_reason,
                         "log_path": log_path_for_record,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "timestamp": _now_iso,
+                        "first_failed_at": failed.get(name, {}).get("first_failed_at", _now_iso),
                         "retries": failed.get(name, {}).get("retries", 0) + 1,
+                        "error_type": failure_type or "build",
                     }
                     save_failed(config["failed_path"], failed)
                     cycle_stats["failed"] += 1
@@ -1738,21 +1750,27 @@ def run_daemon(config_path: str, debug: bool):
             except FileNotFoundError as e:
                 cycle_stats["failed"] += 1
                 log.error("[%s] PKGBUILD not found: %s", name, e)
+                _now_iso = datetime.now(timezone.utc).isoformat()
                 failed[name] = {
                     "version": pkg.get("version", "unknown"),
                     "reason": _sanitize_reason(str(e)),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": _now_iso,
+                    "first_failed_at": failed.get(name, {}).get("first_failed_at", _now_iso),
                     "retries": failed.get(name, {}).get("retries", 0) + 1,
+                    "error_type": "pkgbuild_not_found",
                 }
                 save_failed(config["failed_path"], failed)
             except Exception as e:
                 cycle_stats["failed"] += 1
                 log.error("[%s] unexpected error: %s", name, e, exc_info=True)
+                _now_iso = datetime.now(timezone.utc).isoformat()
                 failed[name] = {
                     "version": pkg.get("version", "unknown"),
                     "reason": _sanitize_reason(str(e)),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": _now_iso,
+                    "first_failed_at": failed.get(name, {}).get("first_failed_at", _now_iso),
                     "retries": failed.get(name, {}).get("retries", 0) + 1,
+                    "error_type": "build",
                 }
                 save_failed(config["failed_path"], failed)
             finally:
