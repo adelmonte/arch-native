@@ -995,6 +995,198 @@ def cmd_failed_clear(args, config: dict) -> int:
     return 0
 
 
+def _read_forge_db(repo_db_path: str) -> dict:
+    """Parse a pacman repo db tarball. Returns {pkgname: {version, filename}}."""
+    import tarfile
+    result = {}
+    if not os.path.exists(repo_db_path):
+        return result
+    try:
+        with tarfile.open(repo_db_path) as tf:
+            for member in tf.getmembers():
+                if not member.name.endswith("/desc"):
+                    continue
+                f = tf.extractfile(member)
+                if f is None:
+                    continue
+                content = f.read().decode("utf-8", errors="replace")
+                name = _db_field(content, "NAME")
+                version = _db_field(content, "VERSION")
+                filename = _db_field(content, "FILENAME")
+                if name:
+                    result[name] = {"version": version or "", "filename": filename or ""}
+    except Exception as e:
+        log.warning("Error reading forge DB %s: %s", repo_db_path, e)
+    return result
+
+
+def _db_field(content: str, field: str) -> str:
+    marker = f"%{field}%"
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == marker and i + 1 < len(lines):
+            return lines[i + 1].strip()
+    return ""
+
+
+def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tuple[int, int]:
+    """
+    Check and repair consistency between built.json, the forge repo DB, and
+    physical .pkg.tar.zst files. Returns (issues_found, issues_repaired).
+
+    Repair table:
+      file ✓  db ✓  built ✓  → ok
+      file ✓  db ✓  built ✗  → reanimate built.json from DB metadata
+      file ✓  db ✗  built ✓  → reanimate: repo-add the file
+      file ✓  db ✗  built ✗  → orphan file: delete
+      file ✗  db ✓  built ✓  → broken: repo-remove + clear built.json
+      file ✗  db ✓  built ✗  → broken: repo-remove
+      file ✗  db ✗  built ✓  → broken: clear built.json entry
+
+    Covers the common SIGKILL race: build finished, files copied to repo_dir,
+    but repo-add or the built.json write didn't complete before the kill.
+    """
+    from buildbot_lib import (
+        get_built_state, save_built_state,
+        _pkgname_from_filename,
+    )
+
+    built = get_built_state(config["state_path"])
+    repo_db = config["repo_db"]
+    repo_dir = config["repo_dir"]
+
+    db_pkgs = _read_forge_db(repo_db)
+
+    physical: dict[str, list[str]] = {}
+    if os.path.isdir(repo_dir):
+        for fname in os.listdir(repo_dir):
+            if fname.endswith(".pkg.tar.zst"):
+                pn = _pkgname_from_filename(fname)
+                physical.setdefault(pn, []).append(fname)
+
+    built_pkgs = {n: r for n, r in built.items() if r.get("status") != "ineligible"}
+    all_names = set(db_pkgs) | set(physical) | set(built_pkgs)
+
+    # Collect repairs as (action, name, extra)
+    repairs = []
+    for name in sorted(all_names):
+        in_db    = name in db_pkgs
+        in_files = bool(physical.get(name))
+        in_built = name in built_pkgs
+
+        if in_db and in_files and in_built:
+            if verbose:
+                print(f"  ok      {name}")
+            continue
+        elif in_files and in_db and not in_built:
+            repairs.append(("reanimate_built", name, physical[name]))
+        elif in_files and not in_db and in_built:
+            repairs.append(("reanimate_db", name, physical[name]))
+        elif in_files and not in_db and not in_built:
+            repairs.append(("delete_orphan", name, physical[name]))
+        elif not in_files and in_db and in_built:
+            repairs.append(("remove_db_clear_built", name, []))
+        elif not in_files and in_db and not in_built:
+            repairs.append(("remove_db", name, []))
+        elif not in_files and not in_db and in_built:
+            repairs.append(("clear_built", name, []))
+
+    if not repairs:
+        print("fsck: all consistent")
+        return 0, 0
+
+    label = {
+        "reanimate_built":    "reanimate built.json",
+        "reanimate_db":       "reanimate db",
+        "delete_orphan":      "delete orphan file",
+        "remove_db_clear_built": "remove db + clear built",
+        "remove_db":          "remove db",
+        "clear_built":        "clear built.json",
+    }
+    nw = max(len(n) for _, n, _ in repairs)
+    for action, name, _ in repairs:
+        print(f"  {label[action]:<22}  {name}")
+
+    if dry_run:
+        print(f"\nfsck: {len(repairs)} issue(s) — re-run without --dry-run to repair")
+        return len(repairs), 0
+
+    repaired = 0
+    for action, name, files in repairs:
+        try:
+            if action == "reanimate_db":
+                paths = [os.path.join(repo_dir, f) for f in files]
+                r = subprocess.run(["repo-add", "-p", repo_db] + paths, capture_output=True)
+                if r.returncode in (0, 1):
+                    repaired += 1
+                    log.info("fsck: repo-add %s", name)
+                else:
+                    log.warning("fsck: repo-add %s failed: %s", name, r.stderr.decode())
+
+            elif action == "reanimate_built":
+                db_rec = db_pkgs[name]
+                built[name] = {
+                    "version": db_rec["version"],
+                    "built_at": datetime.now(timezone.utc).isoformat(),
+                    "pkg_files": files,
+                }
+                save_built_state(config["state_path"], built)
+                repaired += 1
+                log.info("fsck: reanimated built.json for %s", name)
+
+            elif action == "delete_orphan":
+                for fname in files:
+                    fpath = os.path.join(repo_dir, fname)
+                    try:
+                        os.remove(fpath)
+                    except FileNotFoundError:
+                        pass
+                    sig = fpath + ".sig"
+                    if os.path.exists(sig):
+                        os.remove(sig)
+                repaired += 1
+                log.info("fsck: deleted orphan files for %s", name)
+
+            elif action in ("remove_db_clear_built", "remove_db"):
+                r = subprocess.run(["repo-remove", repo_db, name], capture_output=True)
+                if r.returncode in (0, 1):
+                    if action == "remove_db_clear_built" and name in built:
+                        del built[name]
+                        save_built_state(config["state_path"], built)
+                    repaired += 1
+                    log.info("fsck: repo-remove %s", name)
+                else:
+                    log.warning("fsck: repo-remove %s failed: %s", name, r.stderr.decode())
+
+            elif action == "clear_built":
+                if name in built:
+                    del built[name]
+                    save_built_state(config["state_path"], built)
+                repaired += 1
+                log.info("fsck: cleared built.json entry for %s", name)
+
+        except Exception as e:
+            log.warning("fsck: repair failed for %s (%s): %s", name, action, e)
+
+    print(f"\nfsck: repaired {repaired}/{len(repairs)} issue(s)")
+    return len(repairs), repaired
+
+
+def cmd_fsck(args, config: dict) -> int:
+    """
+    Verify and repair consistency between built.json, the forge repo DB,
+    and physical package files. Repairs SIGKILL-race divergences automatically.
+    Requires the service to be stopped (unless --force is given).
+    """
+    if not getattr(args, "force", False) and _service_active():
+        print(_STOPPED_MSG)
+        return 2
+    dry_run = getattr(args, "dry_run", False)
+    verbose = getattr(args, "verbose", False)
+    found, _ = _run_fsck(config, dry_run=dry_run, verbose=verbose)
+    return 1 if (dry_run and found) else 0
+
+
 def cmd_init(args, config: dict) -> int:
     """
     Bootstrap a new arch-native installation:
@@ -1250,6 +1442,7 @@ def run_cli(args, config: dict) -> int:
         "retry":   cmd_queue_retry_failed,
         "clear":   cmd_failed_clear,
         "sync":    cmd_sync,
+        "fsck":    cmd_fsck,
         "init":    cmd_init,
         "patch":   cmd_patch,
     }
@@ -1377,6 +1570,18 @@ def run_daemon(config_path: str, debug: bool):
     last_manifest_mtime = 0
     last_upstream_check = 0
     manifest = []
+
+    # Auto-fsck on startup: repair any built.json / repo DB / file divergences
+    # caused by SIGKILL during a previous build cycle.
+    log.info("Running startup fsck...")
+    try:
+        found, repaired = _run_fsck(config)
+        if found:
+            log.info("Startup fsck: repaired %d/%d issue(s)", repaired, found)
+        else:
+            log.info("Startup fsck: all consistent")
+    except Exception as e:
+        log.warning("Startup fsck failed: %s", e)
 
     # Build pkgname->pkgbase map for split package resolution
     log.info("Building pkgbase map from sync databases...")
@@ -1934,6 +2139,7 @@ def main():
     buildbot retry    <PKG> [--all] [--dry-run]
     buildbot clear    <PKG> [--all] [--dry-run]
     buildbot sync     [--reset] [--dry-run]
+    buildbot fsck     [--dry-run] [-v]
     buildbot init
     buildbot patch    {{create|show|check}} <PKG>"""
 
@@ -2029,6 +2235,19 @@ def main():
         help="clear the existing queue first, then rebuild from scratch")
     p_sync.add_argument("--dry-run", action="store_true",
         help="show what would be queued without writing")
+
+    p_fsck = sub.add_parser("fsck",
+        usage="buildbot fsck [--dry-run] [-v]",
+        formatter_class=_HelpFormatter,
+        description="Check and repair consistency between built.json, the forge repo DB, "
+                    "and physical .pkg.tar.zst files.  Fixes divergences caused by SIGKILL "
+                    "during a build cycle.  Requires the service to be stopped first.")
+    p_fsck.add_argument("--dry-run", action="store_true",
+        help="report issues without making any changes")
+    p_fsck.add_argument("-v", "--verbose", action="store_true",
+        help="also print OK entries")
+    p_fsck.add_argument("--force", action="store_true",
+        help="run even if the service is active (unsafe)")
 
     sub.add_parser("init",
         formatter_class=_HelpFormatter,
