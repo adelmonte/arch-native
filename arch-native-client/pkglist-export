@@ -31,7 +31,7 @@ fi
 REMOTE="${REMOTE_HOST}:${REMOTE_PATH}"
 
 # Build JSON manifest from pacman
-pacman -Qi | python3 -c "
+pacman -Qi 2>/dev/null | python3 -c "
 import sys, json, re, subprocess
 
 # Get repo mapping from sync db

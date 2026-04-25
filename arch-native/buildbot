@@ -32,6 +32,7 @@ from buildbot_lib import (
     build_pkgbase_map,
     resolve_pkgbuild,
     parse_srcinfo,
+    _quick_pkgver,
     is_eligible,
     prepare_gnupg_home,
     import_pgp_keys,
@@ -109,6 +110,12 @@ def load_config(path: str) -> dict:
     cfg["autoprune_blacklisted"] = sec.getboolean("autoprune_blacklisted", True)
     cfg["autoprune_uninstalled"] = sec.getboolean("autoprune_uninstalled", True)
     cfg["log_level"] = sec.get("log_level", "INFO")
+
+    raw_vs = sec.get("tier_version_select", "priority").strip().lower()
+    if raw_vs not in ("priority", "highest"):
+        log.warning("Unknown tier_version_select '%s', defaulting to 'priority'", raw_vs)
+        raw_vs = "priority"
+    cfg["tier_version_select"] = raw_vs
 
     # Mode: local = build on the same machine you run the packages on.
     # remote = dedicated build server (current/default setup).
@@ -351,19 +358,16 @@ def check_upstream_updates(manifest, built, config):
         else:
             base_ver = built_ver
 
-        upstream_ver = None
+        version_select = config.get("tier_version_select", "priority")
+        best_dir = best_tier = None
+        best_quick_ver = ""
 
         for tier in repo_priority:
-            if upstream_ver is not None:
-                break
-
             if tier == "local":
                 local_dir = os.path.join(pkgbuilds_dir, "local", name)
                 if os.path.isfile(os.path.join(local_dir, "PKGBUILD")):
-                    try:
-                        upstream_ver = _fmt_srcinfo_ver(parse_srcinfo(local_dir, config["build_user"]))
-                    except Exception as e:
-                        log.debug("[%s] failed to parse local srcinfo: %s", name, e)
+                    best_dir, best_tier = local_dir, "local"
+                    break  # local always wins
                 continue
 
             src = tier_sources.get(tier)
@@ -371,6 +375,7 @@ def check_upstream_updates(manifest, built, config):
                 continue
             kind = src["type"]
             tier_base = os.path.join(pkgbuilds_dir, tier)
+            tier_dir = None
 
             if kind == "clone":
                 pkg_dir = os.path.join(tier_base, name)
@@ -378,36 +383,38 @@ def check_upstream_updates(manifest, built, config):
                     candidate = (os.path.join(pkg_dir, subdir, "PKGBUILD") if subdir
                                  else os.path.join(pkg_dir, "PKGBUILD"))
                     if os.path.isfile(candidate):
-                        try:
-                            upstream_ver = _fmt_srcinfo_ver(
-                                parse_srcinfo(os.path.dirname(candidate), config["build_user"])
-                            )
-                        except Exception as e:
-                            log.debug("[%s] failed to parse %s srcinfo: %s", name, tier, e)
+                        tier_dir = os.path.dirname(candidate)
                         break
 
             elif kind == "monorepo":
                 for root, dirs, files in os.walk(tier_base):
                     dirs[:] = [d for d in dirs if d != ".git"]
                     if os.path.basename(root) == name and "PKGBUILD" in files:
-                        try:
-                            upstream_ver = _fmt_srcinfo_ver(
-                                parse_srcinfo(root, config["build_user"])
-                            )
-                        except Exception as e:
-                            log.debug("[%s] failed to parse %s srcinfo: %s", name, tier, e)
+                        tier_dir = root
                         break
 
             elif kind == "pkgctl":
                 pkg_dir = os.path.join(tier_base, name)
                 if os.path.isdir(pkg_dir):
                     subprocess.run(["git", "pull", "--ff-only"], cwd=pkg_dir, capture_output=True)
-                    try:
-                        upstream_ver = _fmt_srcinfo_ver(
-                            parse_srcinfo(pkg_dir, config["build_user"])
-                        )
-                    except Exception as e:
-                        log.debug("[%s] failed to parse %s srcinfo: %s", name, tier, e)
+                    if os.path.isfile(os.path.join(pkg_dir, "PKGBUILD")):
+                        tier_dir = pkg_dir
+
+            if tier_dir:
+                if version_select == "priority":
+                    best_dir, best_tier = tier_dir, tier
+                    break  # first tier match wins
+                ver = _quick_pkgver(tier_dir)
+                if ver and (not best_quick_ver or vercmp(ver, best_quick_ver) > 0):
+                    best_dir, best_tier, best_quick_ver = tier_dir, tier, ver
+
+        # Parse srcinfo once on the winning candidate.
+        upstream_ver = None
+        if best_dir:
+            try:
+                upstream_ver = _fmt_srcinfo_ver(parse_srcinfo(best_dir, config["build_user"]))
+            except Exception as e:
+                log.debug("[%s] failed to parse %s srcinfo: %s", name, best_tier, e)
 
         if upstream_ver:
             normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
@@ -1067,6 +1074,7 @@ def _cmd_patch_create(args, config: dict) -> int:
         upstream_dir, tier = resolve_pkgbuild(
             pkgname, pkgbuilds_dir, None, upstream_priority,
             tier_sources=config["tier_sources"],
+            version_select=config.get("tier_version_select", "priority"),
         )
     except FileNotFoundError as e:
         print(f"error: {e}")
@@ -1151,6 +1159,7 @@ def _cmd_patch_check(args, config: dict) -> int:
             upstream_dir, tier = resolve_pkgbuild(
                 pkgname, pkgbuilds_dir, None, upstream_priority,
                 tier_sources=config["tier_sources"],
+                version_select=config.get("tier_version_select", "priority"),
             )
         except FileNotFoundError:
             print(f"  {pkgname:<28} upstream not found")
@@ -1520,6 +1529,7 @@ def run_daemon(config_path: str, debug: bool):
                     pkgbase_map,
                     config["repo_priority"],
                     tier_sources=config["tier_sources"],
+                    version_select=config["tier_version_select"],
                 )
                 log.info("[%s] PKGBUILD tier: %s (%s)", name, tier, pkgbuild_dir)
 

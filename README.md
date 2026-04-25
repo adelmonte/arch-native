@@ -768,7 +768,16 @@ Build server — main loop (poll_interval = 300s):
 ### PKGBUILD tier resolution
 
 Priority is set by `repo_priority`. Tier names can be anything — each maps to a
-source type defined in config. First match wins.
+source type defined in config.
+
+`tier_version_select` controls what happens when a package exists in more than one tier:
+
+| Value | Behaviour |
+|---|---|
+| `priority` (default) | First tier in `repo_priority` that has a PKGBUILD wins. Safe for setups where higher-priority tiers carry distro-specific patches. |
+| `highest` | All tiers are checked; the one with the highest `pkgver` wins. Useful when a lower-priority tier may lag behind upstream — e.g. an Artix clone tier that hasn't bumped a package yet while CachyOS or Arch already has the new version. |
+
+On Artix with dinit, `highest` is generally safe: Artix-specific service units live in separate `-dinit` split packages, not in the base package PKGBUILD. The worst case when a non-Artix PKGBUILD is selected is a build failure (lands in `failed.json`) or a pacman install refusal — neither breaks the running system.
 
 | Source type | How it works | Auto-updated? |
 |---|---|---|
