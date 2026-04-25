@@ -580,6 +580,11 @@ def resolve_pkgbuild(
                 )
                 if result.returncode != 0:
                     log.debug("[%s] %s clone failed (package not in this tier)", pkgname, tier)
+            else:
+                subprocess.run(
+                    ["git", "-C", tier_dir, "pull", "--ff-only"],
+                    capture_output=True,
+                )
             for subdir in ("", "trunk"):
                 candidate = (os.path.join(tier_dir, subdir, "PKGBUILD") if subdir
                              else os.path.join(tier_dir, "PKGBUILD"))

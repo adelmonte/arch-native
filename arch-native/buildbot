@@ -379,6 +379,11 @@ def check_upstream_updates(manifest, built, config):
 
             if kind == "clone":
                 pkg_dir = os.path.join(tier_base, name)
+                if os.path.isdir(pkg_dir):
+                    subprocess.run(
+                        ["git", "-C", pkg_dir, "pull", "--ff-only"],
+                        capture_output=True,
+                    )
                 for subdir in ("", "trunk"):
                     candidate = (os.path.join(pkg_dir, subdir, "PKGBUILD") if subdir
                                  else os.path.join(pkg_dir, "PKGBUILD"))
