@@ -331,10 +331,12 @@ def _fmt_srcinfo_ver(si: dict) -> str:
     return f"{epoch}:{si['pkgver']}-{si['pkgrel']}" if epoch else f"{si['pkgver']}-{si['pkgrel']}"
 
 
-def check_upstream_updates(manifest, built, config):
+def check_upstream_updates(manifest, built, config, should_stop=None):
     """
     For each built package in the manifest, compare built version against
     current upstream. Returns list of packages needing rebuild.
+    should_stop: optional callable; checked between packages so a SIGTERM
+    received during the upstream check can interrupt it cleanly.
     """
     updates = []
     repo_priority = config.get("repo_priority", ["local", "arch"])
@@ -343,6 +345,9 @@ def check_upstream_updates(manifest, built, config):
 
     blacklist = config.get("blacklist", [])
     for pkg in manifest:
+        if should_stop and should_stop():
+            log.info("Upstream check interrupted by shutdown signal")
+            break
         name = pkg["name"]
         if pkg.get("repo") == "unknown":
             continue
@@ -1454,7 +1459,7 @@ def run_daemon(config_path: str, debug: bool):
                             )
 
                 built = get_built_state(config["state_path"])
-                updates = check_upstream_updates(manifest, built, config)
+                updates = check_upstream_updates(manifest, built, config, should_stop=lambda: shutdown_flag)
 
                 if updates:
                     pending = load_pending(config["pending_path"])
