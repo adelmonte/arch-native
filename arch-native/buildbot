@@ -110,6 +110,8 @@ def load_config(path: str) -> dict:
     cfg["autoprune_blacklisted"] = sec.getboolean("autoprune_blacklisted", True)
     cfg["autoprune_uninstalled"] = sec.getboolean("autoprune_uninstalled", True)
     cfg["log_level"] = sec.get("log_level", "INFO")
+    cfg["failed_stall_retries"] = sec.getint("failed_stall_retries", 5)
+    cfg["failed_stall_days"] = sec.getint("failed_stall_days", 7)
 
     raw_vs = sec.get("tier_version_select", "priority").strip().lower()
     if raw_vs not in ("priority", "highest"):
@@ -638,25 +640,47 @@ def cmd_status(args, config: dict) -> int:
             print(f"  {n:<{nw}}  {DIM}{v:<{vw}}{R}  {DIM}{_age(age)} ago{R}")
         print()
 
-    # Failed — show top-N most recent with reason + age
+    # Failed — split into stalled (needs human attention) and active
     if failed_map:
-        section("Failed", str(len(failed_map)))
-        rows = sorted(failed_map.items(),
-                      key=lambda kv: kv[1].get("timestamp", ""), reverse=True)
-        SHOW = 5
-        nw = max((len(n) for n, _ in rows[:SHOW]), default=0)
-        for n, rec in rows[:SHOW]:
-            age = ""
-            ts = rec.get("timestamp", "")
-            if ts:
-                try:
-                    age = f"{_age(int((now - datetime.fromisoformat(ts)).total_seconds()))} ago"
-                except Exception: pass
-            reason = _sanitize_reason(rec.get("reason", "unknown"))[:60]
-            print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {reason}")
-        if len(rows) > SHOW:
-            print(f"  {DIM}+{len(rows) - SHOW} more — run: buildbot failed{R}")
-        print()
+        stalled_rows = [(n, r) for n, r in failed_map.items() if _is_stalled(r, config)]
+        active_rows  = [(n, r) for n, r in failed_map.items() if not _is_stalled(r, config)]
+
+        if stalled_rows:
+            section(f"Stalled  {DIM}needs attention{R}", str(len(stalled_rows)))
+            stalled_rows.sort(key=lambda kv: kv[1].get("timestamp", ""), reverse=True)
+            nw = max((len(n) for n, _ in stalled_rows), default=0)
+            SHOW = 5
+            for n, rec in stalled_rows[:SHOW]:
+                age = ""
+                ts = rec.get("first_failed_at") or rec.get("timestamp", "")
+                if ts:
+                    try:
+                        age = f"{_age(int((now - datetime.fromisoformat(ts)).total_seconds()))} ago"
+                    except Exception: pass
+                retries = rec.get("retries", 0)
+                reason = _sanitize_reason(rec.get("reason", "unknown"))[:50]
+                print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {retries}x  {reason}")
+            if len(stalled_rows) > SHOW:
+                print(f"  {DIM}+{len(stalled_rows) - SHOW} more — run: buildbot failed{R}")
+            print()
+
+        if active_rows:
+            section("Failed", str(len(active_rows)))
+            rows = sorted(active_rows, key=lambda kv: kv[1].get("timestamp", ""), reverse=True)
+            SHOW = 5
+            nw = max((len(n) for n, _ in rows[:SHOW]), default=0)
+            for n, rec in rows[:SHOW]:
+                age = ""
+                ts = rec.get("timestamp", "")
+                if ts:
+                    try:
+                        age = f"{_age(int((now - datetime.fromisoformat(ts)).total_seconds()))} ago"
+                    except Exception: pass
+                reason = _sanitize_reason(rec.get("reason", "unknown"))[:60]
+                print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {reason}")
+            if len(rows) > SHOW:
+                print(f"  {DIM}+{len(rows) - SHOW} more — run: buildbot failed{R}")
+            print()
 
     # Repo / scan
     section(f"Repo  {DIM}{repo_name}{R}")
@@ -849,6 +873,24 @@ def _sanitize_reason(reason: str) -> str:
         if line and not any(line.startswith(p) for p in skip_prefixes):
             return line[:120]
     return reason.splitlines()[0].strip()[:120]
+
+
+def _is_stalled(rec: dict, config: dict) -> bool:
+    """True if a failed record has exceeded the retry or age stall thresholds."""
+    stall_retries = config.get("failed_stall_retries", 5)
+    if stall_retries > 0 and rec.get("retries", 0) >= stall_retries:
+        return True
+    stall_days = config.get("failed_stall_days", 7)
+    if stall_days > 0:
+        ts = rec.get("first_failed_at") or rec.get("timestamp", "")
+        if ts:
+            try:
+                first = datetime.fromisoformat(ts)
+                if (datetime.now(timezone.utc) - first).days >= stall_days:
+                    return True
+            except Exception:
+                pass
+    return False
 
 
 def cmd_failed_list(args, config: dict) -> int:
@@ -1414,14 +1456,19 @@ def run_daemon(config_path: str, debug: bool):
                     pending = load_pending(config["pending_path"])
                     failed_now = load_failed(config["failed_path"])
                     pending_names = {p["name"] for p in pending}
-                    queued = queued_new = queued_update = skipped_existing = skipped_failed = 0
+                    queued = queued_new = queued_update = skipped_existing = skipped_failed = skipped_stalled = 0
                     for pkg in new_pkgs:
                         if pkg["name"] in pending_names:
                             skipped_existing += 1
                             continue
+                        failed_rec = failed_now.get(pkg["name"], {})
                         # Don't re-add if already failed at this exact version
-                        if failed_now.get(pkg["name"], {}).get("version") == pkg["version"]:
+                        if failed_rec.get("version") == pkg["version"]:
                             skipped_failed += 1
+                            continue
+                        # Don't re-add stalled packages — they need human attention
+                        if _is_stalled(failed_rec, config):
+                            skipped_stalled += 1
                             continue
                         pkg["queued_at"] = datetime.now(timezone.utc).isoformat()
                         pending.append(pkg)
@@ -1432,9 +1479,14 @@ def run_daemon(config_path: str, debug: bool):
                             queued_update += 1
                     save_pending(config["pending_path"], pending)
                     log.info(
-                        "Manifest queue update: queued=%d (new=%d update=%d), skipped_existing=%d, skipped_failed=%d",
-                        queued, queued_new, queued_update, skipped_existing, skipped_failed,
+                        "Manifest queue update: queued=%d (new=%d update=%d), skipped_existing=%d, skipped_failed=%d, skipped_stalled=%d",
+                        queued, queued_new, queued_update, skipped_existing, skipped_failed, skipped_stalled,
                     )
+                    if skipped_stalled:
+                        log.warning(
+                            "%d package(s) stalled (>=%d failures or >=%d days) — run: buildbot failed",
+                            skipped_stalled, config.get("failed_stall_retries", 5), config.get("failed_stall_days", 7),
+                        )
                 else:
                     log.info("No new or updated packages to build")
         except Exception as e:
@@ -1466,21 +1518,25 @@ def run_daemon(config_path: str, debug: bool):
                     pending = load_pending(config["pending_path"])
                     failed_now = load_failed(config["failed_path"])
                     pending_names = {p["name"] for p in pending}
-                    queued = skipped_existing = skipped_failed = 0
+                    queued = skipped_existing = skipped_failed = skipped_stalled = 0
                     for pkg in updates:
                         if pkg["name"] in pending_names:
                             skipped_existing += 1
                             continue
-                        if failed_now.get(pkg["name"], {}).get("version") == pkg["version"]:
+                        failed_rec = failed_now.get(pkg["name"], {})
+                        if failed_rec.get("version") == pkg["version"]:
                             skipped_failed += 1
+                            continue
+                        if _is_stalled(failed_rec, config):
+                            skipped_stalled += 1
                             continue
                         pkg["queued_at"] = datetime.now(timezone.utc).isoformat()
                         pending.append(pkg)
                         queued += 1
                     save_pending(config["pending_path"], pending)
                     log.info(
-                        "Upstream update queue: queued=%d, skipped_existing=%d, skipped_failed=%d",
-                        queued, skipped_existing, skipped_failed,
+                        "Upstream update queue: queued=%d, skipped_existing=%d, skipped_failed=%d, skipped_stalled=%d",
+                        queued, skipped_existing, skipped_failed, skipped_stalled,
                     )
             except Exception as e:
                 log.error("Error checking upstream updates: %s", e)
