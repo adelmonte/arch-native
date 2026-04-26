@@ -32,6 +32,7 @@ from buildbot_lib import (
     build_pkgbase_map,
     resolve_pkgbuild,
     parse_srcinfo,
+    _git,
     _quick_pkgver,
     is_eligible,
     prepare_gnupg_home,
@@ -387,10 +388,11 @@ def check_upstream_updates(manifest, built, config, should_stop=None):
             if kind == "clone":
                 pkg_dir = os.path.join(tier_base, name)
                 if os.path.isdir(pkg_dir):
-                    subprocess.run(
-                        ["git", "-C", pkg_dir, "pull", "--ff-only"],
-                        capture_output=True,
-                    )
+                    r = _git(["-C", pkg_dir, "pull", "--ff-only"],
+                             config["build_user"], capture_output=True)
+                    if r.returncode != 0:
+                        log.debug("[%s] %s pull failed: %s", name, tier,
+                                  r.stderr.decode(errors="replace").strip()[:120])
                 for subdir in ("", "trunk"):
                     candidate = (os.path.join(pkg_dir, subdir, "PKGBUILD") if subdir
                                  else os.path.join(pkg_dir, "PKGBUILD"))
@@ -408,7 +410,11 @@ def check_upstream_updates(manifest, built, config, should_stop=None):
             elif kind == "pkgctl":
                 pkg_dir = os.path.join(tier_base, name)
                 if os.path.isdir(pkg_dir):
-                    subprocess.run(["git", "pull", "--ff-only"], cwd=pkg_dir, capture_output=True)
+                    r = _git(["-C", pkg_dir, "pull", "--ff-only"],
+                             config["build_user"], capture_output=True)
+                    if r.returncode != 0:
+                        log.debug("[%s] arch pull failed: %s", name,
+                                  r.stderr.decode(errors="replace").strip()[:120])
                     if os.path.isfile(os.path.join(pkg_dir, "PKGBUILD")):
                         tier_dir = pkg_dir
 
@@ -1711,10 +1717,13 @@ def run_daemon(config_path: str, debug: bool):
                     if src["type"] == "monorepo":
                         monorepo_dir = os.path.join(config["pkgbuilds_dir"], tier)
                         if os.path.isdir(os.path.join(monorepo_dir, ".git")):
-                            subprocess.run(
-                                ["git", "-C", monorepo_dir, "pull", "--ff-only"],
-                                capture_output=True,
-                            )
+                            r = _git(["-C", monorepo_dir, "pull", "--ff-only"],
+                                     config["build_user"], capture_output=True)
+                            if r.returncode != 0:
+                                log.warning(
+                                    "monorepo pull failed for %s tier: %s",
+                                    tier, r.stderr.decode(errors="replace").strip()[:200],
+                                )
 
                 built = get_built_state(config["state_path"])
                 updates = check_upstream_updates(manifest, built, config, should_stop=lambda: shutdown_flag)

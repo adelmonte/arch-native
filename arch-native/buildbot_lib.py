@@ -444,6 +444,20 @@ def _apply_local_patch(pkgname: str, patch_file: str, upstream_dir: str, local_d
     return work_dir
 
 
+def _git(args: list, build_user: str = "buildbot", **kwargs) -> subprocess.CompletedProcess:
+    """Run git as build_user when the daemon runs as root.
+
+    Git 2.35.2+ rejects operations on directories not owned by the current
+    user (safe.directory). Since pkgbuilds/ is owned by buildbot but the
+    daemon runs as root, every pull silently fails unless we drop privileges.
+    """
+    if os.getuid() == 0:
+        cmd = ["runuser", "-u", build_user, "--", "git"] + args
+    else:
+        cmd = ["git"] + args
+    return subprocess.run(cmd, **kwargs)
+
+
 def _quick_pkgver(pkgbuild_dir: str) -> str:
     """Grep pkgver/pkgrel/epoch from a PKGBUILD for cheap tier comparison.
 
@@ -574,17 +588,15 @@ def resolve_pkgbuild(
             if not os.path.isdir(tier_dir):
                 url = src["url"].format(pkgname=pkgname)
                 log.debug("[%s] attempting %s clone: %s", pkgname, tier, url)
-                result = subprocess.run(
-                    ["git", "clone", "--depth=1", url, tier_dir],
-                    capture_output=True, text=True,
-                )
+                result = _git(["clone", "--depth=1", url, tier_dir],
+                              capture_output=True, text=True)
                 if result.returncode != 0:
                     log.debug("[%s] %s clone failed (package not in this tier)", pkgname, tier)
             else:
-                subprocess.run(
-                    ["git", "-C", tier_dir, "pull", "--ff-only"],
-                    capture_output=True,
-                )
+                r = _git(["-C", tier_dir, "pull", "--ff-only"], capture_output=True)
+                if r.returncode != 0:
+                    log.debug("[%s] %s pull failed: %s", pkgname, tier,
+                              r.stderr.decode(errors="replace").strip()[:120])
             for subdir in ("", "trunk"):
                 candidate = (os.path.join(tier_dir, subdir, "PKGBUILD") if subdir
                              else os.path.join(tier_dir, "PKGBUILD"))
@@ -609,12 +621,17 @@ def resolve_pkgbuild(
             if not os.path.isdir(tier_dir):
                 log.debug("[%s] fetching via pkgctl repo clone", pkgname)
                 os.makedirs(tier_root, exist_ok=True)
-                result = subprocess.run(
-                    ["pkgctl", "repo", "clone", "--protocol=https", pkgname],
-                    capture_output=True, text=True, cwd=tier_root,
-                )
+                result = _git(["clone", "--depth=1",
+                               f"https://gitlab.archlinux.org/archlinux/packaging/packages/{pkgname}.git",
+                               tier_dir],
+                              capture_output=True, text=True)
                 if result.returncode != 0:
-                    log.error("[%s] pkgctl repo clone failed: %s", pkgname, result.stderr)
+                    log.debug("[%s] pkgctl clone failed: %s", pkgname, result.stderr.strip()[:120])
+            else:
+                r = _git(["-C", tier_dir, "pull", "--ff-only"], capture_output=True)
+                if r.returncode != 0:
+                    log.debug("[%s] arch pull failed: %s", pkgname,
+                              r.stderr.decode(errors="replace").strip()[:120])
             if os.path.isfile(os.path.join(tier_dir, "PKGBUILD")):
                 _fix_ownership(tier_dir)
                 candidates.append((tier_dir, tier))
