@@ -176,13 +176,27 @@ See [Service management](#service-management) below for your init system.
 ### 7. Add the repo to pacman.conf
 
 Edit `/etc/pacman.conf` on the machine that will use the packages. Place the
-repo **above** `[core]` so your locally-built packages shadow official ones:
+repo **after your distro repos but before `[extra]`**:
 
 ```ini
+[system]          # or [core] on Arch
+Include = ...
+
+[world]           # or [extra] equivalent on your distro
+Include = ...
+
 [myrepo]
-SigLevel = Required
+SigLevel = Required DatabaseOptional
 Server = http://your-build-host:8081/repo
+
+[extra]           # Arch [extra] after forge
+Include = ...
 ```
+
+Do **not** place forge first. The `.x` pkgrel bump (`pkgrel=2.1 > 2`) already
+ensures forge packages shadow distro equivalents when they are current. Placing
+forge first would hide upstream upgrades when the buildbot hasn't rebuilt a
+package yet — you'd see no upgrade until forge catches up.
 
 For local mode the server is `localhost`. For remote mode use the build
 server's hostname or IP.

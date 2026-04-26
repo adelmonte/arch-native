@@ -445,6 +445,16 @@ def check_upstream_updates(manifest, built, config, should_stop=None):
 
         if upstream_ver:
             normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
+
+            # Packages deferred because PKGBUILD was stale: rebuild once it catches up.
+            # Use >= so we trigger when PKGBUILD reaches the installed version, not only
+            # when it exceeds it (the normal > check would never fire in that case).
+            if built[name].get("status") == "pending_upstream":
+                if vercmp(normalized_upstream, base_ver) >= 0:
+                    log.info("[%s] PKGBUILD caught up (%s >= installed %s) — queuing rebuild", name, normalized_upstream, base_ver)
+                    updates.append({**pkg, "build_reason": "update"})
+                continue
+
             if vercmp(upstream_ver, base_ver) > 0 and vercmp(normalized_upstream, base_ver) == 0:
                 log.debug("[%s] ignoring local pkgrel bump in source tree: %s", name, upstream_ver)
             elif vercmp(normalized_upstream, base_ver) > 0:
@@ -565,7 +575,7 @@ def cmd_status(args, config: dict) -> int:
     for n, e in built.items():
         if not (isinstance(e, dict) and e.get("built_at")):
             continue
-        if e.get("status") == "ineligible":
+        if e.get("status") in ("ineligible", "pending_upstream"):
             continue
         try:
             ts = datetime.fromisoformat(e["built_at"])
@@ -582,7 +592,7 @@ def cmd_status(args, config: dict) -> int:
         manifest = (read_local_packages() if config.get("mode") == "local"
                     else load_manifest(config["manifest_path"]))
         installed_total = len(manifest)
-        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") != "ineligible")
+        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") not in ("ineligible", "pending_upstream"))
         blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
         ineligible_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "ineligible")
     except Exception:
@@ -941,7 +951,7 @@ def cmd_failed_list(args, config: dict) -> int:
 def cmd_built(args, config: dict) -> int:
     built = get_built_state(config["state_path"])
     rows = sorted(
-        ((k, v) for k, v in built.items() if v.get("status") != "ineligible"),
+        ((k, v) for k, v in built.items() if v.get("status") not in ("ineligible", "pending_upstream")),
         key=lambda kv: kv[1].get("built_at", ""),
         reverse=True,
     )
@@ -1079,7 +1089,7 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
                 pn = _pkgname_from_filename(fname)
                 physical.setdefault(pn, []).append(fname)
 
-    built_pkgs = {n: r for n, r in built.items() if r.get("status") != "ineligible"}
+    built_pkgs = {n: r for n, r in built.items() if r.get("status") not in ("ineligible", "pending_upstream")}
     all_names = set(db_pkgs) | set(physical) | set(built_pkgs)
 
     # Collect repairs as (action, name, extra)
@@ -1844,15 +1854,15 @@ def run_daemon(config_path: str, debug: bool):
                     clear_in_progress(config)
                     continue
 
-                # c2. Skip if PKGBUILD version is older than what's already installed
-                pkgbuild_ver = f"{srcinfo['pkgver']}-{srcinfo['pkgrel']}"
+                # c2. Skip if PKGBUILD version is older than what's already installed.
+                # Use _fmt_srcinfo_ver to include epoch so epoch packages compare correctly.
+                pkgbuild_ver = _fmt_srcinfo_ver(srcinfo)
                 if vercmp(pkgbuild_ver, pkg["version"]) < 0:
-                    cycle_stats["skipped_ineligible"] += 1
-                    log.info("[%s] PKGBUILD %s is older than installed %s — skipping", name, pkgbuild_ver, pkg["version"])
+                    log.debug("[%s] PKGBUILD %s is older than installed %s — deferring until upstream catches up", name, pkgbuild_ver, pkg["version"])
                     _built = get_built_state(config["state_path"])
                     _built[name] = {
                         "version": pkg["version"],
-                        "status": "ineligible",
+                        "status": "pending_upstream",
                         "built_at": datetime.now(timezone.utc).isoformat(),
                     }
                     save_built_state(config["state_path"], _built)
