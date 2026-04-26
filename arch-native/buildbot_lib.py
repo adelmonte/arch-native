@@ -1232,9 +1232,21 @@ def prune_uninstalled_from_repo(
     if result.returncode not in (0, 1):
         log.warning("repo-remove returned %d: %s", result.returncode, result.stderr)
 
+    # Split packages share the full pkg_files list across all subpackage entries.
+    # Only delete a file if no installed package still references it — otherwise
+    # removing an uninstalled subpackage (e.g. aom-docs) would delete the main
+    # package file (aom-3.x.pkg.tar.zst) that the installed aom entry also lists.
+    protected = set()
+    for name in built:
+        if name in manifest_names:
+            for fname in built[name].get("pkg_files", []):
+                protected.add(fname)
+
     for name in to_remove:
         pkg_files = built[name].get("pkg_files", [])
         for fname in pkg_files:
+            if fname in protected:
+                continue
             for path in [os.path.join(repo_dir, fname),
                          os.path.join(repo_dir, fname + ".sig")]:
                 if os.path.exists(path):
