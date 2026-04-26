@@ -782,9 +782,11 @@ On Artix with dinit, `highest` is generally safe: Artix-specific service units l
 | Source type | How it works | Auto-updated? |
 |---|---|---|
 | `local` | Hand-maintained patches in `pkgbuilds/local/<pkg>/<pkg>.patch`, applied on top of the upstream PKGBUILD. Full `PKGBUILD` copies also work but go stale silently — prefer patches. | No — user-managed |
-| `clone <url>` | `git clone --depth=1 <url>` on first use, cached in `pkgbuilds/<tier>/<pkg>/`. `{pkgname}` in the URL is substituted at clone time. Checks both the root and a `trunk/` subdirectory for the PKGBUILD. | **No** — snapshot; refresh with `git -C pkgbuilds/<tier>/<pkg> pull` or delete to re-clone |
+| `clone <url>` | `git clone --depth=1 <url>` on first use, cached in `pkgbuilds/<tier>/<pkg>/`. `{pkgname}` in the URL is substituted at clone time. Checks both the root and a `trunk/` subdirectory for the PKGBUILD. | Yes — per-package `git pull` each upstream check cycle (existing clones only; initial clone is created on first build) |
 | `monorepo` | Walks `pkgbuilds/<tier>/`, matching subdirectories by pkgname. Clone the repo manually once; the daemon pulls it each `upstream_check_interval`. | Yes — whole-repo `git pull` each cycle |
-| `pkgctl` | `pkgctl repo clone --protocol=https <pkg>` from Arch Linux. Requires `devtools`. Cached in `pkgbuilds/<tier>/<pkg>/`. | Yes — per-package `git pull` each cycle |
+| `pkgctl` | Direct `git clone --depth=1` from `gitlab.archlinux.org/archlinux/packaging/packages/<pkg>`. Requires `devtools` for builds. Cached in `pkgbuilds/<tier>/<pkg>/`. | Yes — per-package `git pull` each upstream check cycle (existing clones only; initial clone is created on first build) |
+
+**Upstream check scope** — version detection during the hourly upstream check only works for packages that have already been built at least once (so the PKGBUILD clone exists on disk). A package installed *after* the last upstream check won't be detected until it gets built for the first time. If a package update was missed, run `buildbot sync` to re-scan and force it into the queue.
 
 **Built-in tier defaults** — these names work with no config entry needed:
 

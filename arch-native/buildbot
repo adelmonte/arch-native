@@ -409,6 +409,15 @@ def check_upstream_updates(manifest, built, config, should_stop=None):
 
             elif kind == "pkgctl":
                 pkg_dir = os.path.join(tier_base, name)
+                if not os.path.isdir(pkg_dir):
+                    # Create clone on demand so version checks aren't permanently blind
+                    # to packages whose initial build used a different tier (e.g. artix).
+                    url = f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git"
+                    r = _git(["clone", "--depth=1", url, pkg_dir],
+                             config["build_user"], capture_output=True)
+                    if r.returncode != 0:
+                        log.debug("[%s] arch clone failed: %s", name,
+                                  r.stderr.decode(errors="replace").strip()[:120])
                 if os.path.isdir(pkg_dir):
                     r = _git(["-C", pkg_dir, "pull", "--ff-only"],
                              config["build_user"], capture_output=True)
