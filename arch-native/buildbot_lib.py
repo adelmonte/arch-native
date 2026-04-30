@@ -1170,6 +1170,21 @@ def add_to_repo(pkg_files: list[str], repo_db_path: str, repo_dir: str,
     return moved
 
 
+def stage_packages(pkg_files: list[str], repo_dir: str) -> list[str]:
+    """Move packages + sigs to repo_dir without adding to the repo DB.
+    Used when a library soname bump must wait for world repos to catch up.
+    Returns list of staged filenames (basenames only)."""
+    staged = []
+    for f in pkg_files:
+        dest = os.path.join(repo_dir, os.path.basename(f))
+        shutil.move(f, dest)
+        staged.append(os.path.basename(dest))
+        sig = f + ".sig"
+        if os.path.exists(sig):
+            shutil.move(sig, os.path.join(repo_dir, os.path.basename(sig)))
+    return staged
+
+
 def prune_blacklisted_from_repo(
     blacklist: list[str],
     built: dict,

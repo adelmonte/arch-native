@@ -41,6 +41,7 @@ from buildbot_lib import (
     build_package,
     sign_packages,
     add_to_repo,
+    stage_packages,
     update_built_state,
     load_failed,
     save_failed,
@@ -446,6 +447,10 @@ def check_upstream_updates(manifest, built, config, should_stop=None):
         if upstream_ver:
             normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
 
+            # Packages staged but awaiting world cascade: handled by _resolve_pending_cascades.
+            if built[name].get("status") == "pending_world_cascade":
+                continue
+
             # Packages deferred because PKGBUILD was stale: rebuild once it catches up.
             # Use >= so we trigger when PKGBUILD reaches the installed version, not only
             # when it exceeds it (the normal > check would never fire in that case).
@@ -575,7 +580,7 @@ def cmd_status(args, config: dict) -> int:
     for n, e in built.items():
         if not (isinstance(e, dict) and e.get("built_at")):
             continue
-        if e.get("status") in ("ineligible", "pending_upstream"):
+        if e.get("status") in ("ineligible", "pending_upstream", "pending_world_cascade"):
             continue
         try:
             ts = datetime.fromisoformat(e["built_at"])
@@ -592,9 +597,10 @@ def cmd_status(args, config: dict) -> int:
         manifest = (read_local_packages() if config.get("mode") == "local"
                     else load_manifest(config["manifest_path"]))
         installed_total = len(manifest)
-        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") not in ("ineligible", "pending_upstream"))
+        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade"))
         blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
         ineligible_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "ineligible")
+        cascade_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "pending_world_cascade")
     except Exception:
         pass
 
@@ -716,6 +722,8 @@ def cmd_status(args, config: dict) -> int:
             row("skipped", f"{blacklisted_count} / {installed_total}  {DIM}(blacklist — see /etc/arch-native.conf){R}")
         if ineligible_count:
             row("ineligible", f"{ineligible_count} / {installed_total}  {DIM}(arch=any — not rebuilt){R}")
+        if cascade_count:
+            row("staging", f"{cascade_count}  {DIM}(soname bump — awaiting world cascade){R}")
     if repo_size:
         row("size", repo_size)
     if cycle_str:
@@ -951,7 +959,7 @@ def cmd_failed_list(args, config: dict) -> int:
 def cmd_built(args, config: dict) -> int:
     built = get_built_state(config["state_path"])
     rows = sorted(
-        ((k, v) for k, v in built.items() if v.get("status") not in ("ineligible", "pending_upstream")),
+        ((k, v) for k, v in built.items() if v.get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade")),
         key=lambda kv: kv[1].get("built_at", ""),
         reverse=True,
     )
@@ -1054,6 +1062,155 @@ def _db_field(content: str, field: str) -> str:
     return ""
 
 
+def _soname_provides_from_pkg(pkg_file: str) -> set:
+    """Extract soname-style provides (e.g. 'libfoo.so=1-64') from .PKGINFO in a built package."""
+    import tarfile as _tarfile
+    provides = set()
+    try:
+        with _tarfile.open(pkg_file) as tf:
+            try:
+                f = tf.extractfile(".PKGINFO")
+            except KeyError:
+                return provides
+            if f is None:
+                return provides
+            for line in f.read().decode("utf-8", errors="replace").splitlines():
+                if line.startswith("provides = "):
+                    val = line[len("provides = "):].strip()
+                    if ".so" in val:
+                        provides.add(val)
+    except Exception as e:
+        log.warning("Failed reading soname provides from %s: %s", pkg_file, e)
+    return provides
+
+
+def _world_has_soname(soname: str, repo_name: str) -> bool:
+    """Return True if any non-forge pacman sync DB provides the exact soname."""
+    import tarfile as _tarfile
+    sync_dir = "/var/lib/pacman/sync"
+    if not os.path.isdir(sync_dir):
+        return True  # can't check — assume safe to publish
+    for fname in os.listdir(sync_dir):
+        if not fname.endswith(".db") or fname[:-3] == repo_name:
+            continue
+        db_path = os.path.join(sync_dir, fname)
+        try:
+            with _tarfile.open(db_path) as tf:
+                for m in tf.getmembers():
+                    if not m.name.endswith("/depends"):
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    content = f.read().decode("utf-8", errors="replace")
+                    in_provides = False
+                    for line in content.splitlines():
+                        stripped = line.strip()
+                        if stripped == "%PROVIDES%":
+                            in_provides = True
+                            continue
+                        if in_provides:
+                            if not stripped or stripped.startswith("%"):
+                                in_provides = False
+                                continue
+                            if stripped == soname:
+                                return True
+        except Exception:
+            continue
+    return False
+
+
+def _world_has_lib(lib_base: str, repo_name: str) -> bool:
+    """Return True if any non-forge pacman sync DB has any soname for lib_base (e.g. 'libfoo.so').
+    Used to distinguish a soname bump (world has old version) from a brand-new library."""
+    import tarfile as _tarfile
+    sync_dir = "/var/lib/pacman/sync"
+    if not os.path.isdir(sync_dir):
+        return False
+    for fname in os.listdir(sync_dir):
+        if not fname.endswith(".db") or fname[:-3] == repo_name:
+            continue
+        db_path = os.path.join(sync_dir, fname)
+        try:
+            with _tarfile.open(db_path) as tf:
+                for m in tf.getmembers():
+                    if not m.name.endswith("/depends"):
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    content = f.read().decode("utf-8", errors="replace")
+                    in_provides = False
+                    for line in content.splitlines():
+                        stripped = line.strip()
+                        if stripped == "%PROVIDES%":
+                            in_provides = True
+                            continue
+                        if in_provides:
+                            if not stripped or stripped.startswith("%"):
+                                in_provides = False
+                                continue
+                            if stripped.split("=", 1)[0] == lib_base:
+                                return True
+        except Exception:
+            continue
+    return False
+
+
+def _resolve_pending_cascades(config: dict):
+    """Publish staged packages whose sonames are now available in world repos."""
+    built = get_built_state(config["state_path"])
+    repo_name = config["repo_name"]
+
+    cascade_pkgs = {n: r for n, r in built.items()
+                    if r.get("status") == "pending_world_cascade"}
+    if not cascade_pkgs:
+        return
+
+    # Group sibling subpackages by their shared file set so we run repo-add once per build
+    groups: dict = {}
+    for name, rec in cascade_pkgs.items():
+        key = frozenset(rec.get("pkg_files", []))
+        groups.setdefault(key, []).append(name)
+
+    changed = False
+    for files_key, names in groups.items():
+        rec = cascade_pkgs[names[0]]
+        cascade_sonames = set(rec.get("cascade_sonames", []))
+
+        missing = [s for s in cascade_sonames if not _world_has_soname(s, repo_name)]
+        if missing:
+            log.debug("[%s] world still missing sonames: %s", names[0], ", ".join(missing))
+            continue
+
+        # World has all sonames — promote staged files to the live repo
+        abs_files = [
+            os.path.join(config["repo_dir"], f) for f in files_key
+            if os.path.exists(os.path.join(config["repo_dir"], f))
+        ]
+        if not abs_files:
+            log.warning("[%s] pending_world_cascade: staged files missing — clearing status", names[0])
+        else:
+            result = subprocess.run(
+                ["repo-add", "-v", "-p", config["repo_db"]] + abs_files,
+                capture_output=True, text=True,
+            )
+            if result.returncode not in (0, 1):
+                log.error("[%s] repo-add failed for cascade: %s", names[0], result.stderr)
+                continue
+            log.info("[%s] world cascade complete — published (%s)",
+                     ", ".join(names), ", ".join(cascade_sonames))
+
+        for name in names:
+            r = built[name]
+            built[name] = {k: v for k, v in r.items()
+                           if k not in ("status", "cascade_sonames")}
+        changed = True
+
+    if changed:
+        save_built_state(config["state_path"], built)
+
+
 def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tuple[int, int]:
     """
     Check and repair consistency between built.json, the forge repo DB, and
@@ -1089,8 +1246,9 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
                 pn = _pkgname_from_filename(fname)
                 physical.setdefault(pn, []).append(fname)
 
-    built_pkgs = {n: r for n, r in built.items() if r.get("status") not in ("ineligible", "pending_upstream")}
-    all_names = set(db_pkgs) | set(physical) | set(built_pkgs)
+    cascade_names = {n for n, r in built.items() if r.get("status") == "pending_world_cascade"}
+    built_pkgs = {n: r for n, r in built.items() if r.get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade")}
+    all_names = (set(db_pkgs) | set(physical) | set(built_pkgs)) - cascade_names
 
     # Collect repairs as (action, name, extra)
     repairs = []
@@ -1774,6 +1932,11 @@ def run_daemon(config_path: str, debug: bool):
             except Exception as e:
                 log.error("Error checking upstream updates: %s", e)
 
+            try:
+                _resolve_pending_cascades(config)
+            except Exception as e:
+                log.error("Error resolving pending cascades: %s", e)
+
         if shutdown_flag:
             break
 
@@ -1921,17 +2084,60 @@ def run_daemon(config_path: str, debug: bool):
                     sign_packages(pkg_files, config["gnupg_home"], config["build_user"])
                     log.info("[%s] signed %d package(s)", name, len(pkg_files))
 
-                    moved = add_to_repo(
-                        pkg_files, config["repo_db"], config["repo_dir"],
-                        autoprune=config["autoprune"],
-                        autoprune_keep=config["autoprune_keep"],
-                    )
-                    log.info("[%s] added to repo", name)
+                    # Detect soname bumps that would break world reverse-deps.
+                    # If this package introduces a new soname that world repos don't
+                    # yet provide, stage the files without publishing and wait for
+                    # world to complete its cascade rebuild first.
+                    new_sonames = set()
+                    for pf in pkg_files:
+                        new_sonames |= _soname_provides_from_pkg(pf)
+                    cascade_sonames = set()
+                    if new_sonames:
+                        repo_name = config["repo_name"]
+                        for soname in new_sonames:
+                            lib_base = soname.split("=", 1)[0]
+                            if not _world_has_soname(soname, repo_name):
+                                if _world_has_lib(lib_base, repo_name):
+                                    cascade_sonames.add(soname)
 
-                    built = get_built_state(config["state_path"])
-                    all_subpkgs = srcinfo.get("packages", [])
-                    built = update_built_state(built, pkg, new_version, moved, all_pkgnames=all_subpkgs, pgp_skipped=pgp_skipped)
-                    save_built_state(config["state_path"], built)
+                    if cascade_sonames:
+                        # Stage: move to repo_dir but skip repo-add until world is ready
+                        staged = stage_packages(pkg_files, config["repo_dir"])
+                        log.info("[%s] soname bump detected (%s) — staged, awaiting world cascade",
+                                 name, ", ".join(sorted(cascade_sonames)))
+
+                        built = get_built_state(config["state_path"])
+                        all_subpkgs = srcinfo.get("packages", [])
+                        ver_parts = new_version.split("-")
+                        pkgrel = ver_parts[-1] if len(ver_parts) >= 2 else ""
+                        cascade_entry = {
+                            "status": "pending_world_cascade",
+                            "version": new_version,
+                            "pkgrel": pkgrel,
+                            "built_at": datetime.now(timezone.utc).isoformat(),
+                            "pkg_files": staged,
+                            "cascade_sonames": sorted(cascade_sonames),
+                        }
+                        if pgp_skipped:
+                            cascade_entry["pgp_skipped"] = True
+                        built[name] = cascade_entry
+                        if all_subpkgs:
+                            for subpkg in all_subpkgs:
+                                built[subpkg] = cascade_entry.copy()
+                        save_built_state(config["state_path"], built)
+
+                    else:
+                        moved = add_to_repo(
+                            pkg_files, config["repo_db"], config["repo_dir"],
+                            autoprune=config["autoprune"],
+                            autoprune_keep=config["autoprune_keep"],
+                        )
+                        log.info("[%s] added to repo", name)
+
+                        built = get_built_state(config["state_path"])
+                        all_subpkgs = srcinfo.get("packages", [])
+                        built = update_built_state(built, pkg, new_version, moved, all_pkgnames=all_subpkgs, pgp_skipped=pgp_skipped)
+                        save_built_state(config["state_path"], built)
 
                     # Remove from failed if it was there (including subpackages)
                     names_to_clear = set(all_subpkgs) | {name}
