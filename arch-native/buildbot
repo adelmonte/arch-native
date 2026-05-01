@@ -1157,6 +1157,45 @@ def _world_has_lib(lib_base: str, repo_name: str) -> bool:
     return False
 
 
+def _world_depends_on_old_soname(lib_base: str, new_soname: str, repo_name: str) -> bool:
+    """Return True if any world repo package still depends on an old soname for lib_base.
+    Used as a second gate: even if world *provides* the new soname (e.g. Arch's extra),
+    the cascade isn't done until every repo has finished rebuilding its reverse-deps
+    (e.g. CachyOS still has chrony linked against the old libnettle.so=8-64)."""
+    import tarfile as _tarfile
+    sync_dir = "/var/lib/pacman/sync"
+    if not os.path.isdir(sync_dir):
+        return False
+    for fname in os.listdir(sync_dir):
+        if not fname.endswith(".db") or fname[:-3] == repo_name:
+            continue
+        db_path = os.path.join(sync_dir, fname)
+        try:
+            with _tarfile.open(db_path) as tf:
+                for m in tf.getmembers():
+                    if not m.name.endswith("/depends"):
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    content = f.read().decode("utf-8", errors="replace")
+                    in_depends = False
+                    for line in content.splitlines():
+                        stripped = line.strip()
+                        if stripped == "%DEPENDS%":
+                            in_depends = True
+                            continue
+                        if in_depends:
+                            if not stripped or stripped.startswith("%"):
+                                in_depends = False
+                                continue
+                            if stripped.split("=", 1)[0] == lib_base and stripped != new_soname:
+                                return True
+        except Exception:
+            continue
+    return False
+
+
 def _resolve_pending_cascades(config: dict):
     """Publish staged packages whose sonames are now available in world repos."""
     built = get_built_state(config["state_path"])
@@ -1178,9 +1217,11 @@ def _resolve_pending_cascades(config: dict):
         rec = cascade_pkgs[names[0]]
         cascade_sonames = set(rec.get("cascade_sonames", []))
 
-        missing = [s for s in cascade_sonames if not _world_has_soname(s, repo_name)]
-        if missing:
-            log.debug("[%s] world still missing sonames: %s", names[0], ", ".join(missing))
+        not_ready = [s for s in cascade_sonames
+                     if not _world_has_soname(s, repo_name)
+                     or _world_depends_on_old_soname(s.split("=", 1)[0], s, repo_name)]
+        if not_ready:
+            log.debug("[%s] world cascade still in progress: %s", names[0], ", ".join(not_ready))
             continue
 
         # World has all sonames — promote staged files to the live repo
@@ -2096,9 +2137,11 @@ def run_daemon(config_path: str, debug: bool):
                         repo_name = config["repo_name"]
                         for soname in new_sonames:
                             lib_base = soname.split("=", 1)[0]
-                            if not _world_has_soname(soname, repo_name):
-                                if _world_has_lib(lib_base, repo_name):
-                                    cascade_sonames.add(soname)
+                            world_has_new = _world_has_soname(soname, repo_name)
+                            if world_has_new and not _world_depends_on_old_soname(lib_base, soname, repo_name):
+                                continue  # world fully migrated to new soname
+                            if _world_has_lib(lib_base, repo_name):
+                                cascade_sonames.add(soname)
 
                     if cascade_sonames:
                         # Stage: move to repo_dir but skip repo-add until world is ready
