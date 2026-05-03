@@ -1097,7 +1097,7 @@ def _world_has_soname(soname: str, repo_name: str) -> bool:
         try:
             with _tarfile.open(db_path) as tf:
                 for m in tf.getmembers():
-                    if not m.name.endswith("/depends"):
+                    if not m.name.endswith("/desc"):
                         continue
                     f = tf.extractfile(m)
                     if f is None:
@@ -1134,7 +1134,7 @@ def _world_has_lib(lib_base: str, repo_name: str) -> bool:
         try:
             with _tarfile.open(db_path) as tf:
                 for m in tf.getmembers():
-                    if not m.name.endswith("/depends"):
+                    if not m.name.endswith("/desc"):
                         continue
                     f = tf.extractfile(m)
                     if f is None:
@@ -1173,7 +1173,7 @@ def _world_depends_on_old_soname(lib_base: str, new_soname: str, repo_name: str)
         try:
             with _tarfile.open(db_path) as tf:
                 for m in tf.getmembers():
-                    if not m.name.endswith("/depends"):
+                    if not m.name.endswith("/desc"):
                         continue
                     f = tf.extractfile(m)
                     if f is None:
