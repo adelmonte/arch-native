@@ -13,10 +13,12 @@ import json
 import logging
 import fcntl
 import os
+import queue as _thread_queue
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from contextlib import contextmanager, nullcontext
@@ -335,7 +337,7 @@ def _fmt_srcinfo_ver(si: dict) -> str:
     return f"{epoch}:{si['pkgver']}-{si['pkgrel']}" if epoch else f"{si['pkgver']}-{si['pkgrel']}"
 
 
-def check_upstream_updates(manifest, built, config, should_stop=None):
+def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls=False):
     """
     For each built package in the manifest, compare built version against
     current upstream. Returns list of packages needing rebuild.
@@ -388,7 +390,7 @@ def check_upstream_updates(manifest, built, config, should_stop=None):
 
             if kind == "clone":
                 pkg_dir = os.path.join(tier_base, name)
-                if os.path.isdir(pkg_dir):
+                if os.path.isdir(pkg_dir) and not skip_pulls:
                     r = _git(["-C", pkg_dir, "pull", "--ff-only"],
                              config["build_user"], capture_output=True)
                     if r.returncode != 0:
@@ -410,23 +412,24 @@ def check_upstream_updates(manifest, built, config, should_stop=None):
 
             elif kind == "pkgctl":
                 pkg_dir = os.path.join(tier_base, name)
-                if not os.path.isdir(pkg_dir):
-                    # Create clone on demand so version checks aren't permanently blind
-                    # to packages whose initial build used a different tier (e.g. artix).
-                    url = f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git"
-                    r = _git(["clone", "--depth=1", url, pkg_dir],
-                             config["build_user"], capture_output=True)
-                    if r.returncode != 0:
-                        log.debug("[%s] arch clone failed: %s", name,
-                                  r.stderr.decode(errors="replace").strip()[:120])
-                if os.path.isdir(pkg_dir):
-                    r = _git(["-C", pkg_dir, "pull", "--ff-only"],
-                             config["build_user"], capture_output=True)
-                    if r.returncode != 0:
-                        log.debug("[%s] arch pull failed: %s", name,
-                                  r.stderr.decode(errors="replace").strip()[:120])
-                    if os.path.isfile(os.path.join(pkg_dir, "PKGBUILD")):
-                        tier_dir = pkg_dir
+                if not skip_pulls:
+                    if not os.path.isdir(pkg_dir):
+                        # Create clone on demand so version checks aren't permanently blind
+                        # to packages whose initial build used a different tier (e.g. artix).
+                        url = f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git"
+                        r = _git(["clone", "--depth=1", url, pkg_dir],
+                                 config["build_user"], capture_output=True)
+                        if r.returncode != 0:
+                            log.debug("[%s] arch clone failed: %s", name,
+                                      r.stderr.decode(errors="replace").strip()[:120])
+                    if os.path.isdir(pkg_dir):
+                        r = _git(["-C", pkg_dir, "pull", "--ff-only"],
+                                 config["build_user"], capture_output=True)
+                        if r.returncode != 0:
+                            log.debug("[%s] arch pull failed: %s", name,
+                                      r.stderr.decode(errors="replace").strip()[:120])
+                if os.path.isdir(pkg_dir) and os.path.isfile(os.path.join(pkg_dir, "PKGBUILD")):
+                    tier_dir = pkg_dir
 
             if tier_dir:
                 if version_select == "priority":
@@ -1825,6 +1828,9 @@ def run_daemon(config_path: str, debug: bool):
     last_manifest_mtime = 0
     last_upstream_check = 0
     manifest = []
+    _upstream_thread = None
+    _upstream_results = _thread_queue.Queue()
+    _upstream_built_snapshot = {}
 
     # Auto-fsck on startup: repair any built.json / repo DB / file divergences
     # caused by SIGKILL during a previous build cycle.
@@ -1955,59 +1961,94 @@ def run_daemon(config_path: str, debug: bool):
         if shutdown_flag:
             break
 
-        # ----- Step 3: Upstream update check -----
+        # ----- Step 3: Upstream update check (async) -----
         now = time.time()
         if manifest and (now - last_upstream_check) >= config["upstream_check_interval"]:
-            log.info("Checking for upstream updates...")
-            last_upstream_check = now
+            if _upstream_thread is None or not _upstream_thread.is_alive():
+                log.info("Starting async upstream update check...")
+                last_upstream_check = now
+                # Pull monorepos synchronously in the main thread to avoid racing
+                # with per-package git writes in the build loop (clone/pkgctl tiers).
+                try:
+                    for tier, src in config["tier_sources"].items():
+                        if src["type"] == "monorepo":
+                            monorepo_dir = os.path.join(config["pkgbuilds_dir"], tier)
+                            if os.path.isdir(os.path.join(monorepo_dir, ".git")):
+                                r = _git(["-C", monorepo_dir, "pull", "--ff-only"],
+                                         config["build_user"], capture_output=True)
+                                if r.returncode != 0:
+                                    log.warning(
+                                        "monorepo pull failed for %s tier: %s",
+                                        tier, r.stderr.decode(errors="replace").strip()[:200],
+                                    )
+                except Exception as e:
+                    log.error("Error pulling monorepos: %s", e)
+
+                _upstream_built_snapshot = get_built_state(config["state_path"])
+                _thread_manifest = list(manifest)
+
+                def _upstream_worker(m, b, cfg, results_q, stop_fn):
+                    try:
+                        updates = check_upstream_updates(m, b, cfg, should_stop=stop_fn, skip_pulls=True)
+                        results_q.put(updates)
+                    except Exception as exc:
+                        log.error("Upstream check thread error: %s", exc)
+                        results_q.put([])
+
+                _upstream_thread = threading.Thread(
+                    target=_upstream_worker,
+                    args=(_thread_manifest, _upstream_built_snapshot, config,
+                          _upstream_results, lambda: shutdown_flag),
+                    daemon=True,
+                    name="upstream-check",
+                )
+                _upstream_thread.start()
+
+        # Drain upstream results from completed thread before building
+        if not _upstream_results.empty():
             try:
-                # Pull all monorepo tiers
-                for tier, src in config["tier_sources"].items():
-                    if src["type"] == "monorepo":
-                        monorepo_dir = os.path.join(config["pkgbuilds_dir"], tier)
-                        if os.path.isdir(os.path.join(monorepo_dir, ".git")):
-                            r = _git(["-C", monorepo_dir, "pull", "--ff-only"],
-                                     config["build_user"], capture_output=True)
-                            if r.returncode != 0:
-                                log.warning(
-                                    "monorepo pull failed for %s tier: %s",
-                                    tier, r.stderr.decode(errors="replace").strip()[:200],
-                                )
-
-                built = get_built_state(config["state_path"])
-                updates = check_upstream_updates(manifest, built, config, should_stop=lambda: shutdown_flag)
-
+                updates = _upstream_results.get_nowait()
+                log.info("Upstream check completed: %d update(s) found", len(updates))
                 if updates:
                     pending = load_pending(config["pending_path"])
+                    built_now = get_built_state(config["state_path"])
                     failed_now = load_failed(config["failed_path"])
                     pending_names = {p["name"] for p in pending}
-                    queued = skipped_existing = skipped_failed = skipped_stalled = 0
+                    queued = skipped_existing = skipped_failed = skipped_stalled = skipped_already_built = 0
                     for pkg in updates:
-                        if pkg["name"] in pending_names:
+                        pname = pkg["name"]
+                        if pname in pending_names:
                             skipped_existing += 1
                             continue
-                        failed_rec = failed_now.get(pkg["name"], {})
+                        failed_rec = failed_now.get(pname, {})
                         if failed_rec.get("version") == pkg["version"]:
                             skipped_failed += 1
                             continue
                         if _is_stalled(failed_rec, config):
                             skipped_stalled += 1
                             continue
+                        # Skip if already built at a newer version since the thread started
+                        old_ver = _upstream_built_snapshot.get(pname, {}).get("version", "")
+                        cur_ver = built_now.get(pname, {}).get("version", "")
+                        if cur_ver and cur_ver != old_ver:
+                            skipped_already_built += 1
+                            continue
                         pkg["queued_at"] = datetime.now(timezone.utc).isoformat()
                         pending.append(pkg)
                         queued += 1
                     save_pending(config["pending_path"], pending)
                     log.info(
-                        "Upstream update queue: queued=%d, skipped_existing=%d, skipped_failed=%d, skipped_stalled=%d",
-                        queued, skipped_existing, skipped_failed, skipped_stalled,
+                        "Upstream update queue: queued=%d, skipped_existing=%d, skipped_failed=%d, skipped_stalled=%d, skipped_already_built=%d",
+                        queued, skipped_existing, skipped_failed, skipped_stalled, skipped_already_built,
                     )
+                try:
+                    _resolve_pending_cascades(config)
+                except Exception as e:
+                    log.error("Error resolving pending cascades: %s", e)
+            except _thread_queue.Empty:
+                pass
             except Exception as e:
-                log.error("Error checking upstream updates: %s", e)
-
-            try:
-                _resolve_pending_cascades(config)
-            except Exception as e:
-                log.error("Error resolving pending cascades: %s", e)
+                log.error("Error draining upstream results: %s", e)
 
         if shutdown_flag:
             break
