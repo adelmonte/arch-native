@@ -2132,8 +2132,12 @@ def run_daemon(config_path: str, debug: bool):
 
                 # c2. Skip if PKGBUILD version is older than what's already installed.
                 # Use _fmt_srcinfo_ver to include epoch so epoch packages compare correctly.
+                # Strip the local forge pkgrel bump (.1 suffix) from the manifest version
+                # before comparing — the upstream PKGBUILD will never have our added bump,
+                # so comparing against the raw version would permanently defer the rebuild.
                 pkgbuild_ver = _fmt_srcinfo_ver(srcinfo)
-                if vercmp(pkgbuild_ver, pkg["version"]) < 0:
+                _manifest_base_ver = strip_local_pkgrel_bump(pkg["version"])
+                if vercmp(pkgbuild_ver, _manifest_base_ver) < 0:
                     log.debug("[%s] PKGBUILD %s is older than installed %s — deferring until upstream catches up", name, pkgbuild_ver, pkg["version"])
                     _built = get_built_state(config["state_path"])
                     _built[name] = {
