@@ -1029,11 +1029,12 @@ def cmd_failed_clear(args, config: dict) -> int:
 
 
 def _read_forge_db(repo_db_path: str) -> dict:
-    """Parse a pacman repo db tarball. Returns {pkgname: {version, filename}}."""
+    """Parse a pacman repo db tarball. Returns {pkgname: {version, filename}}.
+    If a name has multiple entries (DB corruption), 'dup_versions' lists the extras."""
     import tarfile
-    result = {}
+    seen: dict = {}
     if not os.path.exists(repo_db_path):
-        return result
+        return seen
     try:
         with tarfile.open(repo_db_path) as tf:
             for member in tf.getmembers():
@@ -1047,9 +1048,15 @@ def _read_forge_db(repo_db_path: str) -> dict:
                 version = _db_field(content, "VERSION")
                 filename = _db_field(content, "FILENAME")
                 if name:
-                    result[name] = {"version": version or "", "filename": filename or ""}
+                    seen.setdefault(name, []).append({"version": version or "", "filename": filename or ""})
     except Exception as e:
         log.warning("Error reading forge DB %s: %s", repo_db_path, e)
+        return {}
+    result = {}
+    for name, entries in seen.items():
+        result[name] = entries[-1]
+        if len(entries) > 1:
+            result[name]["dup_versions"] = entries[:-1]
     return result
 
 
@@ -1293,6 +1300,12 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
 
     # Collect repairs as (action, name, extra)
     repairs = []
+
+    # Duplicate DB entries — same package name, multiple versions recorded
+    for name, db_rec in db_pkgs.items():
+        if db_rec.get("dup_versions"):
+            repairs.append(("remove_dup_db", name, []))
+
     for name in sorted(all_names):
         in_db    = name in db_pkgs
         in_files = bool(physical.get(name))
@@ -1326,6 +1339,7 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
         "remove_db_clear_built": "remove db + clear built",
         "remove_db":          "remove db",
         "clear_built":        "clear built.json",
+        "remove_dup_db":      "remove duplicate db entry",
     }
     nw = max(len(n) for _, n, _ in repairs)
     for action, name, _ in repairs:
@@ -1388,6 +1402,23 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
                     save_built_state(config["state_path"], built)
                 repaired += 1
                 log.info("fsck: cleared built.json entry for %s", name)
+
+            elif action == "remove_dup_db":
+                # repo-remove clears ALL versions for this name; re-add from disk
+                r = subprocess.run(["repo-remove", repo_db, name], capture_output=True)
+                if r.returncode in (0, 1):
+                    pkg_file = None
+                    for fname in physical.get(name, []):
+                        fp = os.path.join(repo_dir, fname)
+                        if os.path.exists(fp):
+                            pkg_file = fp
+                            break
+                    if pkg_file:
+                        subprocess.run(["repo-add", "-p", repo_db, pkg_file], capture_output=True)
+                    repaired += 1
+                    log.info("fsck: deduped DB for %s, re-added %s", name, pkg_file)
+                else:
+                    log.warning("fsck: repo-remove %s failed: %s", name, r.stderr.decode())
 
         except Exception as e:
             log.warning("fsck: repair failed for %s (%s): %s", name, action, e)
