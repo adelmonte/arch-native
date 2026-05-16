@@ -180,15 +180,12 @@ def generate_makepkg_conf(config: dict, output_path: str):
     mode  = config.get("mode", "remote")
     local = (mode == "local")
 
+    extra = config.get("extra_cflags", "").strip()
     cflags = (
         f"-march={march} -O3 -pipe -fno-plt -fexceptions "
         f"-Wp,-D_FORTIFY_SOURCE=3 -fstack-clash-protection "
-        f"-fcf-protection -fno-semantic-interposition "
-        # GCC 15 promoted several C legacy patterns to hard errors; demote back
-        # to warnings so packages that haven't been updated yet can still build.
-        f"-Wno-error=incompatible-pointer-types "
-        f"-Wno-error=discarded-qualifiers "
-        f"-Wno-error=implicit-function-declaration"
+        f"-fcf-protection -fno-semantic-interposition"
+        + (f" {extra}" if extra else "")
     )
 
     if local:
