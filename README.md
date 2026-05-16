@@ -79,6 +79,14 @@ machine.
 
 ### 1. Build and install the server package
 
+Both packages are available on the AUR:
+
+```bash
+yay -S arch-native
+```
+
+Or build from source:
+
 ```bash
 cd arch-native && makepkg -si
 ```
@@ -291,6 +299,12 @@ sudo ln -s /etc/runit/sv/arch-native /run/runit/service/
 On the desktop machine that the build server compiles for:
 
 ```bash
+yay -S arch-native-client
+```
+
+Or from source:
+
+```bash
 cd arch-native-client && makepkg -si
 ```
 
@@ -500,6 +514,14 @@ log_retention_days = 7
 ### Debugging
 
 ```ini
+# Extra flags appended to CFLAGS for every build. Use this for
+# compiler-version compatibility workarounds. Default: empty.
+#
+# GCC 15 promoted several C legacy patterns to hard errors. The default
+# config includes these flags to keep unpatched packages building — remove
+# them once your package set has been updated:
+# extra_cflags = -Wno-error=incompatible-pointer-types -Wno-error=discarded-qualifiers -Wno-error=implicit-function-declaration
+
 # Python logging level written to the systemd journal / log file.
 # DEBUG produces verbose per-package resolution and build tracing.
 # One of: DEBUG, INFO, WARNING, ERROR. Default: INFO.

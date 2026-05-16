@@ -116,6 +116,7 @@ def load_config(path: str) -> dict:
     cfg["log_level"] = sec.get("log_level", "INFO")
     cfg["failed_stall_retries"] = sec.getint("failed_stall_retries", 5)
     cfg["failed_stall_days"] = sec.getint("failed_stall_days", 7)
+    cfg["extra_cflags"] = sec.get("extra_cflags", "")
 
     raw_vs = sec.get("tier_version_select", "priority").strip().lower()
     if raw_vs not in ("priority", "highest"):
