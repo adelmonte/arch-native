@@ -179,24 +179,21 @@ Edit `/etc/pacman.conf` on the machine that will use the packages. Place the
 repo **after your distro repos but before `[extra]`**:
 
 ```ini
-[system]          # or [core] on Arch
-Include = ...
-
-[world]           # or [extra] equivalent on your distro
-Include = ...
-
 [myrepo]
 SigLevel = Required DatabaseOptional
 Server = http://your-build-host:8081/repo
 
-[extra]           # Arch [extra] after forge
+[core]            # or [system] on Artix
+Include = ...
+
+[extra]           # or [world] on Artix
 Include = ...
 ```
 
-Do **not** place forge first. The `.x` pkgrel bump (`pkgrel=2.1 > 2`) already
-ensures forge packages shadow distro equivalents when they are current. Placing
-forge first would hide upstream upgrades when the buildbot hasn't rebuilt a
-package yet — you'd see no upgrade until forge catches up.
+Placing forge first is safe. The `.x` pkgrel bump means forge always holds
+`pkgrel=N.1`. When upstream releases a new pkgrel (`N+1`), vercmp sees
+`N+1 > N.1` and the upgrade shows through normally. Forge only wins when it
+has actually rebuilt the package at the current upstream version.
 
 For local mode the server is `localhost`. For remote mode use the build
 server's hostname or IP.
@@ -219,6 +216,13 @@ sudo pacman-key --lsign-key <KEY-FINGERPRINT>
 
 `buildbot` is a long-running daemon (`buildbot --config /etc/arch-native.conf`).
 A systemd unit is included; examples for other init systems are below.
+
+**Graceful shutdown** — SIGTERM (what `systemctl stop` sends) lets the current
+build finish before the daemon exits. If Firefox is compiling, stopping the
+service can take up to `build_timeout` (default 4 hours) to return. If the
+daemon is killed mid-build (SIGKILL, power loss), the in-progress build is
+re-queued at the front of the queue on next startup, and `fsck` runs
+automatically to repair any file/DB divergence.
 
 ### systemd
 
@@ -317,6 +321,43 @@ The pacman hook fires automatically after every transaction. Test it manually:
 sudo pkglist-export
 ```
 
+### SSH access setup
+
+`pkglist-export` runs as root (pacman hooks run as root) and uses rsync over
+SSH to push the manifest to the build server. The remote user in `REMOTE_HOST`
+needs write access to the `REMOTE_PATH` directory on the build server.
+
+**On the desktop (as root):**
+
+```bash
+# Generate a key for root if you don't already have one
+sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ""
+
+# Print the public key
+sudo cat /root/.ssh/id_ed25519.pub
+```
+
+**On the build server** — add that public key to the authorized_keys of
+whichever user you put in `REMOTE_HOST`. That user needs write access to
+`/var/lib/arch-native/manifests/`:
+
+```bash
+# Example: using a regular user 'myuser' that has write access to the manifests dir
+echo "ssh-ed25519 AAAA... root@desktop" >> ~/.ssh/authorized_keys
+
+# Grant the user write access to the manifests dir
+sudo setfacl -m u:myuser:rwx /var/lib/arch-native/manifests
+```
+
+Or simply use root-to-root SSH if your setup allows it and set
+`REMOTE_HOST="root@build-server"`.
+
+Once the key is in place, verify end-to-end before relying on the hook:
+
+```bash
+sudo pkglist-export
+```
+
 ---
 
 ## Configuration reference
@@ -344,6 +385,10 @@ mode = local
 #        deploys artix-meson wrapper so meson-based packages find it.
 # arch:  standard clean Arch chroot, no extra packages.
 distro = arch
+
+# System user that owns and runs builds (chroot, GPG key, logs). Default: buildbot.
+# Change only if you need to run under a different user; the user must exist.
+# build_user = buildbot
 ```
 
 ### PKGBUILD resolution
@@ -366,6 +411,13 @@ repo_priority = local,arch
 # Add your own:
 # myfork_source = clone https://git.example.com/packages/{pkgname}.git
 # mypkgs_source = monorepo
+
+# How to pick a PKGBUILD when the same package exists in more than one tier.
+#   priority (default) — first tier in repo_priority that has a PKGBUILD wins
+#   highest            — the tier with the highest pkgver wins
+# "highest" is useful when a lower-priority tier may lag behind upstream.
+# See PKGBUILD tier resolution in the Architecture section for details.
+tier_version_select = priority
 ```
 
 See [PKGBUILD tier resolution](#pkgbuild-tier-resolution) in the Architecture
@@ -423,6 +475,13 @@ autoprune_blacklisted = true
 # and repo-db entry are removed on the next cycle.
 # Default: true.
 autoprune_uninstalled = true
+
+# Packages that keep failing are eventually marked "stalled" and excluded from
+# automatic re-queue. A package is stalled when it has failed >= this many times
+# AND its most recent failure is >= failed_stall_days days ago.
+# Default: retries=5, days=7.
+# failed_stall_retries = 5
+# failed_stall_days = 7
 ```
 
 ### Timing
@@ -436,6 +495,15 @@ upstream_check_interval = 3600
 
 # Build log retention in days. Default: 7.
 log_retention_days = 7
+```
+
+### Debugging
+
+```ini
+# Python logging level written to the systemd journal / log file.
+# DEBUG produces verbose per-package resolution and build tracing.
+# One of: DEBUG, INFO, WARNING, ERROR. Default: INFO.
+# log_level = DEBUG
 ```
 
 ### Artix / chroot
@@ -464,154 +532,8 @@ a non-standard layout:
 # manifest_path      = /var/lib/arch-native/manifests/client.json
 # gnupg_home         = /var/lib/arch-native/gnupg
 # log_dir            = /var/lib/arch-native/logs
+# metrics_path       = /var/lib/arch-native/metrics.json
 ```
-
----
-
-## `buildbot` CLI reference
-
-The `buildbot` binary is both the daemon (no subcommand) and the CLI.
-
-### Monitoring
-
-```
-buildbot status
-```
-
-```
-arch-native  ● active
-
-Building
-  package    firefox
-  elapsed    1h23m
-
-Queue  52 pending
-  new        8
-  updates    44
-  next       thunderbird
-
-Recently built
-  fish          3.7.1-2.1   2h ago
-  curl          8.7.1-1.1   3h ago
-  zstd          1.5.6-1.1   5h ago
-
-Failed  3
-  gpgme      3d ago    build failed: collect2: error: ld returned 1
-  krb5       5d ago    download failed after 3 attempts
-  +1 more — run: buildbot failed
-
-Repo  forge
-  rebuilt    987 / 1189  (83%)
-  skipped    47 / 1189  (blacklist — see /etc/arch-native.conf)
-  size       12G
-  next cycle in 4m
-```
-
-**next cycle** is the countdown to the next poll cycle. Each cycle:
-
-1. Upgrades the build chroot (`pacman -Syu` inside the clean chroot) so builds
-   always use the latest official packages
-2. Re-reads the installed package list (local mode: pacman DB; remote mode:
-   checks for a new manifest from `pkglist-export`)
-3. Every `upstream_check_interval` (default 1h): pulls cached PKGBUILD repos
-   and compares versions against `built.json` — any package whose upstream
-   PKGBUILD has a newer version than what was last built is re-queued
-   automatically with `build_reason: update`
-4. Drains the full pending queue — all queued packages are built before the
-   daemon sleeps
-
-This means official-repo package updates are picked up automatically once per
-hour without any manual intervention. New packages you install are picked up
-on the next cycle.
-
-The **Building** section shows what is currently being compiled and how long it
-has been running. When nothing is building it shows `idle`.
-
-If the daemon stopped while a build was running, the status flags it:
-
-```
-Building
-  status     stale — daemon not running
-  package    firefox
-  started    3d ago
-```
-
-If a build has exceeded `build_timeout`:
-
-```
-Building
-  package    firefox
-  elapsed    5h12m  ⚠ exceeded build_timeout (4h00m)
-```
-
-Both conditions mean the build is stuck and the daemon needs attention.
-
-```
-buildbot doctor
-```
-Checks: paths exist, JSON files are valid, gnupg home has correct permissions
-(0700), chroot keyring is initialized.
-
-```
-buildbot built [-n N]
-```
-Lists successfully built packages. `-n N` limits to the N most recent.
-Packages with dot-bumped pkgrel (`3.4.1-1.1`) are marked with `*`.
-
-```
-buildbot queue [-n N]
-```
-Lists the pending build queue (default: first 25 entries).
-
-```
-buildbot failed [-n N]
-```
-Lists failed builds with failure reason and retry count.
-
-```
-buildbot logs PKG [-f]
-```
-Prints the latest build log for PKG. `-f` follows the log in real time
-(equivalent to `tail -f`), useful while a build is running.
-
-### Queue management
-
-These commands require the service to be stopped first (command depends on
-your init system; see [Service management](#service-management)):
-
-```bash
-# Stop the daemon
-sudo systemctl stop arch-native      # systemd
-# sudo rc-service arch-native stop   # OpenRC
-# sudo dinitctl stop arch-native     # dinit
-
-# Move one failed package back to the queue
-sudo buildbot retry firefox
-
-# Move all failed packages back (skips ones no longer in the manifest)
-sudo buildbot retry --all
-
-# Remove a package from the failed list without retrying
-sudo buildbot clear firefox
-
-# Recompute the pending queue from the current installed package list.
-# Use --reset to clear existing queue first (removes stale entries).
-# Use --dry-run to preview what would be added without writing anything.
-sudo buildbot sync --reset
-
-# Restart the daemon
-sudo systemctl start arch-native
-```
-
-### Setup
-
-```
-buildbot init
-```
-Bootstraps a new installation. Run once after installing the package.
-Creates the directory layout under `/var/lib/arch-native/`, calls
-`mkarchroot` to create the base chroot, initializes the pacman keyring.
-Safe to re-run.
 
 ---
 
@@ -747,6 +669,234 @@ sudo buildbot patch show networkmanager   # read the old diff in another termina
 
 ---
 
+## `buildbot` CLI reference
+
+The `buildbot` binary is both the daemon (no subcommand) and the CLI.
+
+### Monitoring
+
+```
+buildbot status
+```
+
+```
+arch-native  ● active
+
+Building
+  package    firefox
+  elapsed    1h23m
+
+Queue  52 pending
+  new        8
+  updates    44
+  next       thunderbird
+
+Recently built
+  fish          3.7.1-2.1   2h ago
+  curl          8.7.1-1.1   3h ago
+  zstd          1.5.6-1.1   5h ago
+
+Failed  3
+  gpgme      3d ago    build failed: collect2: error: ld returned 1
+  krb5       5d ago    download failed after 3 attempts
+  +1 more — run: buildbot failed
+
+Repo  forge
+  rebuilt    987 / 1189  (83%)
+  skipped    47 / 1189  (blacklist — see /etc/arch-native.conf)
+  size       12G
+  next cycle in 4m
+```
+
+**next cycle** is the countdown to the next poll cycle. Each cycle:
+
+1. Upgrades the build chroot (`pacman -Syu` inside the clean chroot) so builds
+   always use the latest official packages
+2. Re-reads the installed package list (local mode: pacman DB; remote mode:
+   checks for a new manifest from `pkglist-export`)
+3. Every `upstream_check_interval` (default 1h): pulls cached PKGBUILD repos
+   and compares versions against `built.json` — any package whose upstream
+   PKGBUILD has a newer version than what was last built is re-queued
+   automatically with `build_reason: update`
+4. Drains the full pending queue — all queued packages are built before the
+   daemon sleeps
+
+This means official-repo package updates are picked up automatically once per
+hour without any manual intervention. New packages you install are picked up
+on the next cycle.
+
+The **Building** section shows what is currently being compiled and how long it
+has been running. When nothing is building it shows `idle`.
+
+If the daemon stopped while a build was running, the status flags it:
+
+```
+Building
+  status     stale — daemon not running
+  package    firefox
+  started    3d ago
+```
+
+If a build has exceeded `build_timeout`:
+
+```
+Building
+  package    firefox
+  elapsed    5h12m  ⚠ exceeded build_timeout (4h00m)
+```
+
+Both conditions mean the build is stuck and the daemon needs attention.
+
+```
+buildbot doctor
+```
+Checks: paths exist, JSON files are valid, gnupg home has correct permissions
+(0700), chroot keyring is initialized.
+
+```
+buildbot fsck [--dry-run] [-v] [--force]
+```
+Verifies and repairs consistency between `built.json`, the pacman repo DB, and
+physical `.pkg.tar.zst` files. Detects and fixes divergences caused by a
+SIGKILL or interrupted build cycle — e.g. files were copied to `repo_dir` but
+`repo-add` or the `built.json` write didn't complete.
+
+Requires the service to be stopped first (use `--force` to override, at your
+own risk). `--dry-run` reports issues without making changes (exits 1 if any
+are found). `-v` / `--verbose` also prints packages that are fully consistent.
+
+`fsck` also runs automatically at the start of each daemon cycle, so manual
+runs are only needed when the daemon is stopped and you want to inspect or
+pre-repair state.
+
+```
+buildbot built [-n N]
+```
+Lists successfully built packages. `-n N` limits to the N most recent.
+Packages with dot-bumped pkgrel (`3.4.1-1.1`) are marked with `*`.
+
+```
+buildbot queue [-n N]
+```
+Lists the pending build queue (default: first 25 entries).
+
+```
+buildbot failed [-n N]
+```
+Lists failed builds with failure reason and retry count.
+
+```
+buildbot logs PKG [-f]
+```
+Prints the latest build log for PKG. `-f` follows the log in real time
+(equivalent to `tail -f`), useful while a build is running.
+
+### metrics.json
+
+Written atomically after each poll cycle. Suitable for scraping by Prometheus,
+Grafana, or any external monitoring tool. Fields:
+
+```json
+{
+  "timestamp":               "2025-06-01T03:00:00+00:00",
+  "status":                  "sleeping",
+  "pending_start":           12,
+  "pending_end":             0,
+  "attempted":               12,
+  "succeeded":               11,
+  "failed":                  1,
+  "skipped_previous_failure": 0,
+  "skipped_ineligible":      4,
+  "skipped_missing_keys":    0,
+  "cycle_seconds":           3820,
+  "sleep_seconds":           300
+}
+```
+
+`status` is `sleeping` between cycles, `processing` while builds are running,
+and `starting` briefly at daemon start. `cycle_seconds` and `sleep_seconds` are
+only present when `status = sleeping`.
+
+### Queue management
+
+These commands require the service to be stopped first (command depends on
+your init system; see [Service management](#service-management)):
+
+```bash
+# Stop the daemon
+sudo systemctl stop arch-native      # systemd
+# sudo rc-service arch-native stop   # OpenRC
+# sudo dinitctl stop arch-native     # dinit
+
+# Move one failed package back to the queue
+sudo buildbot retry firefox
+
+# Move all failed packages back (skips ones no longer in the manifest)
+sudo buildbot retry --all
+
+# Preview what retry --all would do without changing anything
+sudo buildbot retry --all --dry-run
+
+# Remove a package from the failed list without retrying
+sudo buildbot clear firefox
+
+# Remove all packages from the failed list
+sudo buildbot clear --all
+
+# Preview what clear --all would do
+sudo buildbot clear --all --dry-run
+
+# Recompute the pending queue from the current installed package list.
+# Use --reset to clear existing queue first (removes stale entries).
+# Use --dry-run to preview what would be added without writing anything.
+sudo buildbot sync --reset
+
+# Restart the daemon
+sudo systemctl start arch-native
+```
+
+### Setup
+
+```
+buildbot init
+```
+Bootstraps a new installation. Run once after installing the package.
+Creates the directory layout under `/var/lib/arch-native/`, calls
+`mkarchroot` to create the base chroot, initializes the pacman keyring.
+Safe to re-run.
+
+---
+
+## Why a package might not be queued or built
+
+Beyond the explicit blacklist, there are a few other reasons a package never
+appears in the queue:
+
+**Auto-ineligible packages** — these are detected automatically and counted
+under "skipped" in `buildbot status`, without needing a blacklist entry:
+
+- `arch=any` packages — no compiled code, so no benefit from rebuilding.
+- Packages with `ghc` or `haskell-ghc` as a `makedepends` — Haskell
+  packages embed the compiler version they were built with; rebuilding them
+  with a different GHC produces incompatible libraries.
+- Any package whose pkgbase is blacklisted (see [Split packages](#split-packages-and-pkgbase-resolution)).
+
+**`pending_upstream` — PKGBUILD behind installed version** — if the installed
+package is newer than the PKGBUILD in the configured tiers (e.g. you updated
+from `[extra]` before the upstream tier cloned the new PKGBUILD), the package
+is held in `pending_upstream` rather than queued. It will be released
+automatically once the upstream tier catches up and the hourly upstream check
+detects the new PKGBUILD version. Run `buildbot sync` to force a re-scan if
+you want to check the current state.
+
+**Stalled failures** — packages that have failed ≥ `failed_stall_retries`
+times (default 5) and whose last failure was ≥ `failed_stall_days` days ago
+(default 7) are excluded from automatic re-queue. They remain in
+`buildbot failed` with their history. Use `buildbot retry <pkg>` to manually
+re-queue them after fixing the underlying issue.
+
+---
+
 ## Architecture
 
 ### Data flow (remote mode)
@@ -790,8 +940,6 @@ source type defined in config.
 |---|---|
 | `priority` (default) | First tier in `repo_priority` that has a PKGBUILD wins. Safe for setups where higher-priority tiers carry distro-specific patches. |
 | `highest` | All tiers are checked; the one with the highest `pkgver` wins. Useful when a lower-priority tier may lag behind upstream — e.g. an Artix clone tier that hasn't bumped a package yet while CachyOS or Arch already has the new version. |
-
-On Artix with dinit, `highest` is generally safe: Artix-specific service units live in separate `-dinit` split packages, not in the base package PKGBUILD. The worst case when a non-Artix PKGBUILD is selected is a build failure (lands in `failed.json`) or a pacman install refusal — neither breaks the running system.
 
 | Source type | How it works | Auto-updated? |
 |---|---|---|

@@ -32,6 +32,24 @@ Verify that all required paths exist, JSON state files are valid, the GPG
 home has correct permissions (0700), and the chroot pacman keyring is
 initialised.
 Safe to run while the service is active.
+.SS fsck [\-\-dry\-run] [\-v] [\-\-force]
+Verify and repair consistency between
+.IR built.json ,
+the pacman repo database, and physical
+.I .pkg.tar.zst
+files.
+Detects and fixes divergences caused by a SIGKILL or interrupted build cycle.
+Also runs automatically at daemon startup.
+Requires the service to be stopped first.
+.TP
+.B \-\-dry\-run
+Report issues without making any changes (exits 1 if any are found).
+.TP
+.BR \-v ", " \-\-verbose
+Also print packages that are fully consistent.
+.TP
+.B \-\-force
+Run even if the service is active (unsafe).
 .SS built [\-n \fIN\fR]
 List packages successfully rebuilt by arch\-native, newest first.
 .TP
@@ -95,8 +113,15 @@ Initialise a new arch\-native installation: create the directory layout
 under
 .IR /var/lib/arch\-native/ ,
 build the clean devtools chroot, initialise the pacman keyring, and
-generate the GPG signing key.
+set up the GPG home directory for the build user.
 Safe to re\-run \(em skips steps already complete.
+After running
+.BR init ,
+generate the signing key manually (see
+.IR /usr/share/doc/arch\-native/README.md
+or the project README for the
+.B gpg \-\-gen\-key
+invocation).
 .SS "patch {create|show|check} \fIPKG\fR"
 Manage local PKGBUILD patches stored in
 .IR /var/lib/arch\-native/pkgbuilds/local/ .
