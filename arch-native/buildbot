@@ -392,6 +392,8 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
             if kind == "clone":
                 pkg_dir = os.path.join(tier_base, name)
                 if os.path.isdir(pkg_dir) and not skip_pulls:
+                    _git(["-C", pkg_dir, "checkout", "--", "PKGBUILD"],
+                         config["build_user"], capture_output=True)
                     r = _git(["-C", pkg_dir, "pull", "--ff-only"],
                              config["build_user"], capture_output=True)
                     if r.returncode != 0:
@@ -424,6 +426,8 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
                             log.debug("[%s] arch clone failed: %s", name,
                                       r.stderr.decode(errors="replace").strip()[:120])
                     if os.path.isdir(pkg_dir):
+                        _git(["-C", pkg_dir, "checkout", "--", "PKGBUILD"],
+                             config["build_user"], capture_output=True)
                         r = _git(["-C", pkg_dir, "pull", "--ff-only"],
                                  config["build_user"], capture_output=True)
                         if r.returncode != 0:
@@ -2185,8 +2189,18 @@ def run_daemon(config_path: str, debug: bool):
 
                 # e. Bump pkgrel
                 pkgbuild_path = os.path.join(pkgbuild_dir, "PKGBUILD")
-                with open(pkgbuild_path, "r") as f:
-                    pkgbuild_backup = f.read()
+                # Prefer reading the backup from git HEAD so that a previously
+                # SIGKILL'd build (which left a dirty pkgrel bump) doesn't
+                # cause successive builds to perpetuate the dirty state.
+                _git_backup = subprocess.run(
+                    ["git", "show", "HEAD:PKGBUILD"],
+                    cwd=pkgbuild_dir, capture_output=True, text=True,
+                )
+                if _git_backup.returncode == 0:
+                    pkgbuild_backup = _git_backup.stdout
+                else:
+                    with open(pkgbuild_path, "r") as f:
+                        pkgbuild_backup = f.read()
                 old_pkgrel = srcinfo["pkgrel"]
                 new_version = bump_pkgrel(pkgbuild_path, srcinfo)
                 log.debug("[%s] pkgrel bumped: %s -> %s", name, old_pkgrel, new_version.rsplit("-", 1)[-1])
