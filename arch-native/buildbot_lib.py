@@ -193,7 +193,7 @@ def generate_makepkg_conf(config: dict, output_path: str):
         check_flag = "check"
         mode_comment = "local mode — building and running on the same machine"
     else:
-        rustflags = f"-C opt-level=3 -C target-cpu={march}"
+        rustflags = "-C opt-level=3"
         check_flag = "!check"
         mode_comment = (
             "remote mode — !check: test suites may SIGILL if march != build host CPU"
