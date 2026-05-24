@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -1001,17 +1002,25 @@ def build_package(
 
         timeout = config.get("build_timeout")
         with open(logpath, "w") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=pkgbuild_dir,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
             try:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=pkgbuild_dir,
-                    stdout=lf,
-                    stderr=subprocess.STDOUT,
-                    env=env,
-                    timeout=timeout,
-                )
+                proc.communicate(timeout=timeout)
                 return proc.returncode
             except subprocess.TimeoutExpired:
+                # Kill the entire process group so the container and compiler
+                # inside the chroot die too, not just the makechrootpkg child.
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
                 lf.write(f"\n=== BUILD TIMED OUT after {timeout}s ===\n")
                 lf.flush()
                 log.error("[%s] build timed out after %ds", pkg["name"], timeout)
@@ -1349,49 +1358,60 @@ def vercmp(a: str, b: str) -> int:
 # ---------------------------------------------------------------------------
 # Chroot upgrade
 # ---------------------------------------------------------------------------
-def upgrade_chroot(chroot_root: str, extra_packages: list[str] = None):
+def upgrade_chroot(chroot_root: str, extra_packages: list[str] = None, timeout: int = 600):
     """
     Upgrade the clean chroot and install any extra packages.
 
     extra_packages: installed with -Sd --overwrite '*' after the main upgrade.
     For Artix this is ['libelogind', 'libudev', 'elogind']; for Arch it's empty.
     Common build deps (socat, gperf) are always installed.
+    Returns False if any step times out or critically fails, True otherwise.
     """
     log.info("Upgrading chroot at %s", chroot_root)
-    result = subprocess.run(
-        ["arch-nspawn", chroot_root, "pacman", "-Syu", "--noconfirm"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log.warning("Chroot upgrade warnings: %s", result.stderr.strip())
-    else:
-        log.info("Chroot upgrade complete")
+    try:
+        result = subprocess.run(
+            ["arch-nspawn", chroot_root, "pacman", "-Syu", "--noconfirm"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            log.warning("Chroot upgrade warnings: %s", result.stderr.strip())
+        else:
+            log.info("Chroot upgrade complete")
+    except subprocess.TimeoutExpired:
+        log.error("Chroot upgrade timed out after %ds — proceeding with existing chroot state", timeout)
+        return False
 
     if extra_packages:
+        try:
+            result = subprocess.run(
+                [
+                    "arch-nspawn", chroot_root,
+                    "pacman", "-Sd", "--noconfirm", "--overwrite", "*",
+                ] + extra_packages,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if result.returncode != 0:
+                log.warning("Extra package install warnings: %s", result.stderr.strip())
+            else:
+                log.info("Extra packages installed in chroot: %s", " ".join(extra_packages))
+        except subprocess.TimeoutExpired:
+            log.error("Extra package install timed out after %ds — proceeding without them", timeout)
+
+    # Always install common build dependencies
+    try:
         result = subprocess.run(
             [
                 "arch-nspawn", chroot_root,
-                "pacman", "-Sd", "--noconfirm", "--overwrite", "*",
-            ] + extra_packages,
-            capture_output=True, text=True,
+                "pacman", "-S", "--needed", "--noconfirm",
+                "socat", "gperf",
+            ],
+            capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode != 0:
-            log.warning("Extra package install warnings: %s", result.stderr.strip())
+            log.warning("socat/gperf install warnings: %s", result.stderr.strip())
         else:
-            log.info("Extra packages installed in chroot: %s", " ".join(extra_packages))
-
-    # Always install common build dependencies
-    result = subprocess.run(
-        [
-            "arch-nspawn", chroot_root,
-            "pacman", "-S", "--needed", "--noconfirm",
-            "socat", "gperf",
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log.warning("socat/gperf install warnings: %s", result.stderr.strip())
-    else:
-        log.info("socat/gperf installed in chroot")
+            log.info("socat/gperf installed in chroot")
+    except subprocess.TimeoutExpired:
+        log.error("socat/gperf install timed out after %ds", timeout)
 
     return True

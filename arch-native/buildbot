@@ -1858,7 +1858,8 @@ def run_daemon(config_path: str, debug: bool):
 
         # ----- Step 1: Chroot upgrade -----
         log.info("Upgrading chroot...")
-        upgrade_chroot(config["chroot_root"], config.get("chroot_extra_packages", []))
+        if not upgrade_chroot(config["chroot_root"], config.get("chroot_extra_packages", [])):
+            log.warning("Chroot upgrade did not complete — builds will use existing chroot state")
 
         if shutdown_flag:
             break
