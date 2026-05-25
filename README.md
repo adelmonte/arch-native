@@ -437,6 +437,26 @@ tier_version_select = priority
 See [PKGBUILD tier resolution](#pkgbuild-tier-resolution) in the Architecture
 section for a full explanation of each type.
 
+### Per-package tier overrides
+
+Add an optional `[package_tiers]` section to override `repo_priority` for
+specific packages. Useful when you want most packages from one tier but need
+certain packages to always come from another (e.g. Artix's elogind-patched
+networkmanager, or a specific fork of ffmpeg).
+
+```ini
+[package_tiers]
+# Include "local" first to keep local patch support for that package.
+# If a package isn't listed here, the global repo_priority applies.
+networkmanager = local,artix,arch
+pipewire       = local,artix,arch
+ffmpeg         = local,cachyos,arch
+```
+
+The patch commands (`buildbot patch create`, `buildbot patch check`) also
+respect per-package overrides — the patch is created against the upstream tier
+specified in the override, not the global priority.
+
 ### Blacklists
 
 ```ini
@@ -979,6 +999,8 @@ source type defined in config.
 | `artix` | `clone https://gitea.artixlinux.org/packages/{pkgname}.git` |
 | `cachyos` | `monorepo` — clone manually to `pkgbuilds/cachyos/` |
 | `arch` | `pkgctl` |
+
+**Per-package overrides** — use `[package_tiers]` to pin specific packages to a different tier without changing the global default (see [Per-package tier overrides](#per-package-tier-overrides) in the configuration reference).
 
 **Adding your own tiers** — name them anything, define the source, add to `repo_priority`:
 

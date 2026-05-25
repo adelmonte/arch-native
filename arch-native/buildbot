@@ -203,6 +203,14 @@ def load_config(path: str) -> dict:
             )
     cfg["tier_sources"] = tier_sources
 
+    pkg_tier_overrides = {}
+    if parser.has_section("package_tiers"):
+        for pkgname, tiers_raw in parser.items("package_tiers"):
+            tiers = [t.strip().lower() for t in tiers_raw.split(",") if t.strip()]
+            if tiers:
+                pkg_tier_overrides[pkgname] = tiers
+    cfg["package_tier_overrides"] = pkg_tier_overrides
+
     blacklist_str = sec.get("blacklist", "gcc,glibc,coreutils,linux-api-headers")
     cfg["blacklist"] = [s.strip() for s in blacklist_str.split(",") if s.strip()]
 
@@ -1584,7 +1592,8 @@ def _cmd_patch_create(args, config: dict) -> int:
         print(f"warning: {local_dir} already contains a full PKGBUILD copy.")
         print(f"  after creating the patch, remove the PKGBUILD file to avoid confusion.")
 
-    upstream_priority = [t for t in config["repo_priority"] if t != "local"]
+    pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
+    upstream_priority = [t for t in pkg_priority if t != "local"]
     try:
         upstream_dir, tier = resolve_pkgbuild(
             pkgname, pkgbuilds_dir, None, upstream_priority,
@@ -1645,7 +1654,6 @@ def _cmd_patch_check(args, config: dict) -> int:
     """Verify that local patches still apply against current upstream."""
     import shutil as _shutil
     pkgbuilds_dir = config["pkgbuilds_dir"]
-    upstream_priority = [t for t in config["repo_priority"] if t != "local"]
 
     if args.all:
         local_root = os.path.join(pkgbuilds_dir, "local")
@@ -1670,6 +1678,8 @@ def _cmd_patch_check(args, config: dict) -> int:
             print(f"  {pkgname:<28} NO PATCH FILE")
             any_failed = True
             continue
+        pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
+        upstream_priority = [t for t in pkg_priority if t != "local"]
         try:
             upstream_dir, tier = resolve_pkgbuild(
                 pkgname, pkgbuilds_dir, None, upstream_priority,
@@ -2114,11 +2124,12 @@ def run_daemon(config_path: str, debug: bool):
 
             try:
                 # a. Resolve PKGBUILD (with pkgbase fallback for split packages)
+                pkg_priority = config["package_tier_overrides"].get(name) or config["repo_priority"]
                 pkgbuild_dir, tier = resolve_pkgbuild(
                     name,
                     config["pkgbuilds_dir"],
                     pkgbase_map,
-                    config["repo_priority"],
+                    pkg_priority,
                     tier_sources=config["tier_sources"],
                     version_select=config["tier_version_select"],
                 )
