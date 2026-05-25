@@ -3,6 +3,7 @@ buildbot_lib.py — Core library for the personal package buildbot.
 """
 
 import fnmatch
+import functools
 import json
 import logging
 import os
@@ -1126,17 +1127,32 @@ def _pkgname_from_filename(filename: str) -> str:
     return parts[0] if len(parts) == 4 else basename
 
 
+def _ver_from_pkg_path(f: "Path") -> str:
+    """Extract pkgver-pkgrel from a .pkg.tar.zst filename for version-based sorting."""
+    basename = f.name
+    for ext in (".pkg.tar.zst", ".pkg.tar.xz"):
+        if basename.endswith(ext):
+            basename = basename[:-len(ext)]
+            break
+    parts = basename.rsplit("-", 3)
+    return f"{parts[1]}-{parts[2]}" if len(parts) == 4 else ""
+
+
 def _prune_stale_versions(repo_dir: str, newly_added: list[str], keep: int = 1) -> list[str]:
-    """For each newly added pkg, keep the `keep` newest files for the same pkgname,
-    delete the rest (and their .sig siblings)."""
+    """For each newly added pkg, keep the `keep` highest-version files for the same pkgname,
+    delete the rest (and their .sig siblings). Sorts by package version via vercmp."""
     new_pkgnames = {_pkgname_from_filename(f) for f in newly_added}
 
     pruned = []
     for pkgname in new_pkgnames:
-        files = sorted(
-            (f for f in Path(repo_dir).glob("*.pkg.tar.zst")
-             if _pkgname_from_filename(f.name) == pkgname),
-            key=lambda f: f.stat().st_mtime,
+        files = list(
+            f for f in Path(repo_dir).glob("*.pkg.tar.zst")
+            if _pkgname_from_filename(f.name) == pkgname
+        )
+        files.sort(
+            key=functools.cmp_to_key(
+                lambda a, b: vercmp(_ver_from_pkg_path(a) or "0", _ver_from_pkg_path(b) or "0")
+            ),
             reverse=True,
         )
         for f in files[keep:]:

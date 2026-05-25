@@ -1205,6 +1205,14 @@ def _world_depends_on_old_soname(lib_base: str, new_soname: str, repo_name: str)
                                 in_depends = False
                                 continue
                             if stripped.split("=", 1)[0] == lib_base and stripped != new_soname:
+                                # Bare soname dep (no version) — not a concrete ABI conflict
+                                if "=" not in stripped:
+                                    continue
+                                # Different ELF class (32-bit vs 64-bit) — not a conflict
+                                new_cls = new_soname.rsplit("-", 1)[-1] if "-" in new_soname.split("=", 1)[-1] else ""
+                                dep_cls = stripped.rsplit("-", 1)[-1] if "-" in stripped.split("=", 1)[-1] else ""
+                                if new_cls and dep_cls and new_cls != dep_cls:
+                                    continue
                                 return True
         except Exception:
             continue
