@@ -324,6 +324,12 @@ def diff_manifest(
             todo.append({**pkg, "build_reason": "new"})
             continue
 
+        # World has a newer version and forge's DB entry was withdrawn — don't
+        # re-queue a rebuild of the stale PKGBUILD version. The upstream version
+        # check will re-queue once the PKGBUILD catches up to world.
+        if built[name].get("status") == "world_superseded":
+            continue
+
         built_upstream = _strip_local_pkgrel_bump(built[name]["version"])
         manifest_upstream = _strip_local_pkgrel_bump(pkg["version"])
         if vercmp(manifest_upstream, built_upstream) > 0:
