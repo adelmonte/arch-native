@@ -455,13 +455,19 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
                 if ver and (not best_quick_ver or vercmp(ver, best_quick_ver) > 0):
                     best_dir, best_tier, best_quick_ver = tier_dir, tier, ver
 
-        # Parse srcinfo once on the winning candidate.
+        # Cheap version read — just grep pkgver/pkgrel/epoch from the PKGBUILD.
+        # parse_srcinfo (runs makepkg --printsrcinfo per package) would be more
+        # accurate for complex expressions, but costs ~0.5 s/pkg × 800 pkgs ≈ 7 min.
+        # _quick_pkgver reads the file directly in <1 ms and is accurate for the
+        # static literal assignments used in almost all PKGBUILDs.  VCS packages
+        # (pkgver() function) return "" and are silently skipped.
         upstream_ver = None
         if best_dir:
-            try:
-                upstream_ver = _fmt_srcinfo_ver(parse_srcinfo(best_dir, config["build_user"]))
-            except Exception as e:
-                log.debug("[%s] failed to parse %s srcinfo: %s", name, best_tier, e)
+            upstream_ver = _quick_pkgver(best_dir) or None
+            # Reject bash variable placeholders ($var / ${var}) that _quick_pkgver
+            # might capture from unusual PKGBUILDs.
+            if upstream_ver and ("$" in upstream_ver or "{" in upstream_ver):
+                upstream_ver = None
 
         if upstream_ver:
             normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
