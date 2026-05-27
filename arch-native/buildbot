@@ -738,14 +738,19 @@ def cmd_status(args, config: dict) -> int:
     if installed_total:
         pct = rebuilt_count / installed_total * 100
         row("rebuilt", f"{rebuilt_count} / {installed_total}  ({pct:.0f}%)")
+        pending_count = cascade_count + superseded_count
+        if pending_count:
+            if cascade_count and superseded_count:
+                detail = f"{superseded_count} updating · {cascade_count} releasing after lib update"
+            elif superseded_count:
+                detail = "rebuilding at newer version"
+            else:
+                detail = "built, releasing once library updates land"
+            row("pending", f"{pending_count}  {DIM}({detail}){R}")
         if blacklisted_count:
             row("blacklisted", f"{blacklisted_count} / {installed_total}  ({blacklisted_count / installed_total * 100:.0f}%)  {DIM}(see /etc/arch-native.conf){R}")
         if ineligible_count:
             row("ineligible", f"{ineligible_count} / {installed_total}  ({ineligible_count / installed_total * 100:.0f}%)  {DIM}(arch=any — not rebuilt){R}")
-        if cascade_count:
-            row("staging", f"{cascade_count}  {DIM}(soname bump — awaiting world cascade){R}")
-        if superseded_count:
-            row("superseded", f"{superseded_count}  {DIM}(world has newer version — forge entry withdrawn){R}")
     if repo_size:
         row("size", repo_size)
     if cycle_str:
