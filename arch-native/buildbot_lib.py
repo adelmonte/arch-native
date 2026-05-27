@@ -1311,6 +1311,34 @@ def prune_uninstalled_from_repo(
     return to_remove
 
 
+def _read_pacman_db(db_path: str) -> dict[str, str]:
+    """Parse a pacman repo DB tarball. Returns {pkgname: version}.
+    On duplicate entries (DB corruption) the last entry wins."""
+    import tarfile
+    result = {}
+    try:
+        with tarfile.open(db_path) as tf:
+            for member in tf.getmembers():
+                if not member.name.endswith("/desc"):
+                    continue
+                f = tf.extractfile(member)
+                if f is None:
+                    continue
+                content = f.read().decode("utf-8", errors="replace")
+                lines = content.splitlines()
+                name = version = ""
+                for i, line in enumerate(lines):
+                    if line.strip() == "%NAME%" and i + 1 < len(lines):
+                        name = lines[i + 1].strip()
+                    elif line.strip() == "%VERSION%" and i + 1 < len(lines):
+                        version = lines[i + 1].strip()
+                if name and version:
+                    result[name] = version
+    except Exception as e:
+        log.warning("Error reading pacman DB %s: %s", db_path, e)
+    return result
+
+
 def prune_world_superseded_from_repo(
     built: dict,
     repo_db_path: str,
@@ -1325,9 +1353,10 @@ def prune_world_superseded_from_repo(
 
     Returns the list of package names removed from the DB (caller updates built.json).
     """
-    import tarfile
+    if not os.path.exists(repo_db_path):
+        return []
 
-    forge_db = _read_forge_db(repo_db_path)
+    forge_db = _read_pacman_db(repo_db_path)
     if not forge_db:
         return []
 
@@ -1343,29 +1372,15 @@ def prune_world_superseded_from_repo(
         if fname[:-3] == repo_name:
             continue
         db_path = os.path.join(sync_dir, fname)
-        try:
-            with tarfile.open(db_path) as tf:
-                for member in tf.getmembers():
-                    if not member.name.endswith("/desc"):
-                        continue
-                    f = tf.extractfile(member)
-                    if f is None:
-                        continue
-                    content = f.read().decode("utf-8", errors="replace")
-                    pkgname = _db_field(content, "NAME")
-                    version = _db_field(content, "VERSION")
-                    if pkgname and version:
-                        existing = world_versions.get(pkgname)
-                        if existing is None or vercmp(version, existing) > 0:
-                            world_versions[pkgname] = version
-        except Exception as e:
-            log.warning("prune_world_superseded: error reading %s: %s", db_path, e)
+        for pkgname, version in _read_pacman_db(db_path).items():
+            existing = world_versions.get(pkgname)
+            if existing is None or vercmp(version, existing) > 0:
+                world_versions[pkgname] = version
 
     to_remove = []
-    for pkgname, db_rec in forge_db.items():
-        forge_ver = db_rec.get("version", "")
+    for pkgname, forge_ver in forge_db.items():
         world_ver = world_versions.get(pkgname)
-        if world_ver and forge_ver and vercmp(world_ver, forge_ver) > 0:
+        if world_ver and vercmp(world_ver, forge_ver) > 0:
             to_remove.append(pkgname)
 
     if not to_remove:
