@@ -739,9 +739,9 @@ def cmd_status(args, config: dict) -> int:
         pct = rebuilt_count / installed_total * 100
         row("rebuilt", f"{rebuilt_count} / {installed_total}  ({pct:.0f}%)")
         if blacklisted_count:
-            row("blacklisted", f"{blacklisted_count} / {installed_total}  {DIM}(see /etc/arch-native.conf){R}")
+            row("blacklisted", f"{blacklisted_count} / {installed_total}  ({blacklisted_count / installed_total * 100:.0f}%)  {DIM}(see /etc/arch-native.conf){R}")
         if ineligible_count:
-            row("ineligible", f"{ineligible_count} / {installed_total}  {DIM}(arch=any — not rebuilt){R}")
+            row("ineligible", f"{ineligible_count} / {installed_total}  ({ineligible_count / installed_total * 100:.0f}%)  {DIM}(arch=any — not rebuilt){R}")
         if cascade_count:
             row("staging", f"{cascade_count}  {DIM}(soname bump — awaiting world cascade){R}")
         if superseded_count:
