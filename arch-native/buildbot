@@ -54,6 +54,7 @@ from buildbot_lib import (
     ignore_special_files,
     prune_blacklisted_from_repo,
     prune_uninstalled_from_repo,
+    prune_world_superseded_from_repo,
 )
 
 # ---------------------------------------------------------------------------
@@ -113,6 +114,7 @@ def load_config(path: str) -> dict:
     cfg["autoprune_keep"] = max(1, sec.getint("autoprune_keep", 1))
     cfg["autoprune_blacklisted"] = sec.getboolean("autoprune_blacklisted", True)
     cfg["autoprune_uninstalled"] = sec.getboolean("autoprune_uninstalled", True)
+    cfg["autoprune_world_superseded"] = sec.getboolean("autoprune_world_superseded", True)
     cfg["log_level"] = sec.get("log_level", "INFO")
     cfg["failed_stall_retries"] = sec.getint("failed_stall_retries", 5)
     cfg["failed_stall_days"] = sec.getint("failed_stall_days", 7)
@@ -596,7 +598,7 @@ def cmd_status(args, config: dict) -> int:
     for n, e in built.items():
         if not (isinstance(e, dict) and e.get("built_at")):
             continue
-        if e.get("status") in ("ineligible", "pending_upstream", "pending_world_cascade"):
+        if e.get("status") in ("ineligible", "pending_upstream", "pending_world_cascade", "world_superseded"):
             continue
         try:
             ts = datetime.fromisoformat(e["built_at"])
@@ -613,10 +615,11 @@ def cmd_status(args, config: dict) -> int:
         manifest = (read_local_packages() if config.get("mode") == "local"
                     else load_manifest(config["manifest_path"]))
         installed_total = len(manifest)
-        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade"))
+        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade", "world_superseded"))
         blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
         ineligible_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "ineligible")
         cascade_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "pending_world_cascade")
+        superseded_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "world_superseded")
     except Exception:
         pass
 
@@ -735,11 +738,13 @@ def cmd_status(args, config: dict) -> int:
         pct = rebuilt_count / installed_total * 100
         row("rebuilt", f"{rebuilt_count} / {installed_total}  ({pct:.0f}%)")
         if blacklisted_count:
-            row("skipped", f"{blacklisted_count} / {installed_total}  {DIM}(blacklist — see /etc/arch-native.conf){R}")
+            row("blacklisted", f"{blacklisted_count} / {installed_total}  {DIM}(see /etc/arch-native.conf){R}")
         if ineligible_count:
             row("ineligible", f"{ineligible_count} / {installed_total}  {DIM}(arch=any — not rebuilt){R}")
         if cascade_count:
             row("staging", f"{cascade_count}  {DIM}(soname bump — awaiting world cascade){R}")
+        if superseded_count:
+            row("superseded", f"{superseded_count}  {DIM}(world has newer version — forge entry withdrawn){R}")
     if repo_size:
         row("size", repo_size)
     if cycle_str:
@@ -1318,9 +1323,9 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
                 pn = _pkgname_from_filename(fname)
                 physical.setdefault(pn, []).append(fname)
 
-    cascade_names = {n for n, r in built.items() if r.get("status") == "pending_world_cascade"}
-    built_pkgs = {n: r for n, r in built.items() if r.get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade")}
-    all_names = (set(db_pkgs) | set(physical) | set(built_pkgs)) - cascade_names
+    staged_names = {n for n, r in built.items() if r.get("status") in ("pending_world_cascade", "world_superseded")}
+    built_pkgs = {n: r for n, r in built.items() if r.get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade", "world_superseded")}
+    all_names = (set(db_pkgs) | set(physical) | set(built_pkgs)) - staged_names
 
     # Collect repairs as (action, name, extra)
     repairs = []
@@ -1940,6 +1945,21 @@ def run_daemon(config_path: str, debug: bool):
                         for name in removed:
                             built.pop(name, None)
                         save_built_state(config["state_path"], built)
+
+                # Withdraw forge DB entries where world now has a newer version.
+                # Uses the chroot's sync DBs (fresh after upgrade_chroot) so stalled
+                # packages don't permanently hide distro upgrades from pacman.
+                if config.get("autoprune_world_superseded", True):
+                    sync_dir = os.path.join(config["chroot_root"], "var/lib/pacman/sync")
+                    removed = prune_world_superseded_from_repo(
+                        built, config["repo_db"], config["repo_name"], sync_dir,
+                    )
+                    if removed:
+                        for name in removed:
+                            if name in built:
+                                built[name]["status"] = "world_superseded"
+                        save_built_state(config["state_path"], built)
+
                 new_pkgs = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
 
                 if new_pkgs:

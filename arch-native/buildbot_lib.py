@@ -1305,6 +1305,80 @@ def prune_uninstalled_from_repo(
     return to_remove
 
 
+def prune_world_superseded_from_repo(
+    built: dict,
+    repo_db_path: str,
+    repo_name: str,
+    sync_dir: str,
+) -> list[str]:
+    """Remove forge DB entries where a world repo has a strictly newer version.
+
+    Called each cycle after upgrade_chroot() — the chroot's sync DBs are always
+    fresh, so this catches packages that stalled in the failed queue and whose
+    forge DB entry is now blocking pacman from seeing the world upgrade.
+
+    Returns the list of package names removed from the DB (caller updates built.json).
+    """
+    import tarfile
+
+    forge_db = _read_forge_db(repo_db_path)
+    if not forge_db:
+        return []
+
+    if not os.path.isdir(sync_dir):
+        log.debug("prune_world_superseded: sync_dir %s not found, skipping", sync_dir)
+        return []
+
+    # Build {pkgname: best_world_version} across all non-forge sync DBs
+    world_versions: dict[str, str] = {}
+    for fname in os.listdir(sync_dir):
+        if not fname.endswith(".db"):
+            continue
+        if fname[:-3] == repo_name:
+            continue
+        db_path = os.path.join(sync_dir, fname)
+        try:
+            with tarfile.open(db_path) as tf:
+                for member in tf.getmembers():
+                    if not member.name.endswith("/desc"):
+                        continue
+                    f = tf.extractfile(member)
+                    if f is None:
+                        continue
+                    content = f.read().decode("utf-8", errors="replace")
+                    pkgname = _db_field(content, "NAME")
+                    version = _db_field(content, "VERSION")
+                    if pkgname and version:
+                        existing = world_versions.get(pkgname)
+                        if existing is None or vercmp(version, existing) > 0:
+                            world_versions[pkgname] = version
+        except Exception as e:
+            log.warning("prune_world_superseded: error reading %s: %s", db_path, e)
+
+    to_remove = []
+    for pkgname, db_rec in forge_db.items():
+        forge_ver = db_rec.get("version", "")
+        world_ver = world_versions.get(pkgname)
+        if world_ver and forge_ver and vercmp(world_ver, forge_ver) > 0:
+            to_remove.append(pkgname)
+
+    if not to_remove:
+        return []
+
+    result = subprocess.run(
+        ["repo-remove", repo_db_path] + to_remove,
+        capture_output=True, text=True,
+    )
+    if result.returncode not in (0, 1):
+        log.warning("repo-remove returned %d: %s", result.returncode, result.stderr)
+
+    log.info(
+        "Removed %d world-superseded package(s) from forge DB: %s",
+        len(to_remove), ", ".join(to_remove),
+    )
+    return to_remove
+
+
 # ---------------------------------------------------------------------------
 # State tracking
 # ---------------------------------------------------------------------------
