@@ -1574,9 +1574,12 @@ def cmd_init(args, config: dict) -> int:
 
     # 3. Initialize chroot pacman keyring
     print("  initializing chroot pacman keyring ...")
+    CACHYOS_KEY = "882DCFE48E2051D48E2562ABF3B607488DB35A47"
     for cmd in [
         ["arch-nspawn", chroot_root, "pacman-key", "--init"],
         ["arch-nspawn", chroot_root, "pacman-key", "--populate"],
+        ["arch-nspawn", chroot_root, "pacman-key", "--recv-keys", CACHYOS_KEY],
+        ["arch-nspawn", chroot_root, "pacman-key", "--lsign-key", CACHYOS_KEY],
     ]:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
