@@ -115,6 +115,7 @@ def load_config(path: str) -> dict:
     cfg["autoprune_blacklisted"] = sec.getboolean("autoprune_blacklisted", True)
     cfg["autoprune_uninstalled"] = sec.getboolean("autoprune_uninstalled", True)
     cfg["autoprune_world_superseded"] = sec.getboolean("autoprune_world_superseded", True)
+    cfg["stall_auto_retry_days"] = sec.getint("stall_auto_retry_days", 3)
     cfg["log_level"] = sec.get("log_level", "INFO")
     cfg["failed_stall_retries"] = sec.getint("failed_stall_retries", 5)
     cfg["failed_stall_days"] = sec.getint("failed_stall_days", 7)
@@ -1310,6 +1311,15 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
         _pkgname_from_filename,
     )
 
+    def _ver_from_fname(fname: str) -> str:
+        """Extract pkgver-pkgrel from a package filename."""
+        for ext in (".pkg.tar.zst", ".pkg.tar.xz"):
+            if fname.endswith(ext):
+                fname = fname[:-len(ext)]
+                break
+        parts = fname.rsplit("-", 3)
+        return f"{parts[1]}-{parts[2]}" if len(parts) == 4 else ""
+
     built = get_built_state(config["state_path"])
     repo_db = config["repo_db"]
     repo_dir = config["repo_dir"]
@@ -1341,8 +1351,22 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
         in_built = name in built_pkgs
 
         if in_db and in_files and in_built:
-            if verbose:
-                print(f"  ok      {name}")
+            # Check for pkgrel drift: a higher-version file exists in the repo dir
+            # than what the DB (and built.json) record. Happens when the DB is
+            # repaired/reset but the newer pkg file survived on disk.
+            db_ver = db_pkgs[name].get("version", "")
+            best_file = None
+            best_ver = db_ver
+            for fname in physical.get(name, []):
+                fver = _ver_from_fname(fname)
+                if fver and vercmp(fver, best_ver) > 0:
+                    best_ver = fver
+                    best_file = fname
+            if best_file:
+                repairs.append(("fix_drift", name, [best_file]))
+            else:
+                if verbose:
+                    print(f"  ok      {name}")
             continue
         elif in_files and in_db and not in_built:
             repairs.append(("reanimate_built", name, physical[name]))
@@ -1369,6 +1393,7 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
         "remove_db":          "remove db",
         "clear_built":        "clear built.json",
         "remove_dup_db":      "remove duplicate db entry",
+        "fix_drift":          "fix pkgrel drift",
     }
     nw = max(len(n) for _, n, _ in repairs)
     for action, name, _ in repairs:
@@ -1448,6 +1473,23 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
                     log.info("fsck: deduped DB for %s, re-added %s", name, pkg_file)
                 else:
                     log.warning("fsck: repo-remove %s failed: %s", name, r.stderr.decode())
+
+            elif action == "fix_drift":
+                # DB has an older pkgrel than the highest-version file on disk;
+                # re-add the newer file so the DB and built.json stay in sync.
+                old_ver = db_pkgs[name].get("version", "?")
+                fpath = os.path.join(repo_dir, files[0])
+                r = subprocess.run(["repo-add", "-p", repo_db, fpath], capture_output=True)
+                if r.returncode in (0, 1):
+                    new_ver = _ver_from_fname(files[0])
+                    if new_ver and name in built:
+                        built[name]["version"] = new_ver
+                        built[name]["pkg_files"] = [files[0]]
+                        save_built_state(config["state_path"], built)
+                    repaired += 1
+                    log.info("fsck: fixed pkgrel drift for %s (%s → %s)", name, old_ver, new_ver)
+                else:
+                    log.warning("fsck: fix_drift repo-add %s failed: %s", name, r.stderr.decode())
 
         except Exception as e:
             log.warning("fsck: repair failed for %s (%s): %s", name, action, e)
@@ -1960,6 +2002,31 @@ def run_daemon(config_path: str, debug: bool):
                                 built[name]["status"] = "world_superseded"
                         save_built_state(config["state_path"], built)
 
+                # Auto-retry packages stalled past the configured interval.
+                # Clears their failed entry so diff_manifest re-queues them.
+                stall_auto_retry_days = config.get("stall_auto_retry_days", 3)
+                if stall_auto_retry_days > 0:
+                    _failed_all = load_failed(config["failed_path"])
+                    _now_utc = datetime.now(timezone.utc)
+                    auto_retried = []
+                    for _pkgname, _rec in list(_failed_all.items()):
+                        if not _is_stalled(_rec, config):
+                            continue
+                        _ts = _rec.get("timestamp") or _rec.get("first_failed_at", "")
+                        if not _ts:
+                            continue
+                        try:
+                            _last = datetime.fromisoformat(_ts)
+                            if (_now_utc - _last).days >= stall_auto_retry_days:
+                                del _failed_all[_pkgname]
+                                auto_retried.append(_pkgname)
+                        except Exception:
+                            pass
+                    if auto_retried:
+                        save_failed(config["failed_path"], _failed_all)
+                        log.info("Auto-retried %d stalled package(s): %s",
+                                 len(auto_retried), ", ".join(sorted(auto_retried)))
+
                 new_pkgs = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
 
                 if new_pkgs:
@@ -2145,6 +2212,13 @@ def run_daemon(config_path: str, debug: bool):
             try:
                 # a. Resolve PKGBUILD (with pkgbase fallback for split packages)
                 pkg_priority = config["package_tier_overrides"].get(name) or config["repo_priority"]
+                # If this package previously failed with a tier-specific dep or source
+                # error, skip that tier and try the next one in priority order.
+                _failed_tier = (failed.get(name) or {}).get("failed_tier")
+                if _failed_tier and _failed_tier in pkg_priority and len(pkg_priority) > 1:
+                    pkg_priority = [t for t in pkg_priority if t != _failed_tier]
+                    log.info("[%s] skipping failed tier '%s' (dep/source error) — trying: %s",
+                             name, _failed_tier, pkg_priority)
                 pkgbuild_dir, tier = resolve_pkgbuild(
                     name,
                     config["pkgbuilds_dir"],
@@ -2371,6 +2445,32 @@ def run_daemon(config_path: str, debug: bool):
                                 "[%s] download FAILED %d times — giving up (tier: %s)",
                                 name, limit, tier,
                             )
+                        continue
+
+                    # Dep/source failure — tier-specific, record the failing tier so
+                    # the next attempt skips it and tries the next one in priority order.
+                    if failure_type and (failure_type.startswith("dep:") or failure_type == "missing_source"):
+                        if failure_type.startswith("dep:"):
+                            _dep = failure_type[4:]
+                            _reason = f"missing makedep: {_dep}"
+                            _etype = "dep"
+                        else:
+                            _reason = "source file missing from PKGBUILD directory"
+                            _etype = "missing_source"
+                        _now_iso = datetime.now(timezone.utc).isoformat()
+                        failed[name] = {
+                            "version": pkg["version"],
+                            "reason": _reason,
+                            "timestamp": _now_iso,
+                            "first_failed_at": failed.get(name, {}).get("first_failed_at", _now_iso),
+                            "retries": failed.get(name, {}).get("retries", 0) + 1,
+                            "error_type": _etype,
+                            "failed_tier": tier,
+                        }
+                        save_failed(config["failed_path"], failed)
+                        cycle_stats["failed"] += 1
+                        log.error("[%s] build FAILED after %ds — %s (tier: %s, will retry on next tier)",
+                                  name, int(duration), _reason, tier)
                         continue
 
                     # Compile/link/etc failure — pull last non-empty line from log as reason

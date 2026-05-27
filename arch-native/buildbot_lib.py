@@ -80,9 +80,14 @@ RE_DOWNLOAD_FAILURE = re.compile(
     r"|Connection reset by peer"
     r"|429 Too Many Requests"
     r"|SSL certificate problem"
-    r"|error: Could not resolve"
+    r"|error: Could not resolve host"
     r"|Network is unreachable"
 )
+# Missing makedep — pacman can't find a required build dependency in any repo.
+# This is tier-specific, not transient: retrying on the same tier will always fail.
+RE_DEP_NOT_FOUND = re.compile(r"error: target not found: (\S+)")
+# Missing source file — the PKGBUILD lists a local file that isn't in the directory.
+RE_SOURCE_NOT_FOUND = re.compile(r"was not found in the build directory and is not a URL")
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1045,23 @@ def build_package(
         # Check for LTO errors
         with open(log_file, "r", errors="replace") as lf:
             build_output = lf.read()
+
+        # Missing makedep — tier-specific, retrying won't help. Return a typed
+        # error so the daemon can skip this tier and try the next one.
+        dep_match = RE_DEP_NOT_FOUND.search(build_output)
+        if dep_match:
+            missing = dep_match.group(1)
+            log.warning("[%s] missing makedep '%s' — will try next tier", pkg["name"], missing)
+            _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                           remove_packages=True)
+            return False, [], f"dep:{missing}"
+
+        # Missing source file listed in PKGBUILD — also tier-specific.
+        if RE_SOURCE_NOT_FOUND.search(build_output):
+            log.warning("[%s] source file not found in PKGBUILD directory", pkg["name"])
+            _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                           remove_packages=True)
+            return False, [], "missing_source"
 
         # Check for download failure before LTO retry (download failures are
         # transient — no point retrying with LTO disabled).
