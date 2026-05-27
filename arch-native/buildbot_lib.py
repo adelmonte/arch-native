@@ -301,6 +301,16 @@ def _strip_local_pkgrel_bump(version: str) -> str:
     return f"{pkgver}-{base_pkgrel}"
 
 
+# Statuses that mean "don't queue this package for a rebuild right now."
+# All four are checked together in several places; the constant avoids drift.
+_DEFERRED_STATUSES = frozenset({
+    "ineligible",           # arch=any or otherwise not rebuildable
+    "pending_upstream",     # PKGBUILD is older than installed; waiting for upstream
+    "pending_world_cascade",# built and staged; waiting for soname to land in world repos
+    "world_superseded",     # forge entry withdrawn; distro repo now serves this package
+})
+
+
 def diff_manifest(
     manifest: list,
     built: dict,
@@ -1336,6 +1346,44 @@ def prune_uninstalled_from_repo(
 
     log.info("Removed %d uninstalled package(s) from repo: %s", len(to_remove), ", ".join(to_remove))
     return to_remove
+
+
+def prune_stale_pkgbuild_clones(
+    pkgbuilds_dir: str,
+    tier_sources: dict,
+    current_names: set[str],
+) -> list[str]:
+    """Delete per-package PKGBUILD clone dirs for packages no longer in use.
+
+    Only applies to clone-type and pkgctl-type tiers (one directory per package).
+    Monorepo tiers (a single git checkout covering all packages) are not touched.
+
+    current_names should be the union of:
+      - manifest package names (currently installed on the desktop)
+      - built.json names for packages not world_superseded (avoid pruning
+        a clone the day a package is removed, giving it one cycle of grace)
+    """
+    import shutil
+    removed = []
+    for tier, src in tier_sources.items():
+        if src.get("type") not in ("clone", "pkgctl"):
+            continue
+        tier_dir = os.path.join(pkgbuilds_dir, tier)
+        if not os.path.isdir(tier_dir):
+            continue
+        for entry in os.listdir(tier_dir):
+            full = os.path.join(tier_dir, entry)
+            if not os.path.isdir(full):
+                continue
+            if entry not in current_names:
+                try:
+                    shutil.rmtree(full)
+                    removed.append(f"{tier}/{entry}")
+                except Exception as e:
+                    log.warning("Failed to remove stale PKGBUILD clone %s: %s", full, e)
+    if removed:
+        log.info("Removed %d stale PKGBUILD clone(s): %s", len(removed), ", ".join(removed))
+    return removed
 
 
 def _read_pacman_db(db_path: str) -> dict[str, str]:

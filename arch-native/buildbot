@@ -31,6 +31,7 @@ from buildbot_lib import (
     get_built_state,
     save_built_state,
     diff_manifest,
+    _DEFERRED_STATUSES,
     build_pkgbase_map,
     resolve_pkgbuild,
     parse_srcinfo,
@@ -55,6 +56,7 @@ from buildbot_lib import (
     prune_blacklisted_from_repo,
     prune_uninstalled_from_repo,
     prune_world_superseded_from_repo,
+    prune_stale_pkgbuild_clones,
 )
 
 # ---------------------------------------------------------------------------
@@ -605,7 +607,7 @@ def cmd_status(args, config: dict) -> int:
     for n, e in built.items():
         if not (isinstance(e, dict) and e.get("built_at")):
             continue
-        if e.get("status") in ("ineligible", "pending_upstream", "pending_world_cascade", "world_superseded"):
+        if e.get("status") in _DEFERRED_STATUSES:
             continue
         try:
             ts = datetime.fromisoformat(e["built_at"])
@@ -622,7 +624,7 @@ def cmd_status(args, config: dict) -> int:
         manifest = (read_local_packages() if config.get("mode") == "local"
                     else load_manifest(config["manifest_path"]))
         installed_total = len(manifest)
-        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade", "world_superseded"))
+        rebuilt_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") not in _DEFERRED_STATUSES)
         blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
         ineligible_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "ineligible")
         cascade_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "pending_world_cascade")
@@ -994,7 +996,7 @@ def cmd_failed_list(args, config: dict) -> int:
 def cmd_built(args, config: dict) -> int:
     built = get_built_state(config["state_path"])
     rows = sorted(
-        ((k, v) for k, v in built.items() if v.get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade")),
+        ((k, v) for k, v in built.items() if v.get("status") not in _DEFERRED_STATUSES),
         key=lambda kv: kv[1].get("built_at", ""),
         reverse=True,
     )
@@ -1013,6 +1015,141 @@ def cmd_built(args, config: dict) -> int:
     if any("." in rec.get("version","").rsplit("-",1)[-1] for _, rec in rows[:limit]):
         print("\n  * pkgrel x.N = locally bumped rebuild (upstream pkgrel unchanged)")
     return 0
+
+
+def cmd_why(args, config: dict) -> int:
+    """Explain in plain English why a package is in its current state."""
+    pkg = args.package
+    built  = get_built_state(config["state_path"])
+    failed = load_failed(config["failed_path"])
+    pending = load_pending(config["pending_path"])
+
+    # Try to read manifest for installed version
+    try:
+        if config.get("mode") == "local":
+            manifest = read_local_packages()
+        else:
+            manifest = load_manifest(config["manifest_path"])
+        installed = next((p for p in manifest if p["name"] == pkg), None)
+    except Exception:
+        installed = None
+
+    built_rec   = built.get(pkg)
+    failed_rec  = failed.get(pkg)
+    pending_rec = next((p for p in pending if p["name"] == pkg), None)
+    status      = built_rec.get("status", "ok") if built_rec else None
+
+    installed_ver = installed["version"] if installed else None
+    forge_ver     = built_rec.get("version") if built_rec else None
+
+    def _age_str(iso: str) -> str:
+        try:
+            ts = datetime.fromisoformat(iso)
+            secs = int((datetime.now(timezone.utc) - ts).total_seconds())
+            if secs < 3600:  return f"{secs // 60}m ago"
+            if secs < 86400: return f"{secs // 3600}h ago"
+            return f"{secs // 86400}d ago"
+        except Exception:
+            return ""
+
+    print(f"\n  {pkg}\n")
+
+    if pending_rec:
+        reason = pending_rec.get("build_reason", "?")
+        queued_at = _age_str(pending_rec.get("queued_at", ""))
+        print(f"  Status    queued for build ({reason})  {queued_at}")
+        if forge_ver:
+            print(f"  In forge  {forge_ver}")
+        if installed_ver:
+            print(f"  Installed {installed_ver}")
+        print()
+        return 0
+
+    if status == "ok" or (built_rec and status not in _DEFERRED_STATUSES):
+        built_at = _age_str(built_rec.get("built_at", ""))
+        print(f"  Status    ok — in forge repo")
+        print(f"  Version   {forge_ver}  (built {built_at})")
+        if installed_ver:
+            print(f"  Installed {installed_ver}")
+        print()
+        return 0
+
+    if status == "world_superseded":
+        print(f"  Status    deferred to distro")
+        print(f"  Forge had {forge_ver}")
+        if installed_ver:
+            print(f"  Installed {installed_ver}  ← distro is now serving this")
+        print()
+        print("  Forge's repo entry was withdrawn because the desktop has a newer version.")
+        print("  Your distro repo is serving the package. Forge will rebuild once a tier")
+        print("  PKGBUILD reaches the installed version or higher.")
+        print()
+        return 0
+
+    if status == "pending_upstream":
+        print(f"  Status    waiting for upstream PKGBUILD to catch up")
+        print(f"  Forge had {forge_ver}")
+        if installed_ver:
+            print(f"  Installed {installed_ver}")
+        print()
+        print("  The best available PKGBUILD is older than what's installed. Forge will")
+        print("  rebuild automatically once the PKGBUILD reaches the installed version.")
+        print()
+        return 0
+
+    if status == "pending_world_cascade":
+        print(f"  Status    built, waiting for library soname update in distro repos")
+        print(f"  Version   {forge_ver}")
+        print()
+        print("  The package was built successfully but uses a library whose new soname")
+        print("  hasn't landed in the distro repos yet. It will be released automatically")
+        print("  once the distro ships the updated library.")
+        print()
+        return 0
+
+    if status == "ineligible":
+        print(f"  Status    not rebuilt (arch=any or explicitly excluded)")
+        print(f"  Version   {forge_ver or '—'}")
+        print()
+        print("  This package is architecture-independent (arch=any) and doesn't benefit")
+        print("  from native CPU optimisation, so forge skips it.")
+        print()
+        return 0
+
+    if failed_rec:
+        retries = failed_rec.get("retries", 0)
+        reason  = failed_rec.get("reason", "unknown")
+        failed_tier = failed_rec.get("failed_tier", "")
+        ts = _age_str(failed_rec.get("timestamp", ""))
+        log_path = failed_rec.get("log_path", "")
+        print(f"  Status    failed  ({retries} attempt{'s' if retries != 1 else ''})")
+        if installed_ver:
+            print(f"  Installed {installed_ver}")
+        print(f"  Reason    {reason}")
+        if failed_tier:
+            print(f"  Tier skip [{failed_tier} skipped due to earlier dep/source error]")
+        if ts:
+            print(f"  Last try  {ts}")
+        if log_path:
+            print(f"  Log       {log_path}")
+        print()
+        print(f"  Re-queue: buildbot retry {pkg}")
+        print(f"  Dismiss:  buildbot clear {pkg}")
+        print()
+        return 0
+
+    if installed and not built_rec:
+        print(f"  Status    never attempted")
+        print(f"  Installed {installed_ver}")
+        print()
+        print("  This package is installed but forge has never tried to build it.")
+        print("  It will be queued on the next build cycle.")
+        print()
+        return 0
+
+    print(f"  {pkg!r} is not installed and has no forge build record.")
+    print()
+    return 1
 
 
 def cmd_logs(args, config: dict) -> int:
@@ -1347,7 +1484,7 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
                 physical.setdefault(pn, []).append(fname)
 
     staged_names = {n for n, r in built.items() if r.get("status") in ("pending_world_cascade", "world_superseded")}
-    built_pkgs = {n: r for n, r in built.items() if r.get("status") not in ("ineligible", "pending_upstream", "pending_world_cascade", "world_superseded")}
+    built_pkgs = {n: r for n, r in built.items() if r.get("status") not in _DEFERRED_STATUSES}
     all_names = (set(db_pkgs) | set(physical) | set(built_pkgs)) - staged_names
 
     # Collect repairs as (action, name, extra)
@@ -1780,6 +1917,7 @@ def run_cli(args, config: dict) -> int:
         "status":  cmd_status,
         "doctor":  cmd_doctor,
         "built":   cmd_built,
+        "why":     cmd_why,
         "logs":    cmd_logs,
         "queue":   cmd_queue_show,
         "failed":  cmd_failed_list,
@@ -1795,6 +1933,116 @@ def run_cli(args, config: dict) -> int:
         return fn(args, config)
     print("error: unknown command")
     return 2
+
+
+# ---------------------------------------------------------------------------
+# Main loop helpers — extracted from run_daemon for readability
+# ---------------------------------------------------------------------------
+
+def _prune_cycle(config: dict, manifest: list, manifest_names: set, built: dict) -> dict:
+    """Run all autoprune operations for one cycle. Returns the updated built dict."""
+    if config.get("autoprune_blacklisted", True):
+        removed = prune_blacklisted_from_repo(
+            config["blacklist"], built,
+            config["repo_db"], config["repo_dir"],
+        )
+        if removed:
+            for name in removed:
+                built.pop(name, None)
+            save_built_state(config["state_path"], built)
+
+    if config.get("autoprune_uninstalled", True):
+        removed = prune_uninstalled_from_repo(
+            manifest_names, built,
+            config["repo_db"], config["repo_dir"],
+        )
+        if removed:
+            for name in removed:
+                built.pop(name, None)
+            save_built_state(config["state_path"], built)
+
+    if config.get("autoprune_world_superseded", True):
+        removed = prune_world_superseded_from_repo(
+            built, config["repo_db"], manifest,
+        )
+        if removed:
+            for name in removed:
+                if name in built:
+                    built[name]["status"] = "world_superseded"
+            save_built_state(config["state_path"], built)
+
+    if config.get("autoprune_pkgbuild_clones", True) and config.get("tier_sources"):
+        keep = manifest_names | {
+            n for n, r in built.items() if r.get("status") != "world_superseded"
+        }
+        prune_stale_pkgbuild_clones(config["pkgbuilds_dir"], config["tier_sources"], keep)
+
+    return built
+
+
+def _queue_from_manifest(config: dict, manifest: list, built: dict, pkgbase_map: dict) -> None:
+    """Auto-retry stalled packages, diff manifest, and populate the build queue."""
+    stall_auto_retry_days = config.get("stall_auto_retry_days", 3)
+    if stall_auto_retry_days > 0:
+        _failed_all = load_failed(config["failed_path"])
+        _now_utc = datetime.now(timezone.utc)
+        auto_retried = []
+        for _pkgname, _rec in list(_failed_all.items()):
+            if not _is_stalled(_rec, config):
+                continue
+            _ts = _rec.get("timestamp") or _rec.get("first_failed_at", "")
+            if not _ts:
+                continue
+            try:
+                _last = datetime.fromisoformat(_ts)
+                if (_now_utc - _last).days >= stall_auto_retry_days:
+                    del _failed_all[_pkgname]
+                    auto_retried.append(_pkgname)
+            except Exception:
+                pass
+        if auto_retried:
+            save_failed(config["failed_path"], _failed_all)
+            log.info("Auto-retried %d stalled package(s): %s",
+                     len(auto_retried), ", ".join(sorted(auto_retried)))
+
+    new_pkgs = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
+    if not new_pkgs:
+        log.info("No new or updated packages to build")
+        return
+
+    pending = load_pending(config["pending_path"])
+    failed_now = load_failed(config["failed_path"])
+    pending_names = {p["name"] for p in pending}
+    queued = queued_new = queued_update = skipped_existing = skipped_failed = skipped_stalled = 0
+    for pkg in new_pkgs:
+        if pkg["name"] in pending_names:
+            skipped_existing += 1
+            continue
+        failed_rec = failed_now.get(pkg["name"], {})
+        if failed_rec.get("version") == pkg["version"]:
+            skipped_failed += 1
+            continue
+        if _is_stalled(failed_rec, config):
+            skipped_stalled += 1
+            continue
+        pkg["queued_at"] = datetime.now(timezone.utc).isoformat()
+        pending.append(pkg)
+        queued += 1
+        if pkg["build_reason"] == "new":
+            queued_new += 1
+        elif pkg["build_reason"] == "update":
+            queued_update += 1
+    save_pending(config["pending_path"], pending)
+    log.info(
+        "Manifest queue update: queued=%d (new=%d update=%d), "
+        "skipped_existing=%d, skipped_failed=%d, skipped_stalled=%d",
+        queued, queued_new, queued_update, skipped_existing, skipped_failed, skipped_stalled,
+    )
+    if skipped_stalled:
+        log.warning(
+            "%d package(s) stalled (>=%d failures or >=%d days) — run: buildbot failed",
+            skipped_stalled, config.get("failed_stall_retries", 5), config.get("failed_stall_days", 7),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1981,106 +2229,8 @@ def run_daemon(config_path: str, debug: bool):
                     log.info("Pruned stale queue entries: %d pending, %d failed removed", pp, pf)
 
                 built = get_built_state(config["state_path"])
-
-                # Remove newly-blacklisted packages from the repo
-                if config.get("autoprune_blacklisted", True):
-                    removed = prune_blacklisted_from_repo(
-                        config["blacklist"], built,
-                        config["repo_db"], config["repo_dir"],
-                    )
-                    if removed:
-                        for name in removed:
-                            built.pop(name, None)
-                        save_built_state(config["state_path"], built)
-
-                # Remove packages no longer in the client manifest from the repo
-                if config.get("autoprune_uninstalled", True):
-                    removed = prune_uninstalled_from_repo(
-                        manifest_names, built,
-                        config["repo_db"], config["repo_dir"],
-                    )
-                    if removed:
-                        for name in removed:
-                            built.pop(name, None)
-                        save_built_state(config["state_path"], built)
-
-                # Withdraw forge DB entries where the desktop has a newer version.
-                # Uses the manifest (what's actually installed) so pruning decisions
-                # match the desktop's world view, not the build chroot's Arch-only view.
-                if config.get("autoprune_world_superseded", True):
-                    removed = prune_world_superseded_from_repo(
-                        built, config["repo_db"], manifest,
-                    )
-                    if removed:
-                        for name in removed:
-                            if name in built:
-                                built[name]["status"] = "world_superseded"
-                        save_built_state(config["state_path"], built)
-
-                # Auto-retry packages stalled past the configured interval.
-                # Clears their failed entry so diff_manifest re-queues them.
-                stall_auto_retry_days = config.get("stall_auto_retry_days", 3)
-                if stall_auto_retry_days > 0:
-                    _failed_all = load_failed(config["failed_path"])
-                    _now_utc = datetime.now(timezone.utc)
-                    auto_retried = []
-                    for _pkgname, _rec in list(_failed_all.items()):
-                        if not _is_stalled(_rec, config):
-                            continue
-                        _ts = _rec.get("timestamp") or _rec.get("first_failed_at", "")
-                        if not _ts:
-                            continue
-                        try:
-                            _last = datetime.fromisoformat(_ts)
-                            if (_now_utc - _last).days >= stall_auto_retry_days:
-                                del _failed_all[_pkgname]
-                                auto_retried.append(_pkgname)
-                        except Exception:
-                            pass
-                    if auto_retried:
-                        save_failed(config["failed_path"], _failed_all)
-                        log.info("Auto-retried %d stalled package(s): %s",
-                                 len(auto_retried), ", ".join(sorted(auto_retried)))
-
-                new_pkgs = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
-
-                if new_pkgs:
-                    pending = load_pending(config["pending_path"])
-                    failed_now = load_failed(config["failed_path"])
-                    pending_names = {p["name"] for p in pending}
-                    queued = queued_new = queued_update = skipped_existing = skipped_failed = skipped_stalled = 0
-                    for pkg in new_pkgs:
-                        if pkg["name"] in pending_names:
-                            skipped_existing += 1
-                            continue
-                        failed_rec = failed_now.get(pkg["name"], {})
-                        # Don't re-add if already failed at this exact version
-                        if failed_rec.get("version") == pkg["version"]:
-                            skipped_failed += 1
-                            continue
-                        # Don't re-add stalled packages — they need human attention
-                        if _is_stalled(failed_rec, config):
-                            skipped_stalled += 1
-                            continue
-                        pkg["queued_at"] = datetime.now(timezone.utc).isoformat()
-                        pending.append(pkg)
-                        queued += 1
-                        if pkg["build_reason"] == "new":
-                            queued_new += 1
-                        elif pkg["build_reason"] == "update":
-                            queued_update += 1
-                    save_pending(config["pending_path"], pending)
-                    log.info(
-                        "Manifest queue update: queued=%d (new=%d update=%d), skipped_existing=%d, skipped_failed=%d, skipped_stalled=%d",
-                        queued, queued_new, queued_update, skipped_existing, skipped_failed, skipped_stalled,
-                    )
-                    if skipped_stalled:
-                        log.warning(
-                            "%d package(s) stalled (>=%d failures or >=%d days) — run: buildbot failed",
-                            skipped_stalled, config.get("failed_stall_retries", 5), config.get("failed_stall_days", 7),
-                        )
-                else:
-                    log.info("No new or updated packages to build")
+                built = _prune_cycle(config, manifest, manifest_names, built)
+                _queue_from_manifest(config, manifest, built, pkgbase_map)
         except Exception as e:
             log.error("Error processing manifest: %s", e)
 
@@ -2656,6 +2806,7 @@ def main():
     buildbot status
     buildbot doctor
     buildbot built    [-n N]
+    buildbot why      <PKG>
     buildbot logs     <PKG> [-f]
     buildbot queue    [-n N]
     buildbot failed   [-n N]
@@ -2703,6 +2854,13 @@ def main():
         description="List packages successfully rebuilt by arch-native, newest first.")
     p_built.add_argument("-n", type=int, default=0, dest="limit", metavar="N",
         help="max entries to show  (default: all)")
+
+    p_why = sub.add_parser("why",
+        usage="buildbot why <PKG>",
+        formatter_class=_HelpFormatter,
+        description="Explain in plain English why PKG is in its current state — "
+                    "ok, failed, deferred to distro, waiting for upstream, etc.")
+    p_why.add_argument("package", metavar="PKG")
 
     p_logs = sub.add_parser("logs",
         usage="buildbot logs <PKG> [-f]",
