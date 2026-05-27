@@ -1402,7 +1402,17 @@ def prune_world_superseded_from_repo(
     to_remove = []
     for pkgname, forge_ver in forge_db.items():
         world_ver = world_versions.get(pkgname)
-        if world_ver and vercmp(world_ver, forge_ver) > 0:
+        if not world_ver:
+            continue
+        # Only prune when world has a strictly newer PKGVER (upstream release).
+        # Pkgrel differences (e.g. chroot's Arch extra having pkgrel-2 while
+        # the desktop's CachyOS galaxy has pkgrel-1) are handled by the upstream
+        # check + rebuild loop, not the pruner.  Pruning on pkgrel alone causes
+        # forge entries to be withdrawn for packages the user still wants from
+        # forge, producing spurious "local is newer" warnings on the desktop.
+        forge_pkgver = forge_ver.rsplit("-", 1)[0] if "-" in forge_ver else forge_ver
+        world_pkgver = world_ver.rsplit("-", 1)[0] if "-" in world_ver else world_ver
+        if vercmp(world_pkgver, forge_pkgver) > 0:
             to_remove.append(pkgname)
 
     if not to_remove:
