@@ -593,6 +593,8 @@ def resolve_pkgbuild(
             continue
         kind = src["type"]
 
+        candidates_before = len(candidates)
+
         if kind == "clone":
             tier_dir = os.path.join(pkgbuilds_dir, tier, pkgname)
             if not os.path.isdir(tier_dir):
@@ -601,7 +603,7 @@ def resolve_pkgbuild(
                 result = _git(["clone", "--depth=1", url, tier_dir],
                               capture_output=True, text=True)
                 if result.returncode != 0:
-                    log.debug("[%s] %s clone failed (package not in this tier)", pkgname, tier)
+                    log.debug("[%s] %s: not in this tier (clone failed)", pkgname, tier)
             else:
                 r = _git(["-C", tier_dir, "pull", "--ff-only"], capture_output=True)
                 if r.returncode != 0:
@@ -636,7 +638,7 @@ def resolve_pkgbuild(
                                tier_dir],
                               capture_output=True, text=True)
                 if result.returncode != 0:
-                    log.debug("[%s] pkgctl clone failed: %s", pkgname, result.stderr.strip()[:120])
+                    log.debug("[%s] %s: not found via pkgctl (clone failed)", pkgname, tier)
             else:
                 r = _git(["-C", tier_dir, "pull", "--ff-only"], capture_output=True)
                 if r.returncode != 0:
@@ -645,6 +647,9 @@ def resolve_pkgbuild(
             if os.path.isfile(os.path.join(tier_dir, "PKGBUILD")):
                 _fix_ownership(tier_dir)
                 candidates.append((tier_dir, tier))
+
+        if len(candidates) == candidates_before:
+            log.debug("[%s] %s: no PKGBUILD found in this tier", pkgname, tier)
 
         if candidates and version_select == "priority":
             break  # first tier match wins
@@ -1364,14 +1369,19 @@ def _read_pacman_db(db_path: str) -> dict[str, str]:
 def prune_world_superseded_from_repo(
     built: dict,
     repo_db_path: str,
-    repo_name: str,
-    sync_dir: str,
+    manifest: list[dict],
 ) -> list[str]:
-    """Remove forge DB entries where a world repo has a strictly newer version.
+    """Remove forge DB entries where the desktop manifest has a strictly newer version.
 
-    Called each cycle after upgrade_chroot() — the chroot's sync DBs are always
-    fresh, so this catches packages that stalled in the failed queue and whose
-    forge DB entry is now blocking pacman from seeing the world upgrade.
+    Uses the desktop manifest (what is actually installed) rather than the build
+    chroot's sync DBs.  The chroot sees Arch's world; the desktop sees CachyOS's
+    world.  When CachyOS ships python 3.14.5-2 and forge has 3.14.5-1.1, a
+    chroot-DB comparison (pkgver-only) would never prune, letting forge block the
+    CachyOS package forever.  Comparing against the manifest uses the real version
+    the user has and naturally handles both cases:
+
+      - Desktop has wget 1.25.0-4, forge has 1.25.0-4.1  →  forge wins  →  no prune
+      - Desktop has python 3.14.5-2, forge has 3.14.5-1.1  →  manifest wins  →  prune
 
     Returns the list of package names removed from the DB (caller updates built.json).
     """
@@ -1382,37 +1392,22 @@ def prune_world_superseded_from_repo(
     if not forge_db:
         return []
 
-    if not os.path.isdir(sync_dir):
-        log.debug("prune_world_superseded: sync_dir %s not found, skipping", sync_dir)
+    if not manifest:
+        log.debug("prune_world_superseded: manifest is empty, skipping")
         return []
 
-    # Build {pkgname: best_world_version} across all non-forge sync DBs
-    world_versions: dict[str, str] = {}
-    for fname in os.listdir(sync_dir):
-        if not fname.endswith(".db"):
-            continue
-        if fname[:-3] == repo_name:
-            continue
-        db_path = os.path.join(sync_dir, fname)
-        for pkgname, version in _read_pacman_db(db_path).items():
-            existing = world_versions.get(pkgname)
-            if existing is None or vercmp(version, existing) > 0:
-                world_versions[pkgname] = version
+    world_versions: dict[str, str] = {pkg["name"]: pkg["version"] for pkg in manifest}
 
     to_remove = []
     for pkgname, forge_ver in forge_db.items():
         world_ver = world_versions.get(pkgname)
         if not world_ver:
             continue
-        # Only prune when world has a strictly newer PKGVER (upstream release).
-        # Pkgrel differences (e.g. chroot's Arch extra having pkgrel-2 while
-        # the desktop's CachyOS galaxy has pkgrel-1) are handled by the upstream
-        # check + rebuild loop, not the pruner.  Pruning on pkgrel alone causes
-        # forge entries to be withdrawn for packages the user still wants from
-        # forge, producing spurious "local is newer" warnings on the desktop.
-        forge_pkgver = forge_ver.rsplit("-", 1)[0] if "-" in forge_ver else forge_ver
-        world_pkgver = world_ver.rsplit("-", 1)[0] if "-" in world_ver else world_ver
-        if vercmp(world_pkgver, forge_pkgver) > 0:
+        # Prune when the installed version is strictly newer than what forge provides.
+        # Full version comparison (including pkgrel) is correct here because world_ver
+        # is the desktop's actual installed version — not the chroot's distro-specific
+        # view — so pkgrel differences are meaningful.
+        if vercmp(world_ver, forge_ver) > 0:
             to_remove.append(pkgname)
 
     if not to_remove:
