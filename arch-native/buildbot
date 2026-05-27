@@ -206,8 +206,8 @@ def load_config(path: str) -> dict:
     cfg["tier_sources"] = tier_sources
 
     pkg_tier_overrides = {}
-    if parser.has_section("package_tiers"):
-        for pkgname, tiers_raw in parser.items("package_tiers"):
+    if cp.has_section("package_tiers"):
+        for pkgname, tiers_raw in cp.items("package_tiers"):
             tiers = [t.strip().lower() for t in tiers_raw.split(",") if t.strip()]
             if tiers:
                 pkg_tier_overrides[pkgname] = tiers
