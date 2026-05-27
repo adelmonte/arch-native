@@ -184,7 +184,7 @@ See [Service management](#service-management) below for your init system.
 ### 7. Add the repo to pacman.conf
 
 Edit `/etc/pacman.conf` on the machine that will use the packages. Place the
-repo **after your distro repos but before `[extra]`**:
+repo **before your distro repos**:
 
 ```ini
 [myrepo]
@@ -198,10 +198,20 @@ Include = ...
 Include = ...
 ```
 
-Placing forge first is safe. The `.x` pkgrel bump means forge always holds
-`pkgrel=N.1`. When upstream releases a new pkgrel (`N+1`), vercmp sees
-`N+1 > N.1` and the upgrade shows through normally. Forge only wins when it
-has actually rebuilt the package at the current upstream version.
+Placing forge first is safe for two reasons:
+
+1. **pkgrel versioning** — forge packages carry a `.N` build suffix on the pkgrel
+   (e.g. `1.2.3-2.1` instead of `1.2.3-2`). If upstream later bumps to pkgrel 3,
+   vercmp sees `3 > 2.1` and the world upgrade shows through normally. Forge only
+   wins when it has rebuilt at the exact same upstream version.
+
+2. **Cycle-based pruning** — each build cycle, buildbot compares every forge DB
+   entry against the chroot's world sync databases. If world has a strictly newer
+   *pkgver* (e.g. `2.0` vs forge's `1.9`), the forge entry is withdrawn so pacman
+   can offer the world upgrade directly. Withdrawn packages are queued for rebuild
+   against the new source; once built, the forge entry is restored. This means
+   forge never permanently blocks a world update — at most it delays it by one
+   build cycle.
 
 For local mode the server is `localhost`. For remote mode use the build
 server's hostname or IP.
@@ -510,12 +520,28 @@ autoprune_blacklisted = true
 # Default: true.
 autoprune_uninstalled = true
 
+# Withdraw forge DB entries when world has a strictly newer pkgver.
+# Each cycle, every package in the forge DB is compared against the chroot's
+# world sync databases (extra, galaxy, etc.). If world's pkgver is higher
+# (pkgrel differences are ignored), the forge entry is removed so clients can
+# pull the world upgrade directly. The package is queued for rebuild against
+# the new source; once built, the forge entry is restored.
+# Default: true.
+autoprune_world_superseded = true
+
 # Packages that keep failing are eventually marked "stalled" and excluded from
 # automatic re-queue. A package is stalled when it has failed >= this many times
 # AND its most recent failure is >= failed_stall_days days ago.
 # Default: retries=5, days=7.
 # failed_stall_retries = 5
 # failed_stall_days = 7
+
+# Auto-retry stalled packages after this many days.
+# Once a package has been in the stalled state for stall_auto_retry_days, its
+# failure record is cleared and it is re-queued for a fresh build attempt.
+# Set to 0 to disable auto-retry (stalled packages require manual intervention).
+# Default: 3.
+# stall_auto_retry_days = 3
 ```
 
 ### Timing
