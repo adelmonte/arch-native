@@ -37,7 +37,7 @@ upgrades=()
 while IFS=' ' read -r pkg inst_ver; do
     forge_ver="${forge_versions[$pkg]:-}"
     [[ -z "$forge_ver" ]] && continue
-    (( installed_count++ ))
+    (( ++installed_count ))
     if (( $(vercmp "$forge_ver" "$inst_ver") > 0 )); then
         upgrades+=("${FORGE_REPO}/${pkg}")
     fi
