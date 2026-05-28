@@ -33,8 +33,10 @@ fi
 
 # Find installed packages where forge has a strictly newer version.
 installed_count=0
+total_installed=0
 upgrades=()
 while IFS=' ' read -r pkg inst_ver; do
+    (( ++total_installed ))
     forge_ver="${forge_versions[$pkg]:-}"
     [[ -z "$forge_ver" ]] && continue
     (( ++installed_count ))
@@ -43,7 +45,7 @@ while IFS=' ' read -r pkg inst_ver; do
     fi
 done < <(pacman -Q 2>/dev/null)
 
-echo "forge-sync: ${installed_count}/${#forge_versions[@]} forge packages installed locally"
+echo "forge-sync: ${installed_count}/${total_installed} installed packages are from forge"
 
 if [[ ${#upgrades[@]} -eq 0 ]]; then
     echo "forge-sync: nothing to upgrade"
