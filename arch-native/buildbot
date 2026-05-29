@@ -214,6 +214,15 @@ def load_config(path: str) -> dict:
                 pkg_tier_overrides[pkgname] = tiers
     cfg["package_tier_overrides"] = pkg_tier_overrides
 
+    pkg_timeouts = {}
+    if cp.has_section("package_timeouts"):
+        for pkgname, val in cp.items("package_timeouts"):
+            try:
+                pkg_timeouts[pkgname.strip()] = int(val.strip())
+            except ValueError:
+                log.warning("Ignoring invalid package_timeouts entry: %s = %s", pkgname, val)
+    cfg["package_timeouts"] = pkg_timeouts
+
     blacklist_str = sec.get("blacklist", "gcc,glibc,coreutils,linux-api-headers")
     cfg["blacklist"] = [s.strip() for s in blacklist_str.split(",") if s.strip()]
 

@@ -490,6 +490,21 @@ The patch commands (`buildbot patch create`, `buildbot patch check`) also
 respect per-package overrides — the patch is created against the upstream tier
 specified in the override, not the global priority.
 
+### Per-package timeout overrides
+
+Add an optional `[package_timeouts]` section to override `build_timeout` for
+specific packages. Useful for packages that legitimately take longer than the
+global limit (or to set a tighter limit on packages that should build quickly).
+
+```ini
+[package_timeouts]
+firefox = 28800   # 8 hours
+llvm    = 28800
+rust    = 21600   # 6 hours
+```
+
+Packages not listed here use the global `build_timeout`.
+
 ### Blacklists
 
 ```ini
@@ -506,9 +521,7 @@ to add.
 ### Build behavior
 
 ```ini
-# Per-package build timeout in seconds.
-# Large packages (Firefox, LLVM) legitimately take 2–3 hours.
-# Set to 0 to disable. Default: 14400 (4 hours).
+# Global build timeout in seconds. Set to 0 to disable. Default: 14400 (4 hours).
 build_timeout = 14400
 
 # Re-queue transient download failures (rate limits, SSL errors, connection

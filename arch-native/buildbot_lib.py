@@ -1019,7 +1019,8 @@ def build_package(
 
         log.info("[%s] running: %s", pkg["name"], " ".join(cmd))
 
-        timeout = config.get("build_timeout")
+        pkg_timeouts = config.get("package_timeouts") or {}
+        timeout = pkg_timeouts.get(pkg["name"]) or config.get("build_timeout")
         with open(logpath, "w") as lf:
             proc = subprocess.Popen(
                 cmd,
