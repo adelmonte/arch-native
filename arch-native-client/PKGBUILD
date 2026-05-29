@@ -9,12 +9,16 @@ depends=('rsync' 'pacman' 'python')
 install=arch-native-client.install
 
 package() {
-    # Sync script
+    # Manifest export script + hook (syncs package list to build server)
     install -Dm755 "$startdir/pkglist-export"   "$pkgdir/usr/bin/pkglist-export"
-
-    # Pacman hook (fires after every transaction)
     install -Dm644 "$startdir/pkglist-export.hook" \
         "$pkgdir/usr/share/libalpm/hooks/pkglist-export.hook"
+
+    # Forge upgrade script + hook (upgrades installed packages from forge after each transaction)
+    install -Dm755 "$startdir/forge-sync"       "$pkgdir/usr/bin/forge-sync"
+    install -Dm755 "$startdir/forge-sync-defer" "$pkgdir/usr/bin/forge-sync-defer"
+    install -Dm644 "$startdir/forge-sync.hook" \
+        "$pkgdir/usr/share/libalpm/hooks/forge-sync.hook"
 
     # Example config
     install -Dm644 "$startdir/arch-native-client.conf.example" \

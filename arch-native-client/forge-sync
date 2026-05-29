@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# forge-sync — Upgrade installed packages where forge has a newer build.
+#
+# Run manually or automatically via the forge-sync.hook PostTransaction hook.
+# Set FORGE_REPO to override the repository name (default: forge).
+
+set -euo pipefail
+
+FORGE_REPO="${FORGE_REPO:-forge}"
+
+# Prevent recursive invocation: the pacman -S call below fires this hook again.
+LOCKFILE=/run/forge-sync.lock
+if [[ -e "$LOCKFILE" ]]; then
+    exit 0
+fi
+touch "$LOCKFILE"
+trap 'rm -f "$LOCKFILE"' EXIT
+
+# Sync all DBs (redundant when called from a PostTransaction hook since
+# pacman already synced them, but needed for manual runs).
+pacman -Sy >/dev/null 2>&1 || true
+
+# Build a map of forge package → version in one pass.
+declare -A forge_versions
+while IFS=' ' read -r _ pkg ver _rest; do
+    forge_versions["$pkg"]="$ver"
+done < <(pacman -Sl "$FORGE_REPO" 2>/dev/null)
+
+if [[ ${#forge_versions[@]} -eq 0 ]]; then
+    echo "forge-sync: forge repo is empty or unreachable"
+    exit 0
+fi
+
+# Find installed packages where forge has a strictly newer version.
+upgrades=()
+while IFS=' ' read -r pkg inst_ver; do
+    forge_ver="${forge_versions[$pkg]:-}"
+    [[ -z "$forge_ver" ]] && continue
+    if (( $(vercmp "$forge_ver" "$inst_ver") > 0 )); then
+        upgrades+=("${FORGE_REPO}/${pkg}")
+    fi
+done < <(pacman -Q 2>/dev/null)
+
+if [[ ${#upgrades[@]} -eq 0 ]]; then
+    echo "forge-sync: nothing to upgrade"
+    exit 0
+fi
+
+echo "forge-sync: upgrading ${#upgrades[@]} package(s) from forge"
+pacman -S --noconfirm --needed "${upgrades[@]}"

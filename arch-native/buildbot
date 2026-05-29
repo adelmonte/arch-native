@@ -55,7 +55,6 @@ from buildbot_lib import (
     ignore_special_files,
     prune_blacklisted_from_repo,
     prune_uninstalled_from_repo,
-    prune_world_superseded_from_repo,
     prune_stale_pkgbuild_clones,
 )
 
@@ -116,7 +115,6 @@ def load_config(path: str) -> dict:
     cfg["autoprune_keep"] = max(1, sec.getint("autoprune_keep", 1))
     cfg["autoprune_blacklisted"] = sec.getboolean("autoprune_blacklisted", True)
     cfg["autoprune_uninstalled"] = sec.getboolean("autoprune_uninstalled", True)
-    cfg["autoprune_world_superseded"] = sec.getboolean("autoprune_world_superseded", True)
     cfg["stall_auto_retry_days"] = sec.getint("stall_auto_retry_days", 3)
     cfg["log_level"] = sec.get("log_level", "INFO")
     cfg["failed_stall_retries"] = sec.getint("failed_stall_retries", 5)
@@ -628,7 +626,6 @@ def cmd_status(args, config: dict) -> int:
         blacklisted_count = sum(1 for p in manifest if _bl(p["name"]))
         ineligible_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "ineligible")
         cascade_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "pending_world_cascade")
-        superseded_count = sum(1 for p in manifest if p["name"] in built and built[p["name"]].get("status") == "world_superseded")
     except Exception:
         pass
 
@@ -746,15 +743,8 @@ def cmd_status(args, config: dict) -> int:
     if installed_total:
         pct = rebuilt_count / installed_total * 100
         row("rebuilt", f"{rebuilt_count} / {installed_total}  ({pct:.0f}%)")
-        pending_count = cascade_count + superseded_count
-        if pending_count:
-            if cascade_count and superseded_count:
-                detail = f"{superseded_count} updating · {cascade_count} releasing after lib update"
-            elif superseded_count:
-                detail = "rebuilding at newer version"
-            else:
-                detail = "built, releasing once library updates land"
-            row("pending", f"{pending_count}  {DIM}({detail}){R}")
+        if cascade_count:
+            row("pending", f"{cascade_count}  {DIM}(built, releasing once library updates land){R}")
         if blacklisted_count:
             row("blacklisted", f"{blacklisted_count} / {installed_total}  ({blacklisted_count / installed_total * 100:.0f}%)  {DIM}(see /etc/arch-native.conf){R}")
         if ineligible_count:
@@ -1071,18 +1061,6 @@ def cmd_why(args, config: dict) -> int:
         print(f"  Version   {forge_ver}  (built {built_at})")
         if installed_ver:
             print(f"  Installed {installed_ver}")
-        print()
-        return 0
-
-    if status == "world_superseded":
-        print(f"  Status    deferred to distro")
-        print(f"  Forge had {forge_ver}")
-        if installed_ver:
-            print(f"  Installed {installed_ver}  ← distro is now serving this")
-        print()
-        print("  Forge's repo entry was withdrawn because the desktop has a newer version.")
-        print("  Your distro repo is serving the package. Forge will rebuild once a tier")
-        print("  PKGBUILD reaches the installed version or higher.")
         print()
         return 0
 
@@ -1483,7 +1461,7 @@ def _run_fsck(config: dict, dry_run: bool = False, verbose: bool = False) -> tup
                 pn = _pkgname_from_filename(fname)
                 physical.setdefault(pn, []).append(fname)
 
-    staged_names = {n for n, r in built.items() if r.get("status") in ("pending_world_cascade", "world_superseded")}
+    staged_names = {n for n, r in built.items() if r.get("status") == "pending_world_cascade"}
     built_pkgs = {n: r for n, r in built.items() if r.get("status") not in _DEFERRED_STATUSES}
     all_names = (set(db_pkgs) | set(physical) | set(built_pkgs)) - staged_names
 
@@ -1961,21 +1939,8 @@ def _prune_cycle(config: dict, manifest: list, manifest_names: set, built: dict)
                 built.pop(name, None)
             save_built_state(config["state_path"], built)
 
-    if config.get("autoprune_world_superseded", True):
-        removed = prune_world_superseded_from_repo(
-            built, config["repo_db"], manifest,
-        )
-        if removed:
-            for name in removed:
-                if name in built:
-                    built[name]["status"] = "world_superseded"
-            save_built_state(config["state_path"], built)
-
     if config.get("autoprune_pkgbuild_clones", True) and config.get("tier_sources"):
-        keep = manifest_names | {
-            n for n, r in built.items() if r.get("status") != "world_superseded"
-        }
-        prune_stale_pkgbuild_clones(config["pkgbuilds_dir"], config["tier_sources"], keep)
+        prune_stale_pkgbuild_clones(config["pkgbuilds_dir"], config["tier_sources"], manifest_names)
 
     return built
 

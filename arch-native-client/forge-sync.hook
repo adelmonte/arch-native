@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Remove
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Scheduling forge package upgrades...
+When = PostTransaction
+Exec = /usr/bin/forge-sync-defer

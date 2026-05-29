@@ -184,34 +184,29 @@ See [Service management](#service-management) below for your init system.
 ### 7. Add the repo to pacman.conf
 
 Edit `/etc/pacman.conf` on the machine that will use the packages. Place the
-repo **before your distro repos**:
+repo **after your distro repos**:
 
 ```ini
-[myrepo]
-SigLevel = Required DatabaseOptional
-Server = http://your-build-host:8081/repo
-
 [core]            # or [system] on Artix
 Include = ...
 
 [extra]           # or [world] on Artix
 Include = ...
+
+[myrepo]
+SigLevel = Required DatabaseOptional
+Server = http://your-build-host:8081/repo
 ```
 
-Placing forge first is safe for two reasons:
+With forge last, distro upgrades flow through naturally — when upstream bumps a
+package, `pacman -Syu` picks it up because the new distro pkgver is higher. The
+`forge-sync` hook (installed with `arch-native-client`) then re-upgrades to the
+forge build once buildbot has rebuilt it for the new version.
 
-1. **pkgrel versioning** — forge packages carry a `.N` build suffix on the pkgrel
-   (e.g. `1.2.3-2.1` instead of `1.2.3-2`). If upstream later bumps to pkgrel 3,
-   vercmp sees `3 > 2.1` and the world upgrade shows through normally. Forge only
-   wins when it has rebuilt at the exact same upstream version.
-
-2. **Cycle-based pruning** — each build cycle, buildbot compares every forge DB
-   entry against the chroot's world sync databases. If world has a strictly newer
-   *pkgver* (e.g. `2.0` vs forge's `1.9`), the forge entry is withdrawn so pacman
-   can offer the world upgrade directly. Withdrawn packages are queued for rebuild
-   against the new source; once built, the forge entry is restored. This means
-   forge never permanently blocks a world update — at most it delays it by one
-   build cycle.
+Forge packages carry a `.N` pkgrel suffix (e.g. `2.3.1-1.1` instead of `2.3.1-1`).
+`vercmp` sees `1.1 > 1`, so `forge-sync` can detect that forge has a newer build
+and upgrade accordingly. When distro bumps to pkgrel `2`, vercmp sees `2 > 1.1`,
+so the distro upgrade flows through first.
 
 For local mode the server is `localhost`. For remote mode use the build
 server's hostname or IP.
@@ -382,6 +377,37 @@ Once the key is in place, verify end-to-end before relying on the hook:
 sudo pkglist-export
 ```
 
+### forge-sync
+
+`forge-sync` is the other hook installed by `arch-native-client`. It upgrades
+installed packages where forge has a newer build, and runs automatically as a
+PostTransaction hook after every pacman transaction. Run it manually at any time:
+
+```bash
+sudo forge-sync
+```
+
+The hook fires after `pkglist-export`, so a freshly installed package is included
+in the next buildbot cycle before forge-sync runs. Once buildbot builds it, the
+following `forge-sync` (or the next transaction's hook) picks it up.
+
+**"local is newer" warnings** — with forge last in `pacman.conf`, packages that
+have a forge build will produce `warning: pkg: local (1.2-1.1) is newer than
+extra (1.2-1)` during `pacman -Syu`. This is expected: the `.1` pkgrel suffix
+makes forge builds appear newer, which is how `forge-sync` detects they need
+upgrading. To suppress the warnings without hiding other output:
+
+```bash
+yay -Syu 2>&1 | grep -v " is newer than "
+```
+
+The `FORGE_REPO` environment variable overrides the repo name if yours differs
+from the default `forge`:
+
+```bash
+FORGE_REPO=myrepo forge-sync
+```
+
 ---
 
 ## Configuration reference
@@ -519,15 +545,6 @@ autoprune_blacklisted = true
 # and repo-db entry are removed on the next cycle.
 # Default: true.
 autoprune_uninstalled = true
-
-# Withdraw forge DB entries when world has a strictly newer pkgver.
-# Each cycle, every package in the forge DB is compared against the chroot's
-# world sync databases (extra, galaxy, etc.). If world's pkgver is higher
-# (pkgrel differences are ignored), the forge entry is removed so clients can
-# pull the world upgrade directly. The package is queued for rebuild against
-# the new source; once built, the forge entry is restored.
-# Default: true.
-autoprune_world_superseded = true
 
 # Packages that keep failing are eventually marked "stalled" and excluded from
 # automatic re-queue. A package is stalled when it has failed >= this many times
@@ -1100,9 +1117,13 @@ Or if you have a large AUR footprint, enumerate them explicitly.
 
 ### pkgrel dot-notation
 
-Upstream `pkgrel=2` → arch-native rebuilds as `pkgrel=2.1`. pacman sees
-`2.1 > 2` so locally-built packages take priority over official repos. When
-upstream bumps to `pkgrel=3`, arch-native rebuilds as `3.1`.
+Upstream `pkgrel=2` → arch-native rebuilds as `pkgrel=2.1`. When upstream
+bumps to `pkgrel=3`, arch-native rebuilds as `3.1`.
+
+With forge last in `pacman.conf`, `vercmp 2.1 2` is positive, so `forge-sync`
+detects that forge has a newer build and upgrades. When distro bumps to `pkgrel=3`,
+`vercmp 3 2.1` is positive, so `pacman -Syu` picks up the distro version first;
+`forge-sync` skips it until buildbot rebuilds at `3.1`.
 
 Version comparisons inside the daemon (detecting already-built packages,
 checking upstream updates) strip the local `.N` suffix before comparing:

@@ -302,12 +302,10 @@ def _strip_local_pkgrel_bump(version: str) -> str:
 
 
 # Statuses that mean "don't queue this package for a rebuild right now."
-# All four are checked together in several places; the constant avoids drift.
 _DEFERRED_STATUSES = frozenset({
     "ineligible",           # arch=any or otherwise not rebuildable
     "pending_upstream",     # PKGBUILD is older than installed; waiting for upstream
     "pending_world_cascade",# built and staged; waiting for soname to land in world repos
-    "world_superseded",     # forge entry withdrawn; distro repo now serves this package
 })
 
 
@@ -337,12 +335,6 @@ def diff_manifest(
 
         if name not in built:
             todo.append({**pkg, "build_reason": "new"})
-            continue
-
-        # World has a newer version and forge's DB entry was withdrawn — don't
-        # re-queue a rebuild of the stale PKGBUILD version. The upstream version
-        # check will re-queue once the PKGBUILD catches up to world.
-        if built[name].get("status") == "world_superseded":
             continue
 
         built_upstream = _strip_local_pkgrel_bump(built[name]["version"])
@@ -1358,10 +1350,8 @@ def prune_stale_pkgbuild_clones(
     Only applies to clone-type and pkgctl-type tiers (one directory per package).
     Monorepo tiers (a single git checkout covering all packages) are not touched.
 
-    current_names should be the union of:
-      - manifest package names (currently installed on the desktop)
-      - built.json names for packages not world_superseded (avoid pruning
-        a clone the day a package is removed, giving it one cycle of grace)
+    current_names: set of package names to keep (manifest names currently
+    installed on the desktop).
     """
     import shutil
     removed = []
@@ -1413,66 +1403,6 @@ def _read_pacman_db(db_path: str) -> dict[str, str]:
         log.warning("Error reading pacman DB %s: %s", db_path, e)
     return result
 
-
-def prune_world_superseded_from_repo(
-    built: dict,
-    repo_db_path: str,
-    manifest: list[dict],
-) -> list[str]:
-    """Remove forge DB entries where the desktop manifest has a strictly newer version.
-
-    Uses the desktop manifest (what is actually installed) rather than the build
-    chroot's sync DBs.  The chroot sees Arch's world; the desktop sees CachyOS's
-    world.  When CachyOS ships python 3.14.5-2 and forge has 3.14.5-1.1, a
-    chroot-DB comparison (pkgver-only) would never prune, letting forge block the
-    CachyOS package forever.  Comparing against the manifest uses the real version
-    the user has and naturally handles both cases:
-
-      - Desktop has wget 1.25.0-4, forge has 1.25.0-4.1  →  forge wins  →  no prune
-      - Desktop has python 3.14.5-2, forge has 3.14.5-1.1  →  manifest wins  →  prune
-
-    Returns the list of package names removed from the DB (caller updates built.json).
-    """
-    if not os.path.exists(repo_db_path):
-        return []
-
-    forge_db = _read_pacman_db(repo_db_path)
-    if not forge_db:
-        return []
-
-    if not manifest:
-        log.debug("prune_world_superseded: manifest is empty, skipping")
-        return []
-
-    world_versions: dict[str, str] = {pkg["name"]: pkg["version"] for pkg in manifest}
-
-    to_remove = []
-    for pkgname, forge_ver in forge_db.items():
-        world_ver = world_versions.get(pkgname)
-        if not world_ver:
-            continue
-        # Prune when the installed version is strictly newer than what forge provides.
-        # Full version comparison (including pkgrel) is correct here because world_ver
-        # is the desktop's actual installed version — not the chroot's distro-specific
-        # view — so pkgrel differences are meaningful.
-        if vercmp(world_ver, forge_ver) > 0:
-            to_remove.append(pkgname)
-
-    if not to_remove:
-        return []
-
-    result = subprocess.run(
-        ["repo-remove", repo_db_path] + to_remove,
-        capture_output=True, text=True,
-    )
-    if result.returncode not in (0, 1):
-        log.warning("repo-remove returned %d: %s", result.returncode, result.stderr)
-
-    log.info(
-        "Removed %d world-superseded package(s) from forge DB: %s",
-        len(to_remove), ", ".join(to_remove),
-    )
-    return to_remove
 
 
 # ---------------------------------------------------------------------------
