@@ -16,7 +16,7 @@ Works on any pacman-based distro.
 | Package | Installs | Purpose |
 |---|---|---|
 | `arch-native` | `/usr/bin/buildbot` | Build daemon and CLI |
-| `arch-native-client` | `/usr/bin/pkglist-export`, `/usr/bin/forge-sync` | Desktop client tools |
+| `arch-native-client` | `/usr/bin/pkglist-export`, `/usr/bin/forge-sync` | Client tools — works in both modes |
 
 Build from source with `makepkg -si` from each directory.
 
@@ -74,7 +74,8 @@ machine.
 
 ## Installation
 
-**Local mode** — all steps run on the same machine.
+**Local mode** — all steps run on the same machine. Skip the pkglist-export
+configuration in step 8; everything else applies.
 
 **Remote mode** — steps 1–6 run on the build server. Step 7 onwards runs on
 the desktop machine that will use the packages.
@@ -226,9 +227,9 @@ This installs two tools:
 
 - **`forge-sync`** — upgrades installed packages where forge has a newer build.
   Wire it into your update routine (see [forge-sync](#forge-sync) below).
-- **`pkglist-export`** *(remote mode only)* — a pacman hook that syncs your
-  installed package list to the build server after every transaction, so buildbot
-  knows what to build for you.
+- **`pkglist-export`** — a pacman hook that syncs your installed package list to
+  the build server after every transaction. Only does anything if
+  `/etc/arch-native-client.conf` is configured; in local mode it is a no-op.
 
 ---
 
@@ -308,9 +309,9 @@ sudo ln -s /etc/runit/sv/arch-native /run/runit/service/
 
 ## arch-native-client tools
 
-### pkglist-export *(remote mode only)*
+### pkglist-export
 
-Configure the connection to your build server:
+Configure the connection to your build server (remote mode only — skip this in local mode):
 
 ```bash
 sudo cp /usr/share/arch-native-client/arch-native-client.conf.example \
@@ -367,7 +368,8 @@ forge-sync: nothing to upgrade
 ```
 
 The first line shows how many of your installed packages are covered by forge
-out of your total installed count. Works in both local and remote modes.
+out of your total installed count. Works in both local and remote modes — install
+`arch-native-client` regardless of which mode you use.
 
 **Wiring into your update routine** — the recommended pattern is to run
 `forge-sync` immediately after `pacman -Syu` (or your AUR helper). Since

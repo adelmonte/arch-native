@@ -10,10 +10,7 @@ set -euo pipefail
 CONFIG_FILE="/etc/arch-native-client.conf"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
-    logger -t pkglist-export "ERROR: $CONFIG_FILE not found — copy the example from /usr/share/arch-native-client/"
-    echo "ERROR: $CONFIG_FILE not found." >&2
-    echo "Copy /usr/share/arch-native-client/arch-native-client.conf.example to $CONFIG_FILE and configure it." >&2
-    exit 1
+    exit 0
 fi
 
 # shellcheck source=/dev/null
