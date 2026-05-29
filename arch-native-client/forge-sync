@@ -45,7 +45,7 @@ while IFS=' ' read -r pkg inst_ver; do
     fi
 done < <(pacman -Q 2>/dev/null)
 
-printf '\033[1mforge-sync:\033[0m %d/%d installed packages are from forge\n' "$installed_count" "$total_installed"
+printf '\033[1mforge-sync:\033[0m %d / %d  (%d%%)\n' "$installed_count" "$total_installed" "$(( installed_count * 100 / total_installed ))"
 
 if [[ ${#upgrades[@]} -eq 0 ]]; then
     printf '\033[1mforge-sync:\033[0m nothing to upgrade\n'
