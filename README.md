@@ -7,10 +7,7 @@ signs them, and publishes them as a local pacman repo. Add that repo after your
 distro repos in `pacman.conf` and your system runs binaries compiled specifically
 for your CPU.
 
-Works on Arch Linux and Artix Linux (and any pacman-based distro).
-
-The build model is [ALHP](https://somegit.dev/ALHP/ALHP.GO) — same idea,
-self-hosted and config-driven.
+Works on any pacman-based distro.
 
 ---
 
