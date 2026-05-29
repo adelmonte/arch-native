@@ -14,11 +14,8 @@ package() {
     install -Dm644 "$startdir/pkglist-export.hook" \
         "$pkgdir/usr/share/libalpm/hooks/pkglist-export.hook"
 
-    # Forge upgrade script + hook (upgrades installed packages from forge after each transaction)
-    install -Dm755 "$startdir/forge-sync"       "$pkgdir/usr/bin/forge-sync"
-    install -Dm755 "$startdir/forge-sync-defer" "$pkgdir/usr/bin/forge-sync-defer"
-    install -Dm644 "$startdir/forge-sync.hook" \
-        "$pkgdir/usr/share/libalpm/hooks/forge-sync.hook"
+    # Forge upgrade script (run manually or from an update function after yay)
+    install -Dm755 "$startdir/forge-sync" "$pkgdir/usr/bin/forge-sync"
 
     # Example config
     install -Dm644 "$startdir/arch-native-client.conf.example" \

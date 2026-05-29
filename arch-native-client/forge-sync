@@ -8,19 +8,9 @@ set -euo pipefail
 
 FORGE_REPO="${FORGE_REPO:-forge}"
 
-# Prevent recursive invocation: the pacman -S call below fires this hook again.
-LOCKFILE=/run/forge-sync.lock
-if [[ -e "$LOCKFILE" ]]; then
-    exit 0
-fi
-touch "$LOCKFILE"
-trap 'rm -f "$LOCKFILE"' EXIT
-
-# Sync all DBs (redundant when called from a PostTransaction hook since
-# pacman already synced them, but needed for manual runs).
-pacman -Sy >/dev/null 2>&1 || true
-
 # Build a map of forge package → version in one pass.
+# Uses the cached DB — yay -Syu already synced it. For standalone runs,
+# run 'pacman -Sy' first if you need fresh data.
 declare -A forge_versions
 while IFS=' ' read -r _ pkg ver _rest; do
     forge_versions["$pkg"]="$ver"

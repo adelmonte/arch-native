@@ -19,7 +19,7 @@ self-hosted and config-driven.
 | Package | Installs | Purpose |
 |---|---|---|
 | `arch-native` | `/usr/bin/buildbot` | Build daemon and CLI |
-| `arch-native-client` | `/usr/bin/pkglist-export` | Desktop pacman hook (remote mode only) |
+| `arch-native-client` | `/usr/bin/pkglist-export`, `/usr/bin/forge-sync` | Desktop pacman hooks |
 
 Build from source with `makepkg -si` from each directory.
 
@@ -379,17 +379,30 @@ sudo pkglist-export
 
 ### forge-sync
 
-`forge-sync` is the other hook installed by `arch-native-client`. It upgrades
-installed packages where forge has a newer build, and runs automatically as a
-PostTransaction hook after every pacman transaction. Run it manually at any time:
+`forge-sync` upgrades installed packages where forge has a newer build. It runs
+automatically as a PostTransaction hook after every pacman transaction, and works
+in both local and remote modes. Run it manually at any time:
 
 ```bash
 sudo forge-sync
 ```
 
+Output shows coverage at a glance:
+
+```
+forge-sync: 853 / 1197  (71%)
+forge-sync: nothing to upgrade
+```
+
 The hook fires after `pkglist-export`, so a freshly installed package is included
 in the next buildbot cycle before forge-sync runs. Once buildbot builds it, the
 following `forge-sync` (or the next transaction's hook) picks it up.
+
+**Non-systemd systems** — the PostTransaction hook cannot call `pacman -S`
+directly because pacman holds the database lock during hook execution.
+`arch-native-client` installs a `forge-sync-defer` helper that uses `setsid`
+to launch forge-sync in a new session after the lock is released. This works on
+systemd, dinit, OpenRC, runit, and any other init system.
 
 **"local is newer" warnings** — with forge last in `pacman.conf`, packages that
 have a forge build will produce `warning: pkg: local (1.2-1.1) is newer than
@@ -398,7 +411,7 @@ makes forge builds appear newer, which is how `forge-sync` detects they need
 upgrading. To suppress the warnings without hiding other output:
 
 ```bash
-yay -Syu 2>&1 | grep -v " is newer than "
+yay --color=always -Syu 2>&1 | grep -v "is newer than"
 ```
 
 The `FORGE_REPO` environment variable overrides the repo name if yours differs
