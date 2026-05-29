@@ -77,9 +77,16 @@ machine.
 
 ## Installation
 
-### 1. Build and install the server package
+**Local mode** — all steps run on the same machine.
 
-Both packages are available on the AUR:
+**Remote mode** — steps 1–6 run on the build server. Step 7 onwards runs on
+the desktop machine that will use the packages.
+
+---
+
+### On the build server
+
+### 1. Install the package
 
 ```bash
 yay -S arch-native
@@ -91,31 +98,23 @@ Or build from source:
 cd arch-native && makepkg -si
 ```
 
-The package installs:
-- `/usr/bin/buildbot` — daemon and CLI
-- `/usr/lib/arch-native/buildbot_lib.py` — core library
-- `/usr/lib/systemd/system/arch-native.service` — systemd unit (see [Service management](#service-management) for other init systems)
-- `/usr/share/arch-native/` — nginx example, artix-meson, chroot-pacman.conf
-- `/etc/arch-native.conf` — default config (marked as `backup`, upgrades produce `.pacnew`)
-- `/usr/lib/sysusers.d/arch-native.conf` — creates the `buildbot` system user
-
 ### 2. Edit the config
 
 ```bash
 $EDITOR /etc/arch-native.conf
 ```
 
-Minimum changes for local mode (building on the same machine):
+Local mode (build and use packages on the same machine):
 
 ```ini
 [arch-native]
 repo_name = myrepo     # pacman DB name
-march = native         # compiler target — "native" = let gcc decide
+march = native         # "native" = let gcc decide based on this CPU
 mode = local
-distro = arch          # or "artix" for Artix Linux
+distro = arch          # or "artix"
 ```
 
-For remote mode (dedicated build server cross-compiling for your desktop CPU):
+Remote mode (dedicated build server cross-compiling for your desktop CPU):
 
 ```ini
 [arch-native]
@@ -143,14 +142,10 @@ Default config serves the repo at `:8081/repo/`. Edit the port in
 sudo buildbot init
 ```
 
-`buildbot init` creates the `/var/lib/arch-native/` directory layout,
-calls `mkarchroot` to create the clean chroot, and initializes the pacman
-keyring inside it. Safe to re-run — skips steps already done.
+Creates the `/var/lib/arch-native/` directory layout, builds the clean chroot,
+and initializes the pacman keyring inside it. Safe to re-run.
 
 ### 5. Generate the signing key
-
-After init, generate a GPG key for the `buildbot` user that will sign all
-built packages:
 
 ```bash
 sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg \
@@ -164,14 +159,14 @@ Expire-Date: 0
 EOF
 ```
 
-Export the public key into the repo directory so clients can fetch it:
+Export the public key so clients can fetch it:
 
 ```bash
 sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg \
     --export --armor > /var/lib/arch-native/repo/buildbot-public.asc
 ```
 
-Find the key fingerprint (used in the next step):
+Note the fingerprint for step 7:
 
 ```bash
 sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg -K
@@ -181,10 +176,16 @@ sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg -K
 
 See [Service management](#service-management) below for your init system.
 
+---
+
+### On the desktop
+
+> **Local mode**: "the desktop" is the same machine as the build server —
+> continue on the same machine.
+
 ### 7. Add the repo to pacman.conf
 
-Edit `/etc/pacman.conf` on the machine that will use the packages. Place the
-repo **after your distro repos**:
+Edit `/etc/pacman.conf` and place your repo **after** your distro repos:
 
 ```ini
 [core]            # or [system] on Artix
@@ -195,33 +196,41 @@ Include = ...
 
 [myrepo]
 SigLevel = Required DatabaseOptional
-Server = http://your-build-host:8081/repo
+Server = http://your-build-host:8081/repo   # or http://localhost:8081/repo for local mode
 ```
 
-With forge last, distro upgrades flow through naturally — when upstream bumps a
-package, `pacman -Syu` picks it up because the new distro pkgver is higher.
-Running `forge-sync` afterwards re-upgrades to the forge build once buildbot has
-rebuilt it for the new version (see [forge-sync](#forge-sync) below).
-
-Forge packages carry a `.N` pkgrel suffix (e.g. `2.3.1-1.1` instead of `2.3.1-1`).
-`vercmp` sees `1.1 > 1`, so `forge-sync` can detect that forge has a newer build
-and upgrade accordingly. When distro bumps to pkgrel `2`, vercmp sees `2 > 1.1`,
-so the distro upgrade flows through first.
-
-For local mode the server is `localhost`. For remote mode use the build
-server's hostname or IP.
-
-Trust the signing key on each client machine:
+Trust the signing key:
 
 ```bash
-# Import from the repo server
+# Fetch from the repo server (local or remote)
 sudo pacman-key --fetch-keys http://your-build-host:8081/repo/buildbot-public.asc
 sudo pacman-key --lsign-key <KEY-FINGERPRINT>
-
-# Or import directly if local mode
-sudo pacman-key --add /var/lib/arch-native/repo/buildbot-public.asc
-sudo pacman-key --lsign-key <KEY-FINGERPRINT>
 ```
+
+Forge packages carry a `.N` pkgrel suffix (e.g. `2.3.1-1.1` instead of `2.3.1-1`).
+This suffix is how `forge-sync` detects that a newer forge build is available.
+When distro bumps to a higher pkgver, `pacman -Syu` picks it up first; forge-sync
+re-upgrades to the forge build once buildbot has rebuilt it.
+
+### 8. Install arch-native-client
+
+```bash
+yay -S arch-native-client
+```
+
+Or build from source:
+
+```bash
+cd arch-native-client && makepkg -si
+```
+
+This installs two tools:
+
+- **`forge-sync`** — upgrades installed packages where forge has a newer build.
+  Wire it into your update routine (see [forge-sync](#forge-sync) below).
+- **`pkglist-export`** *(remote mode only)* — a pacman hook that syncs your
+  installed package list to the build server after every transaction, so buildbot
+  knows what to build for you.
 
 ---
 
@@ -299,19 +308,9 @@ sudo ln -s /etc/runit/sv/arch-native /run/runit/service/
 
 ---
 
-## Installing arch-native-client
+## arch-native-client tools
 
-On the desktop machine that the build server compiles for:
-
-```bash
-yay -S arch-native-client
-```
-
-Or from source:
-
-```bash
-cd arch-native-client && makepkg -si
-```
+### pkglist-export *(remote mode only)*
 
 Configure the connection to your build server:
 
@@ -324,54 +323,30 @@ sudo $EDITOR /etc/arch-native-client.conf
 `/etc/arch-native-client.conf`:
 
 ```bash
-# SSH user@host of the build server
 REMOTE_HOST="user@build-server"
-
-# Where the manifest is written on the build server
 REMOTE_PATH="/var/lib/arch-native/manifests/client.json"
-
-# SSH key (optional — omit to use ssh-agent or default key)
-# SSH_KEY="/path/to/id_ed25519"
+# SSH_KEY="/path/to/id_ed25519"   # omit to use ssh-agent or default key
 ```
 
-The pacman hook fires automatically after every transaction. Test it manually:
+`pkglist-export` runs as root via a pacman hook and rsyncs your installed
+package list to the build server after every transaction. The root user on the
+desktop needs SSH access to the build server.
+
+**On the desktop:**
 
 ```bash
-sudo pkglist-export
-```
-
-### SSH access setup
-
-`pkglist-export` runs as root (pacman hooks run as root) and uses rsync over
-SSH to push the manifest to the build server. The remote user in `REMOTE_HOST`
-needs write access to the `REMOTE_PATH` directory on the build server.
-
-**On the desktop (as root):**
-
-```bash
-# Generate a key for root if you don't already have one
 sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ""
-
-# Print the public key
-sudo cat /root/.ssh/id_ed25519.pub
+sudo cat /root/.ssh/id_ed25519.pub   # copy this to the build server
 ```
 
-**On the build server** — add that public key to the authorized_keys of
-whichever user you put in `REMOTE_HOST`. That user needs write access to
-`/var/lib/arch-native/manifests/`:
+**On the build server:**
 
 ```bash
-# Example: using a regular user 'myuser' that has write access to the manifests dir
 echo "ssh-ed25519 AAAA... root@desktop" >> ~/.ssh/authorized_keys
-
-# Grant the user write access to the manifests dir
 sudo setfacl -m u:myuser:rwx /var/lib/arch-native/manifests
 ```
 
-Or simply use root-to-root SSH if your setup allows it and set
-`REMOTE_HOST="root@build-server"`.
-
-Once the key is in place, verify end-to-end before relying on the hook:
+Verify end-to-end:
 
 ```bash
 sudo pkglist-export
