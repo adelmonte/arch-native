@@ -122,6 +122,12 @@ generate the signing key manually (see
 or the project README for the
 .B gpg \-\-gen\-key
 invocation).
+.SS why \fIPKG\fR
+Explain in plain English why
+.I PKG
+is in its current state \(em built, failed, deferred, waiting for an upstream
+PKGBUILD update, ineligible, etc.
+Useful for diagnosing why a package is not being built or has been skipped.
 .SS "patch {create|show|check} \fIPKG\fR"
 Manage local PKGBUILD patches stored in
 .IR /var/lib/arch\-native/pkgbuilds/local/ .
