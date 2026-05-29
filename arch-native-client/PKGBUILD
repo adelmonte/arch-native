@@ -2,7 +2,7 @@
 pkgname=arch-native-client
 pkgver=1.0.0
 pkgrel=1
-pkgdesc="Client-side pacman hook for arch-native: syncs installed package list to the build server"
+pkgdesc="Client-side tools for arch-native: package list sync and forge upgrade helper"
 arch=('any')
 license=('GPL-3.0-or-later')
 depends=('rsync' 'pacman' 'python')
