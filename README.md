@@ -3,8 +3,8 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 Rebuilds your installed packages from source with CPU-optimized compiler flags,
-signs them, and publishes them as a local pacman repo. Add that repo above
-`[core]` in `pacman.conf` and your system runs binaries compiled specifically
+signs them, and publishes them as a local pacman repo. Add that repo after your
+distro repos in `pacman.conf` and your system runs binaries compiled specifically
 for your CPU.
 
 Works on Arch Linux and Artix Linux (and any pacman-based distro).
@@ -19,7 +19,7 @@ self-hosted and config-driven.
 | Package | Installs | Purpose |
 |---|---|---|
 | `arch-native` | `/usr/bin/buildbot` | Build daemon and CLI |
-| `arch-native-client` | `/usr/bin/pkglist-export`, `/usr/bin/forge-sync` | Desktop pacman hooks |
+| `arch-native-client` | `/usr/bin/pkglist-export`, `/usr/bin/forge-sync` | Desktop client tools |
 
 Build from source with `makepkg -si` from each directory.
 
@@ -199,9 +199,9 @@ Server = http://your-build-host:8081/repo
 ```
 
 With forge last, distro upgrades flow through naturally — when upstream bumps a
-package, `pacman -Syu` picks it up because the new distro pkgver is higher. The
-`forge-sync` hook (installed with `arch-native-client`) then re-upgrades to the
-forge build once buildbot has rebuilt it for the new version.
+package, `pacman -Syu` picks it up because the new distro pkgver is higher.
+Running `forge-sync` afterwards re-upgrades to the forge build once buildbot has
+rebuilt it for the new version (see [forge-sync](#forge-sync) below).
 
 Forge packages carry a `.N` pkgrel suffix (e.g. `2.3.1-1.1` instead of `2.3.1-1`).
 `vercmp` sees `1.1 > 1`, so `forge-sync` can detect that forge has a newer build
@@ -299,7 +299,7 @@ sudo ln -s /etc/runit/sv/arch-native /run/runit/service/
 
 ---
 
-## Installing arch-native-client (remote mode only)
+## Installing arch-native-client
 
 On the desktop machine that the build server compiles for:
 
@@ -379,46 +379,55 @@ sudo pkglist-export
 
 ### forge-sync
 
-`forge-sync` upgrades installed packages where forge has a newer build. It runs
-automatically as a PostTransaction hook after every pacman transaction, and works
-in both local and remote modes. Run it manually at any time:
+`forge-sync` checks which of your installed packages have a newer build in the
+forge repo and upgrades them. Run it manually at any time:
 
 ```bash
 sudo forge-sync
 ```
 
-Output shows coverage at a glance:
+Output shows coverage and upgrade status:
 
 ```
 forge-sync: 853 / 1197  (71%)
 forge-sync: nothing to upgrade
 ```
 
-The hook fires after `pkglist-export`, so a freshly installed package is included
-in the next buildbot cycle before forge-sync runs. Once buildbot builds it, the
-following `forge-sync` (or the next transaction's hook) picks it up.
+The first line shows how many of your installed packages are covered by forge
+out of your total installed count. Works in both local and remote modes.
 
-**Non-systemd systems** — the PostTransaction hook cannot call `pacman -S`
-directly because pacman holds the database lock during hook execution.
-`arch-native-client` installs a `forge-sync-defer` helper that uses `setsid`
-to launch forge-sync in a new session after the lock is released. This works on
-systemd, dinit, OpenRC, runit, and any other init system.
+**Wiring into your update routine** — the recommended pattern is to run
+`forge-sync` immediately after `pacman -Syu` (or your AUR helper). Since
+`pacman -Syu` already syncs all repo databases, forge-sync uses the cached
+data and completes in under a second when there is nothing to upgrade.
 
-**"local is newer" warnings** — with forge last in `pacman.conf`, packages that
-have a forge build will produce `warning: pkg: local (1.2-1.1) is newer than
-extra (1.2-1)` during `pacman -Syu`. This is expected: the `.1` pkgrel suffix
-makes forge builds appear newer, which is how `forge-sync` detects they need
-upgrading. To suppress the warnings without hiding other output:
+Example shell function (bash/zsh):
 
 ```bash
-yay --color=always -Syu 2>&1 | grep -v "is newer than"
+update() {
+    yay -Syu && sudo forge-sync
+}
 ```
+
+Example fish function:
+
+```fish
+function update
+    yay -Syu 2>&1 | grep -v "is newer than"
+    and sudo forge-sync
+end
+```
+
+The `grep -v "is newer than"` suppresses the expected `warning: pkg: local
+(1.2-1.1) is newer than extra (1.2-1)` messages that appear because forge
+builds carry a `.1` pkgrel suffix — that suffix is how `forge-sync` detects
+a forge build is installed. The warnings are harmless but noisy.
 
 The `FORGE_REPO` environment variable overrides the repo name if yours differs
 from the default `forge`:
 
 ```bash
-FORGE_REPO=myrepo forge-sync
+FORGE_REPO=myrepo sudo forge-sync
 ```
 
 ---
