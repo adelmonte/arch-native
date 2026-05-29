@@ -40,7 +40,6 @@ from buildbot_lib import (
     is_eligible,
     prepare_gnupg_home,
     import_pgp_keys,
-    bump_pkgrel,
     build_package,
     sign_packages,
     add_to_repo,
@@ -2345,9 +2344,6 @@ def run_daemon(config_path: str, debug: bool):
             build_start = time.time()
             cycle_stats["attempted"] += 1
             log.info("[%s] === BUILD STARTING ===", name)
-            pkgbuild_path = None
-            pkgbuild_backup = None
-
             try:
                 # a. Resolve PKGBUILD (with pkgbase fallback for split packages)
                 pkg_priority = config["package_tier_overrides"].get(name) or config["repo_priority"]
@@ -2440,25 +2436,8 @@ def run_daemon(config_path: str, debug: bool):
                 else:
                     log.info("[%s] no PGP keys required", name)
 
-                # e. Bump pkgrel
-                pkgbuild_path = os.path.join(pkgbuild_dir, "PKGBUILD")
-                # Prefer reading the backup from git HEAD so that a previously
-                # SIGKILL'd build (which left a dirty pkgrel bump) doesn't
-                # cause successive builds to perpetuate the dirty state.
-                _git_backup = subprocess.run(
-                    ["git", "show", "HEAD:PKGBUILD"],
-                    cwd=pkgbuild_dir, capture_output=True, text=True,
-                )
-                if _git_backup.returncode == 0:
-                    pkgbuild_backup = _git_backup.stdout
-                else:
-                    with open(pkgbuild_path, "r") as f:
-                        pkgbuild_backup = f.read()
-                old_pkgrel = srcinfo["pkgrel"]
-                new_version = bump_pkgrel(pkgbuild_path, srcinfo)
-                log.debug("[%s] pkgrel bumped: %s -> %s", name, old_pkgrel, new_version.rsplit("-", 1)[-1])
-
-                # f. Build
+                # e. Build
+                new_version = _fmt_srcinfo_ver(srcinfo)
                 log.info("[%s] build starting...", name)
                 success, pkg_files, failure_type = build_package(pkg, pkgbuild_dir, config, skippgpcheck=pgp_skipped)
 
@@ -2683,12 +2662,6 @@ def run_daemon(config_path: str, debug: bool):
                 save_failed(config["failed_path"], failed)
             finally:
                 clear_in_progress(config)
-                if pkgbuild_path and pkgbuild_backup is not None:
-                    try:
-                        with open(pkgbuild_path, "w") as f:
-                            f.write(pkgbuild_backup)
-                    except Exception as e:
-                        log.warning("[%s] failed to restore PKGBUILD after build: %s", name, e)
 
             # Reload pending in case it was modified externally
             pending = load_pending(config["pending_path"])

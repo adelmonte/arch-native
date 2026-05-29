@@ -61,7 +61,6 @@ def _save_json_file(path: str, data):
 # ---------------------------------------------------------------------------
 # Regex patterns (ported from ALHP.GO)
 # ---------------------------------------------------------------------------
-RE_PKGREL = re.compile(r"(?m)^pkgrel\s*=\s*(.+)$")
 RE_LD_ERROR = re.compile(r"(?mi).*collect2: error: ld returned \d+ exit status.*")
 RE_RUST_LTO_ERROR = re.compile(
     r"(?m)^error: options `-C (.+)` and `-C lto` are incompatible$"
@@ -282,25 +281,6 @@ def save_built_state(state_path: str, state: dict):
 # ---------------------------------------------------------------------------
 # Diffing
 # ---------------------------------------------------------------------------
-def _strip_local_pkgrel_bump(version: str) -> str:
-    """Normalize local dot-bumped pkgrel back to upstream version form."""
-    if "-" not in version:
-        return version
-
-    pkgver, pkgrel = version.rsplit("-", 1)
-    if "." not in pkgrel:
-        return version
-
-    parts = pkgrel.split(".")
-    if len(parts) < 2 or not parts[-1].isdigit():
-        return version
-
-    base_pkgrel = ".".join(parts[:-1])
-    if not base_pkgrel:
-        return version
-    return f"{pkgver}-{base_pkgrel}"
-
-
 # Statuses that mean "don't queue this package for a rebuild right now."
 _DEFERRED_STATUSES = frozenset({
     "ineligible",           # arch=any or otherwise not rebuildable
@@ -337,10 +317,7 @@ def diff_manifest(
             todo.append({**pkg, "build_reason": "new"})
             continue
 
-        built_upstream = _strip_local_pkgrel_bump(built[name]["version"])
-        manifest_upstream = _strip_local_pkgrel_bump(pkg["version"])
-        if vercmp(manifest_upstream, built_upstream) > 0:
-            # Upstream version is newer than what we built (ignoring local dot-bumps)
+        if vercmp(pkg["version"], built[name]["version"]) > 0:
             todo.append({**pkg, "build_reason": "update"})
 
     return todo
@@ -878,45 +855,6 @@ def import_pgp_keys(validpgpkeys: list[str], gnupg_home: str, build_user: str = 
             missing.append(key)
 
     return missing
-
-
-# ---------------------------------------------------------------------------
-# pkgrel bumping (ALHP dot-notation)
-# ---------------------------------------------------------------------------
-def bump_pkgrel(pkgbuild_path: str, srcinfo: dict) -> str:
-    """
-    ALHP-style dot-notation pkgrel bump.
-    If pkgrel=2     -> becomes 2.1
-    If pkgrel=2.3   -> becomes 2.4
-    Returns the full new version string (epoch:pkgver-newpkgrel).
-    """
-    with open(pkgbuild_path, "r") as f:
-        content = f.read()
-
-    current_rel = srcinfo["pkgrel"]
-
-    if "." in current_rel:
-        parts = current_rel.split(".")
-        base = parts[0]
-        frac = int(parts[-1])
-        new_rel = f"{base}.{frac + 1}"
-    else:
-        new_rel = f"{current_rel}.1"
-
-    new_content = RE_PKGREL.sub(f"pkgrel={new_rel}", content)
-    if new_content == content:
-        raise RuntimeError(
-            f"bump_pkgrel: could not find pkgrel= in {pkgbuild_path} — PKGBUILD may be malformed"
-        )
-
-    with open(pkgbuild_path, "w") as f:
-        f.write(new_content)
-
-    epoch = srcinfo.get("epoch", "")
-    pkgver = srcinfo["pkgver"]
-    if epoch:
-        return f"{epoch}:{pkgver}-{new_rel}"
-    return f"{pkgver}-{new_rel}"
 
 
 def _cleanup_build(chroot_dir: str, chroot_names: list[str], pkgbuild_dir: str, pkgname: str,
