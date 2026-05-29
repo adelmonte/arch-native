@@ -27,7 +27,7 @@ while IFS=' ' read -r _ pkg ver _rest; do
 done < <(pacman -Sl "$FORGE_REPO" 2>/dev/null)
 
 if [[ ${#forge_versions[@]} -eq 0 ]]; then
-    echo "forge-sync: forge repo is empty or unreachable"
+    printf '\033[1mforge-sync:\033[0m forge repo is empty or unreachable\n'
     exit 0
 fi
 
@@ -45,12 +45,12 @@ while IFS=' ' read -r pkg inst_ver; do
     fi
 done < <(pacman -Q 2>/dev/null)
 
-echo "forge-sync: ${installed_count}/${total_installed} installed packages are from forge"
+printf '\033[1mforge-sync:\033[0m %d/%d installed packages are from forge\n' "$installed_count" "$total_installed"
 
 if [[ ${#upgrades[@]} -eq 0 ]]; then
-    echo "forge-sync: nothing to upgrade"
+    printf '\033[1mforge-sync:\033[0m nothing to upgrade\n'
     exit 0
 fi
 
-echo "forge-sync: upgrading ${#upgrades[@]} package(s) from forge"
+printf '\033[1mforge-sync:\033[0m upgrading %d package(s) from forge\n' "${#upgrades[@]}"
 pacman -S --noconfirm --needed "${upgrades[@]}"
