@@ -207,8 +207,9 @@ sudo pacman-key --fetch-keys http://your-build-host:8081/repo/buildbot-public.as
 sudo pacman-key --lsign-key <KEY-FINGERPRINT>
 ```
 
-Forge packages carry a `.N` pkgrel suffix (e.g. `2.3.1-1.1` instead of `2.3.1-1`).
-This suffix is how `forge-sync` detects that a newer forge build is available.
+Forge packages use the same version as upstream. `forge-sync` identifies installed
+forge builds via the `PACKAGER` field set in each package at build time, and upgrades
+any package where forge has a newer version or the installed copy isn't a forge build.
 When distro bumps to a higher pkgver, `pacman -Syu` picks it up first; forge-sync
 re-upgrades to the forge build once buildbot has rebuilt it.
 
@@ -388,15 +389,10 @@ Example fish function:
 
 ```fish
 function update
-    yay -Syu 2>&1 | grep -v "is newer than"
+    yay -Syu
     and sudo forge-sync
 end
 ```
-
-The `grep -v "is newer than"` suppresses the expected `warning: pkg: local
-(1.2-1.1) is newer than extra (1.2-1)` messages that appear because forge
-builds carry a `.1` pkgrel suffix — that suffix is how `forge-sync` detects
-a forge build is installed. The warnings are harmless but noisy.
 
 The `FORGE_REPO` environment variable overrides the repo name if yours differs
 from the default `forge`:
@@ -787,9 +783,9 @@ Queue  52 pending
   next       thunderbird
 
 Recently built
-  fish          3.7.1-2.1   2h ago
-  curl          8.7.1-1.1   3h ago
-  zstd          1.5.6-1.1   5h ago
+  fish          3.7.1-2   2h ago
+  curl          8.7.1-1   3h ago
+  zstd          1.5.6-1   5h ago
 
 Failed  3
   gpgme      3d ago    build failed: collect2: error: ld returned 1
@@ -868,7 +864,7 @@ pre-repair state.
 buildbot built [-n N]
 ```
 Lists successfully built packages. `-n N` limits to the N most recent.
-Packages with dot-bumped pkgrel (`3.4.1-1.1`) are marked with `*`.
+Packages are listed with their version as built.
 
 ```
 buildbot queue [-n N]
@@ -1017,7 +1013,6 @@ Build server — main loop (poll_interval = 300s):
        parse_srcinfo()             version, deps, pgp keys
        is_eligible()               skip blacklisted, already-built-at-this-version
        import_pgp_keys()           fetch from keyservers
-       bump_pkgrel()               x → x.1 (ALHP-style dot bump)
        makechrootpkg               build in ephemeral chroot copy (chroots/build-<uuid>/)
        sign_packages()             GPG detach-sign each .pkg.tar.zst
        repo-add                    add to pacman DB; autoprune old versions
@@ -1125,19 +1120,15 @@ blacklist = ...,*-bin,*-git,*-svn
 
 Or if you have a large AUR footprint, enumerate them explicitly.
 
-### pkgrel dot-notation
+### forge-sync detection
 
-Upstream `pkgrel=2` → arch-native rebuilds as `pkgrel=2.1`. When upstream
-bumps to `pkgrel=3`, arch-native rebuilds as `3.1`.
+Forge builds use the same pkgver/pkgrel as upstream. `forge-sync` identifies
+installed forge packages by the `PACKAGER` field (`Buildbot <buildbot@forge>`)
+written into every package at build time, and uses a dotted-pkgrel fallback for
+packages built before the PACKAGER field was standardised.
 
-With forge last in `pacman.conf`, `vercmp 2.1 2` is positive, so `forge-sync`
-detects that forge has a newer build and upgrades. When distro bumps to `pkgrel=3`,
-`vercmp 3 2.1` is positive, so `pacman -Syu` picks up the distro version first;
-`forge-sync` skips it until buildbot rebuilds at `3.1`.
-
-Version comparisons inside the daemon (detecting already-built packages,
-checking upstream updates) strip the local `.N` suffix before comparing:
-`3.4.1-2.1` → `3.4.1-2` for comparison purposes.
+When distro bumps to a higher version, `pacman -Syu` picks it up first;
+`forge-sync` re-upgrades once buildbot has rebuilt at the new version.
 
 ### LTO auto-retry
 
