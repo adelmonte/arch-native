@@ -16,14 +16,14 @@ Works on any pacman-based distro.
 | Package | Installs | Purpose |
 |---|---|---|
 | `arch-native` | `/usr/bin/buildbot` | Build daemon and CLI |
-| `arch-native-client` | `/usr/bin/pkglist-export`, `/usr/bin/forge-sync` | Client tools — works in both modes |
+| `arch-native-client` | `/usr/bin/pkglist-export`, `/usr/bin/native-sync` | Client tools — works in both modes |
 
 Build from source with `makepkg -si` from each directory.
 
 **Naming** — three names appear throughout this doc:
 - **arch-native** — the project. What you install.
 - **buildbot** — the server binary (`/usr/bin/buildbot`). Both the daemon and the CLI.
-- **forge-sync** — the client upgrade tool (`/usr/bin/forge-sync`). Reads `FORGE_REPO` from the environment (default: `forge`).
+- **native-sync** — the client upgrade tool (`/usr/bin/native-sync`). Reads `FORGE_REPO` from the environment (default: `forge`).
 - **forge** — an example `repo_name`. The pacman repo name is set in the config (`repo_name = forge`) and can be anything.
 
 ---
@@ -206,10 +206,10 @@ sudo pacman-key --fetch-keys http://your-build-host:8081/repo/buildbot-public.as
 sudo pacman-key --lsign-key <KEY-FINGERPRINT>
 ```
 
-Forge packages use the same version as upstream. `forge-sync` identifies installed
+Forge packages use the same version as upstream. `native-sync` identifies installed
 forge builds via the `PACKAGER` field set in each package at build time, and upgrades
 any package where forge has a newer version or the installed copy isn't a forge build.
-When distro bumps to a higher pkgver, `pacman -Syu` picks it up first; forge-sync
+When distro bumps to a higher pkgver, `pacman -Syu` picks it up first; native-sync
 re-upgrades to the forge build once buildbot has rebuilt it.
 
 ### 8. Install arch-native-client
@@ -226,8 +226,8 @@ cd arch-native-client && makepkg -si
 
 This installs two tools:
 
-- **`forge-sync`** — upgrades installed packages where forge has a newer build.
-  Wire it into your update routine (see [forge-sync](#forge-sync) below).
+- **`native-sync`** — upgrades installed packages where forge has a newer build.
+  Wire it into your update routine (see [native-sync](#native-sync) below).
 - **`pkglist-export`** — a pacman hook that syncs your installed package list to
   the build server after every transaction. Only does anything if
   `/etc/arch-native-client.conf` is configured; in local mode it is a no-op.
@@ -352,20 +352,20 @@ Verify end-to-end:
 sudo pkglist-export
 ```
 
-### forge-sync
+### native-sync
 
-`forge-sync` checks which of your installed packages have a newer build in the
+`native-sync` checks which of your installed packages have a newer build in the
 forge repo and upgrades them. Run it manually at any time:
 
 ```bash
-sudo forge-sync
+sudo native-sync
 ```
 
 Output shows coverage and upgrade status:
 
 ```
-forge-sync: 853 / 1197  (71%)
-forge-sync: nothing to upgrade
+native-sync: 853 / 1197  (71%)
+native-sync: nothing to upgrade
 ```
 
 The first line shows how many of your installed packages are covered by forge
@@ -373,15 +373,15 @@ out of your total installed count. Works in both local and remote modes — inst
 `arch-native-client` regardless of which mode you use.
 
 **Wiring into your update routine** — the recommended pattern is to run
-`forge-sync` immediately after `pacman -Syu` (or your AUR helper). Since
-`pacman -Syu` already syncs all repo databases, forge-sync uses the cached
+`native-sync` immediately after `pacman -Syu` (or your AUR helper). Since
+`pacman -Syu` already syncs all repo databases, native-sync uses the cached
 data and completes in under a second when there is nothing to upgrade.
 
 Example shell function (bash/zsh):
 
 ```bash
 update() {
-    yay -Syu && sudo forge-sync
+    yay -Syu && sudo native-sync
 }
 ```
 
@@ -390,7 +390,7 @@ Example fish function:
 ```fish
 function update
     yay -Syu
-    and sudo forge-sync
+    and sudo native-sync
 end
 ```
 
@@ -398,7 +398,7 @@ The `FORGE_REPO` environment variable overrides the repo name if yours differs
 from the default `forge`:
 
 ```bash
-FORGE_REPO=myrepo sudo forge-sync
+FORGE_REPO=myrepo sudo native-sync
 ```
 
 ---
@@ -1120,15 +1120,15 @@ blacklist = ...,*-bin,*-git,*-svn
 
 Or if you have a large AUR footprint, enumerate them explicitly.
 
-### forge-sync detection
+### native-sync detection
 
-Forge builds use the same pkgver/pkgrel as upstream. `forge-sync` identifies
+Forge builds use the same pkgver/pkgrel as upstream. `native-sync` identifies
 installed forge packages by the `PACKAGER` field (`Buildbot <buildbot@forge>`)
 written into every package at build time, and uses a dotted-pkgrel fallback for
 packages built before the PACKAGER field was standardised.
 
 When distro bumps to a higher version, `pacman -Syu` picks it up first;
-`forge-sync` re-upgrades once buildbot has rebuilt at the new version.
+`native-sync` re-upgrades once buildbot has rebuilt at the new version.
 
 ### LTO auto-retry
 

@@ -14,8 +14,8 @@ package() {
     install -Dm644 "$startdir/pkglist-export.hook" \
         "$pkgdir/usr/share/libalpm/hooks/pkglist-export.hook"
 
-    # Forge upgrade script (run manually or from an update function after yay)
-    install -Dm755 "$startdir/forge-sync" "$pkgdir/usr/bin/forge-sync"
+    # Repo upgrade script (run manually or from an update function after yay)
+    install -Dm755 "$startdir/native-sync" "$pkgdir/usr/bin/native-sync"
 
     # Example config
     install -Dm644 "$startdir/arch-native-client.conf.example" \
