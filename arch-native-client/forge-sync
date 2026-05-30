@@ -82,4 +82,12 @@ if [[ ${#upgrades[@]} -eq 0 ]]; then
 fi
 
 printf '\033[1mforge-sync:\033[0m upgrading %d package(s) from forge\n' "${#upgrades[@]}"
+
+# Clear cached packages before installing — a cached upstream build at the same
+# version has a different checksum than the forge build, causing pacman to abort.
+for pkg in "${upgrades[@]}"; do
+    pkgname="${pkg#*/}"
+    find /var/cache/pacman/pkg/ -maxdepth 1 -name "${pkgname}-*.pkg.tar.zst" -delete 2>/dev/null || true
+done
+
 pacman -S --noconfirm "${upgrades[@]}"
