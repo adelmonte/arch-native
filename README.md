@@ -22,8 +22,9 @@ Build from source with `makepkg -si` from each directory.
 
 **Naming** — three names appear throughout this doc:
 - **arch-native** — the project. What you install.
-- **buildbot** — the binary (`/usr/bin/buildbot`). Both the daemon and the CLI.
-- **forge** — an example `repo_name`. This is just the pacman repo name you choose in the config (`repo_name = forge`). It can be anything. Examples in this doc use `forge`; yours might be `local`, `custom`, or whatever you set.
+- **buildbot** — the server binary (`/usr/bin/buildbot`). Both the daemon and the CLI.
+- **forge-sync** — the client upgrade tool (`/usr/bin/forge-sync`). Reads `FORGE_REPO` from the environment (default: `forge`).
+- **forge** — an example `repo_name`. The pacman repo name is set in the config (`repo_name = forge`) and can be anything.
 
 ---
 
