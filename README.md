@@ -20,7 +20,10 @@ Works on any pacman-based distro.
 
 Build from source with `makepkg -si` from each directory.
 
-**Naming** — `buildbot` is the server binary; `forge-sync` is the client upgrade tool. Throughout this doc, `forge` is the example `repo_name` — set it to whatever you like in the config. `forge-sync` reads `FORGE_REPO` from the environment (default: `forge`).
+**Naming** — three names appear throughout this doc:
+- **arch-native** — the project. What you install.
+- **buildbot** — the binary (`/usr/bin/buildbot`). Both the daemon and the CLI.
+- **forge** — an example `repo_name`. This is just the pacman repo name you choose in the config (`repo_name = forge`). It can be anything. Examples in this doc use `forge`; yours might be `local`, `custom`, or whatever you set.
 
 ---
 
