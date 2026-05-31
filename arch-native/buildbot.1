@@ -159,7 +159,7 @@ Explicitly listed in
 .TP
 .B not\ found
 No PKGBUILD found in any configured tier (AUR packages, binary packages).
-.SS "patch {create|show|check} \fIPKG\fR"
+.SS "patch {create|show|check|status} \fIPKG\fR"
 Manage local PKGBUILD patches stored in
 .IR /var/lib/arch\-native/pkgbuilds/local/ .
 .TP
@@ -189,6 +189,30 @@ With
 also reports patches for packages that are no longer installed
 .RI ( orphaned )
 so they can be removed.
+.PP
+Patches created with
+.B patch create
+embed the upstream pkgver and pkgrel at the time of writing.
+If the upstream version has since moved,
+.B patch check
+reports the patch as
+.B review
+(applies cleanly but may be stale or redundant) rather than
+.BR ok .
+This catches cases where upstream silently fixed the issue the patch was
+addressing.
+.TP
+.B "patch status"
+Recompute patch health and publish
+.I patch\-status.json
+into the repo directory, where nginx serves it alongside the package database.
+Clients read this file via
+.BR native\-sync ,
+which prints a one\-line summary of how many patches are ok, need review, or
+have failed.
+The daemon refreshes this file at startup and once per
+.B upstream_check_interval
+automatically; run this command to refresh it on demand.
 .SH OPTIONS
 .TP
 .BI \-\-config " file"

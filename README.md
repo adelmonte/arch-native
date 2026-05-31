@@ -389,16 +389,27 @@ forge repo and upgrades them. Run it manually at any time:
 sudo native-sync
 ```
 
-Output shows coverage and upgrade status:
+Output shows coverage, build-server patch health, and upgrade status:
 
 ```
 native-sync: 853 / 1197  (71%)
+native-sync: patches  41 ok, 2 review, 1 fail
 native-sync: nothing to upgrade
 ```
 
 The first line shows how many of your installed packages are covered by forge
-out of your total installed count. Works in both local and remote modes — install
-`arch-native-client` regardless of which mode you use.
+out of your total installed count.
+
+The **patches** line is a glance at the build server's local-patch health,
+published by the daemon and fetched from the repo server. `review` means a patch
+applies but upstream has moved past the version it was written for; `fail` means
+a patch no longer applies and is blocking that package's builds. The line is
+omitted if the server doesn't publish patch health (older server) or has no local
+patches. See [Local PKGBUILD patches](#local-pkgbuild-patches) for how to act on
+these.
+
+Works in both local and remote modes — install `arch-native-client` regardless
+of which mode you use.
 
 **Wiring into your update routine** — the recommended pattern is to run
 `native-sync` immediately after `pacman -Syu` (or your AUR helper). Since
@@ -787,15 +798,31 @@ sudo buildbot patch show networkmanager
 sudo buildbot patch check --all
 ```
 ```
-  elogind                      ok  (tier: artix)
+  elogind                      ok      (tier: artix)
   flashrom                     orphaned  (not installed)
-  networkmanager               ok  (tier: artix)
-  zip                          FAIL  checking file PKGBUILD
+  networkmanager               review  (written for 1.46.0-3, upstream now 1.48.0-2)
+  zip                          FAIL    checking file PKGBUILD
 ```
 
 `orphaned` means the package is no longer installed on the client — the patch
-can be safely removed. `FAIL` means the patch no longer applies cleanly against
-the current upstream PKGBUILD, and must be updated before the next build.
+can be safely removed.
+
+`review` means the patch still applies cleanly, but upstream released a new
+version since the patch was written. Check whether the patch is still needed,
+still correct, or has been made redundant by the upstream change. Update or
+remove it with `buildbot patch create --force <pkg>`.
+
+> **How `review` works** — `patch create` records the upstream `pkgver`/`pkgrel`
+> the patch was written against as a comment header in the `.patch` file. `patch
+> check` compares that against the current upstream version. This catches the
+> silent case where upstream fixes the underlying issue (so the patch still
+> applies, but is now redundant or wrong). Patches created before this feature
+> have no header and simply report `ok`/`FAIL` as before — recreate them with
+> `--force` to opt in. Packages with a computed `pkgver` (git/VCS) get
+> pkgrel-drift detection only.
+
+`FAIL` means the patch no longer applies cleanly against the current upstream
+PKGBUILD, and must be updated before the next build.
 
 If a patch fails to apply, the build for that package fails loudly with:
 ```
@@ -821,6 +848,26 @@ To see your old changes while editing:
 
 ```bash
 sudo buildbot patch show networkmanager   # read the old diff in another terminal
+```
+
+#### Publish patch health to clients
+
+The daemon publishes a `patch-status.json` summary into the repo directory at
+startup and once per `upstream_check_interval`, so `native-sync` on the desktop
+can show patch health at a glance (the **patches** line in its output). To
+recompute and republish it on demand:
+
+```bash
+sudo buildbot patch status
+```
+```
+  total     44
+  ok        41
+  review    2
+  fail      1
+  orphaned  0
+
+  published: /var/lib/arch-native/repo/patch-status.json
 ```
 
 ---
@@ -1038,6 +1085,7 @@ that it moves to `failed.json` with a clear reason like
     ├── <repo_name>.db.tar.zst
     ├── *.pkg.tar.zst
     ├── *.pkg.tar.zst.sig
+    ├── patch-status.json     local-patch health summary (read by native-sync)
     └── buildbot-public.asc
 ```
 

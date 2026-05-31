@@ -8,6 +8,39 @@ set -euo pipefail
 FORGE_REPO="${FORGE_REPO:-forge}"
 FORGE_PACKAGER_TAG="<buildbot@${FORGE_REPO}>"
 
+# Show patch health published by the build server, if available.
+# The daemon writes patch-status.json into the repo dir; the repo Server
+# (nginx in remote mode, file:// in local mode) serves it alongside the
+# package DB. Best-effort — silent if the server doesn't publish it (older
+# server, or repo unreachable). Fetch + parse is done in one python call
+# (already a dependency) so no extra tools are required.
+print_patch_health() {
+    local server counts total ok review fail orphaned
+    server=$(pacman-conf --repo="$FORGE_REPO" Server 2>/dev/null | head -1) || return 0
+    [[ -n "$server" ]] || return 0
+
+    counts=$(python -c '
+import json, sys, urllib.request
+url = sys.argv[1].rstrip("/") + "/patch-status.json"
+try:
+    with urllib.request.urlopen(url, timeout=3) as r:
+        d = json.load(r)
+    print(d.get("total", 0), d.get("ok", 0), d.get("review", 0),
+          d.get("fail", 0), d.get("orphaned", 0))
+except Exception:
+    print("0 0 0 0 0")
+' "$server" 2>/dev/null) || return 0
+    read -r total ok review fail orphaned <<<"$counts" || true
+
+    (( ${total:-0} > 0 )) || return 0
+
+    local line="${ok} ok"
+    (( ${review:-0}   > 0 )) && line+=", ${review} review"
+    (( ${fail:-0}     > 0 )) && line+=", ${fail} fail"
+    (( ${orphaned:-0} > 0 )) && line+=", ${orphaned} orphaned"
+    printf '\033[1mnative-sync:\033[0m patches  %s\n' "$line"
+}
+
 # Build a map of forge package → version in one pass.
 # Uses the cached DB — yay -Syu already synced it. For standalone runs,
 # run 'pacman -Sy' first if you need fresh data.
@@ -34,6 +67,8 @@ installed_count=${#forge_installed[@]}
 printf '\033[1mnative-sync:\033[0m %d / %d  (%d%%)\n' \
     "$installed_count" "$total_installed" \
     "$(( installed_count * 100 / total_installed ))"
+
+print_patch_health
 
 if [[ "$installed_count" -eq 0 ]]; then
     printf '\033[1mnative-sync:\033[0m nothing to upgrade\n'

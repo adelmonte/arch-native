@@ -14,6 +14,7 @@ import logging
 import fcntl
 import os
 import queue as _thread_queue
+import re
 import shutil
 import signal
 import subprocess
@@ -1758,7 +1759,9 @@ def cmd_patch(args, config: dict) -> int:
         return _cmd_patch_show(args, config)
     if subcmd == "check":
         return _cmd_patch_check(args, config)
-    print("error: specify a subcommand: create, show, check")
+    if subcmd == "status":
+        return _cmd_patch_status(args, config)
+    print("error: specify a subcommand: create, show, check, status")
     return 2
 
 
@@ -1818,9 +1821,21 @@ def _cmd_patch_create(args, config: dict) -> int:
             print(f"diff error: {diff.stderr}")
             return 1
 
+        # Record the upstream version this patch was written against so
+        # patch check can flag when upstream has moved past it.
+        metadata = ""
+        try:
+            orig_content = open(orig).read()
+            pv = re.search(r'^pkgver\s*=\s*(\S+)', orig_content, re.MULTILINE)
+            pr = re.search(r'^pkgrel\s*=\s*(\S+)', orig_content, re.MULTILINE)
+            if pv and pr:
+                metadata = f"# arch-native-patch: pkgver={pv.group(1)} pkgrel={pr.group(1)}\n"
+        except OSError:
+            pass
+
         os.makedirs(local_dir, exist_ok=True)
         with open(patch_file, "w") as f:
-            f.write(diff.stdout)
+            f.write(metadata + diff.stdout)
 
     print(f"  saved: {patch_file}")
     return 0
@@ -1837,81 +1852,209 @@ def _cmd_patch_show(args, config: dict) -> int:
     return 0
 
 
+def _list_local_patches(pkgbuilds_dir: str):
+    """Return the list of pkgnames with a local patch, or None if no local/ dir."""
+    local_root = os.path.join(pkgbuilds_dir, "local")
+    if not os.path.isdir(local_root):
+        return None
+    return [
+        d for d in os.listdir(local_root)
+        if not d.startswith("_")
+        and os.path.isfile(os.path.join(local_root, d, f"{d}.patch"))
+    ]
+
+
+def _installed_names(config: dict):
+    """Set of installed package names, or None if the manifest is unavailable."""
+    try:
+        if config.get("mode") == "local":
+            manifest = read_local_packages()
+        else:
+            manifest = load_manifest(config["manifest_path"])
+        return {pkg["name"] for pkg in manifest}
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _check_one_patch(pkgname: str, config: dict, installed=None) -> tuple:
+    """Check a single local patch against current upstream.
+
+    Returns (status, detail, tier) where status is one of:
+      ok, review, fail, orphaned, not_found, no_patch_file.
+    """
+    import shutil as _shutil
+    pkgbuilds_dir = config["pkgbuilds_dir"]
+    patch_file = os.path.join(pkgbuilds_dir, "local", pkgname, f"{pkgname}.patch")
+    if not os.path.isfile(patch_file):
+        return ("no_patch_file", "no patch file", None)
+    if installed is not None and pkgname not in installed:
+        return ("orphaned", "not installed", None)
+
+    pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
+    upstream_priority = [t for t in pkg_priority if t != "local"]
+    try:
+        upstream_dir, tier = resolve_pkgbuild(
+            pkgname, pkgbuilds_dir, None, upstream_priority,
+            tier_sources=config["tier_sources"],
+            version_select=config.get("tier_version_select", "priority"),
+        )
+    except FileNotFoundError:
+        return ("not_found", "upstream not found", None)
+
+    # Read version metadata written by patch create, if present.
+    patch_pkgver = patch_pkgrel = None
+    try:
+        with open(patch_file) as pf:
+            for line in pf:
+                if not line.startswith('#'):
+                    break
+                m = re.match(r'^# arch-native-patch: pkgver=(\S+) pkgrel=(\S+)', line)
+                if m:
+                    patch_pkgver, patch_pkgrel = m.group(1), m.group(2)
+                    break
+    except OSError:
+        pass
+
+    # Read current upstream pkgver/pkgrel for version drift detection.
+    # Static text read — not a shell eval — so packages with a computed pkgver
+    # (git/VCS, variable substitution) compare the literal expression. patch
+    # create reads it the same way, so they stay consistent: such packages get
+    # pkgrel-drift detection only, never a false "review". Static versions
+    # (the common case) are compared exactly.
+    upstream_pkgver = upstream_pkgrel = None
+    try:
+        content = open(os.path.join(upstream_dir, "PKGBUILD")).read()
+        pv = re.search(r'^pkgver\s*=\s*(\S+)', content, re.MULTILINE)
+        pr = re.search(r'^pkgrel\s*=\s*(\S+)', content, re.MULTILINE)
+        if pv:
+            upstream_pkgver = pv.group(1)
+        if pr:
+            upstream_pkgrel = pr.group(1)
+    except OSError:
+        pass
+
+    with tempfile.TemporaryDirectory(prefix=f"arch-native-check-{pkgname}-") as tmpdir:
+        work_dir = os.path.join(tmpdir, "work")
+        _shutil.copytree(upstream_dir, work_dir, ignore=ignore_special_files)
+        dry = subprocess.run(
+            ["patch", "--dry-run", "-p1", "--input", patch_file],
+            capture_output=True, text=True, cwd=work_dir,
+        )
+
+    if dry.returncode == 0:
+        if (patch_pkgver and upstream_pkgver and
+                (patch_pkgver != upstream_pkgver or patch_pkgrel != upstream_pkgrel)):
+            written = f"{patch_pkgver}-{patch_pkgrel}"
+            current = f"{upstream_pkgver}-{upstream_pkgrel}"
+            return ("review", f"written for {written}, upstream now {current}", tier)
+        return ("ok", f"tier: {tier}", tier)
+
+    first_err = next(
+        (l for l in (dry.stdout + dry.stderr).splitlines() if l.strip()),
+        "patch failed"
+    )
+    return ("fail", first_err, tier)
+
+
+def write_patch_status(config: dict) -> None:
+    """Compute patch health and publish a summary JSON into the repo dir.
+
+    Served by nginx alongside the repo DB so clients (native-sync) can show
+    patch health at a glance. Best-effort: logs and returns on any error.
+    """
+    pkgnames = _list_local_patches(config["pkgbuilds_dir"]) or []
+    installed = _installed_names(config)
+
+    counts = {"ok": 0, "review": 0, "fail": 0, "orphaned": 0,
+              "not_found": 0, "no_patch_file": 0}
+    patches = []
+    for pkgname in sorted(pkgnames):
+        status, detail, _tier = _check_one_patch(pkgname, config, installed)
+        counts[status] = counts.get(status, 0) + 1
+        patches.append({"name": pkgname, "status": status, "detail": detail})
+
+    summary = {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "total": len(pkgnames),
+        "ok": counts["ok"],
+        "review": counts["review"],
+        # not_found / no_patch_file are broken patches too — fold into fail.
+        "fail": counts["fail"] + counts["not_found"] + counts["no_patch_file"],
+        "orphaned": counts["orphaned"],
+        "patches": patches,
+    }
+
+    out_path = os.path.join(config["repo_dir"], "patch-status.json")
+    tmp = out_path + ".tmp"
+    try:
+        os.makedirs(config["repo_dir"], exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(summary, f, indent=2)
+        os.replace(tmp, out_path)
+        log.debug("Wrote patch status: %d ok, %d review, %d fail",
+                  summary["ok"], summary["review"], summary["fail"])
+    except OSError as e:
+        log.warning("Could not write patch status to %s: %s", out_path, e)
+
+
 def _cmd_patch_check(args, config: dict) -> int:
     """Verify that local patches still apply against current upstream."""
-    import shutil as _shutil
     pkgbuilds_dir = config["pkgbuilds_dir"]
 
     if args.all:
-        local_root = os.path.join(pkgbuilds_dir, "local")
-        if not os.path.isdir(local_root):
+        pkgnames = _list_local_patches(pkgbuilds_dir)
+        if pkgnames is None:
             print("no local/ patches directory")
             return 0
-        pkgnames = [
-            d for d in os.listdir(local_root)
-            if not d.startswith("_")
-            and os.path.isfile(os.path.join(local_root, d, f"{d}.patch"))
-        ]
         if not pkgnames:
             print("no local patches found")
             return 0
+        installed = _installed_names(config)
     else:
         pkgnames = [args.pkgname]
-
-    installed = None
-    if args.all:
-        try:
-            if config.get("mode") == "local":
-                manifest = read_local_packages()
-            else:
-                manifest = load_manifest(config["manifest_path"])
-            installed = {pkg["name"] for pkg in manifest}
-        except (FileNotFoundError, ValueError):
-            pass
+        installed = None
 
     any_failed = False
     for pkgname in sorted(pkgnames):
-        patch_file = os.path.join(pkgbuilds_dir, "local", pkgname, f"{pkgname}.patch")
-        if not os.path.isfile(patch_file):
-            print(f"  {pkgname:<28} NO PATCH FILE")
+        status, detail, _tier = _check_one_patch(pkgname, config, installed)
+        if status == "ok":
+            print(f"  {pkgname:<28} ok  ({detail})")
+        elif status == "review":
+            print(f"  {pkgname:<28} review  ({detail})")
             any_failed = True
-            continue
-        if installed is not None and pkgname not in installed:
-            print(f"  {pkgname:<28} orphaned  (not installed)")
+        elif status == "orphaned":
+            print(f"  {pkgname:<28} orphaned  ({detail})")
             any_failed = True
-            continue
-        pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
-        upstream_priority = [t for t in pkg_priority if t != "local"]
-        try:
-            upstream_dir, tier = resolve_pkgbuild(
-                pkgname, pkgbuilds_dir, None, upstream_priority,
-                tier_sources=config["tier_sources"],
-                version_select=config.get("tier_version_select", "priority"),
-            )
-        except FileNotFoundError:
+        elif status == "not_found":
             print(f"  {pkgname:<28} upstream not found")
             any_failed = True
-            continue
-
-        with tempfile.TemporaryDirectory(prefix=f"arch-native-check-{pkgname}-") as tmpdir:
-            work_dir = os.path.join(tmpdir, "work")
-            _shutil.copytree(upstream_dir, work_dir, ignore=ignore_special_files)
-            dry = subprocess.run(
-                ["patch", "--dry-run", "-p1", "--input", patch_file],
-                capture_output=True, text=True, cwd=work_dir,
-            )
-
-        if dry.returncode == 0:
-            print(f"  {pkgname:<28} ok  (tier: {tier})")
-        else:
-            first_err = next(
-                (l for l in (dry.stdout + dry.stderr).splitlines() if l.strip()),
-                "patch failed"
-            )
-            print(f"  {pkgname:<28} FAIL  {first_err}")
+        elif status == "no_patch_file":
+            print(f"  {pkgname:<28} NO PATCH FILE")
+            any_failed = True
+        else:  # fail
+            print(f"  {pkgname:<28} FAIL  {detail}")
             any_failed = True
 
     return 1 if any_failed else 0
+
+
+def _cmd_patch_status(args, config: dict) -> int:
+    """Recompute and publish the patch health summary, then print the counts."""
+    write_patch_status(config)
+    out_path = os.path.join(config["repo_dir"], "patch-status.json")
+    try:
+        with open(out_path) as f:
+            summary = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"error: could not read {out_path}: {e}")
+        return 1
+    print(f"  total     {summary['total']}")
+    print(f"  ok        {summary['ok']}")
+    print(f"  review    {summary['review']}")
+    print(f"  fail      {summary['fail']}")
+    print(f"  orphaned  {summary['orphaned']}")
+    print(f"\n  published: {out_path}")
+    return 0
 
 
 def run_cli(args, config: dict) -> int:
@@ -2200,6 +2343,13 @@ def run_daemon(config_path: str, debug: bool):
     log.info("Building pkgbase map from sync databases...")
     pkgbase_map = build_pkgbase_map()
 
+    # Publish initial patch health so clients have data before the first
+    # upstream check; refreshed once per upstream_check_interval below.
+    try:
+        write_patch_status(config)
+    except Exception as e:
+        log.warning("Initial patch status write failed: %s", e)
+
     while not shutdown_flag:
         cycle_start = time.time()
 
@@ -2277,6 +2427,14 @@ def run_daemon(config_path: str, debug: bool):
                                     )
                 except Exception as e:
                     log.error("Error pulling monorepos: %s", e)
+
+                # Refresh published patch health now that PKGBUILDs were pulled.
+                # Runs in the main thread before the build loop starts, so there
+                # is no concurrent git writer racing the patch dry-runs.
+                try:
+                    write_patch_status(config)
+                except Exception as e:
+                    log.warning("Patch status write failed: %s", e)
 
                 _upstream_built_snapshot = get_built_state(config["state_path"])
                 _thread_manifest = list(manifest)
@@ -2930,7 +3088,7 @@ def main():
                     "Safe to re-run — skips steps already complete.")
 
     p_patch = sub.add_parser("patch",
-        usage="buildbot patch {create|show|check} <PKG>",
+        usage="buildbot patch {create|show|check|status} <PKG>",
         formatter_class=_HelpFormatter,
         description="Manage local PKGBUILD patches stored in "
                     "/var/lib/arch-native/pkgbuilds/local/.")
@@ -2960,6 +3118,12 @@ def main():
     p_pck_group.add_argument("pkgname", nargs="?", metavar="PKG")
     p_pck_group.add_argument("--all", action="store_true",
         help="check every local patch")
+
+    patch_sub.add_parser("status",
+        usage="buildbot patch status",
+        formatter_class=_HelpFormatter,
+        description="Recompute patch health and publish patch-status.json into "
+                    "the repo dir for clients (native-sync) to read.")
 
     args = parser.parse_args()
     if args.command:
