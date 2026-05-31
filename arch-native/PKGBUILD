@@ -1,6 +1,6 @@
 # Maintainer: adelmonte
 pkgname=arch-native
-pkgver=1.2.0
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="Rebuild installed Arch packages from source with CPU-optimized flags"
 arch=('any')
