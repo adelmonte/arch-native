@@ -14,6 +14,7 @@ import logging
 import fcntl
 import os
 import queue as _thread_queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -2153,6 +2154,35 @@ def run_daemon(config_path: str, debug: bool):
     _upstream_thread = None
     _upstream_results = _thread_queue.Queue()
     _upstream_built_snapshot = {}
+
+    # Remove stale pacman lock from the root chroot. This file is left behind
+    # when the daemon is SIGKILL'd while arch-nspawn is mid-upgrade; without
+    # cleanup every subsequent build hangs indefinitely waiting on the lock.
+    _chroot_dir = config["chroot_dir"]
+    _root_dblck = os.path.join(_chroot_dir, "root", "var", "lib", "pacman", "db.lck")
+    if os.path.exists(_root_dblck):
+        try:
+            os.remove(_root_dblck)
+            log.warning("Removed stale pacman lock from root chroot (previous run was interrupted mid-upgrade)")
+        except OSError as e:
+            log.warning("Could not remove stale root chroot lock %s: %s", _root_dblck, e)
+
+    # Remove leftover ephemeral build chroots and their directory locks.
+    # Any build-* dirs present at startup are from a killed previous run.
+    try:
+        for _entry in os.listdir(_chroot_dir):
+            _path = os.path.join(_chroot_dir, _entry)
+            if _entry.startswith("build-"):
+                try:
+                    if os.path.isdir(_path):
+                        shutil.rmtree(_path, ignore_errors=True)
+                    else:
+                        os.remove(_path)
+                    log.warning("Removed stale build chroot: %s", _path)
+                except OSError as e:
+                    log.warning("Could not remove stale build chroot %s: %s", _path, e)
+    except OSError as e:
+        log.warning("Stale build chroot scan failed: %s", e)
 
     # Auto-fsck on startup: repair any built.json / repo DB / file divergences
     # caused by SIGKILL during a previous build cycle.
