@@ -125,9 +125,40 @@ invocation).
 .SS why \fIPKG\fR
 Explain in plain English why
 .I PKG
-is in its current state \(em built, failed, deferred, waiting for an upstream
-PKGBUILD update, ineligible, etc.
-Useful for diagnosing why a package is not being built or has been skipped.
+is in its current state.
+Useful for diagnosing why a package is missing from the repo or has not been built.
+Possible states include:
+.TP
+.B built
+Package has been rebuilt at the current version.
+.TP
+.BR failed " / " stalled
+Build failed; output includes the failure reason and retry count.
+A stalled package has exceeded the automatic retry threshold and requires manual
+intervention with
+.BR "buildbot retry" .
+.TP
+.B pending
+Package is queued for an upcoming build.
+.TP
+.B pending_upstream
+The installed version is ahead of the PKGBUILD in the configured tiers.
+The package will be released automatically once the upstream tier catches up.
+Run
+.B buildbot sync
+to force a re-scan.
+.TP
+.B ineligible
+Automatically excluded:
+.BR arch=any ,
+Haskell packages, or a package whose pkgbase is blacklisted.
+.TP
+.B blacklisted
+Explicitly listed in
+.IR blacklist .
+.TP
+.B not\ found
+No PKGBUILD found in any configured tier (AUR packages, binary packages).
 .SS "patch {create|show|check} \fIPKG\fR"
 Manage local PKGBUILD patches stored in
 .IR /var/lib/arch\-native/pkgbuilds/local/ .
@@ -236,9 +267,16 @@ Create a local patch to fix a build failure:
 sudo buildbot patch create xvidcore
 .EE
 .RE
+.PP
+Diagnose why a package has not been built:
+.PP
+.RS 4
+.EX
+buildbot why firefox
+.EE
+.RE
 .SH SEE ALSO
 .BR pacman (8),
 .BR makechrootpkg (1),
 .BR makepkg (8),
-.BR repo\-add (8),
-.BR arch\-native.conf (5)
+.BR repo\-add (8)
