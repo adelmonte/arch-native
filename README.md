@@ -3,9 +3,7 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 Rebuilds your installed packages from source with CPU-optimized compiler flags,
-signs them, and publishes them as a local pacman repo. Add that repo after your
-distro repos in `pacman.conf` and your system runs binaries compiled specifically
-for your CPU.
+signs them, and publishes them as a local pacman repo.
 
 Works on any pacman-based distro.
 
