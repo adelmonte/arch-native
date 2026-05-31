@@ -397,6 +397,10 @@ native-sync: patches  41 ok, 2 review, 1 fail
 native-sync: nothing to upgrade
 ```
 
+When all patches are healthy the line reads `patches  44 ok, 0 review, 0 fail`
+— the zeros are shown explicitly so a clean check is unambiguous. An `orphaned`
+count is appended only when non-zero.
+
 The first line shows how many of your installed packages are covered by forge
 out of your total installed count.
 

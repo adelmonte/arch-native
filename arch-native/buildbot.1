@@ -159,7 +159,7 @@ Explicitly listed in
 .TP
 .B not\ found
 No PKGBUILD found in any configured tier (AUR packages, binary packages).
-.SS "patch {create|show|check|status} \fIPKG\fR"
+.SS "patch {create|show|check|status|backfill} \fIPKG\fR"
 Manage local PKGBUILD patches stored in
 .IR /var/lib/arch\-native/pkgbuilds/local/ .
 .TP
@@ -213,6 +213,15 @@ have failed.
 The daemon refreshes this file at startup and once per
 .B upstream_check_interval
 automatically; run this command to refresh it on demand.
+.TP
+.B "patch backfill"
+Stamp existing patches that lack a version header with the current upstream
+pkgver and pkgrel, establishing a baseline so future upstream drift is reported
+as
+.BR review .
+Patches that already have a header are left untouched.
+Useful once after upgrading to a version of arch\-native that records patch
+versions.
 .SH OPTIONS
 .TP
 .BI \-\-config " file"

@@ -1761,7 +1761,9 @@ def cmd_patch(args, config: dict) -> int:
         return _cmd_patch_check(args, config)
     if subcmd == "status":
         return _cmd_patch_status(args, config)
-    print("error: specify a subcommand: create, show, check, status")
+    if subcmd == "backfill":
+        return _cmd_patch_backfill(args, config)
+    print("error: specify a subcommand: create, show, check, status, backfill")
     return 2
 
 
@@ -2054,6 +2056,55 @@ def _cmd_patch_status(args, config: dict) -> int:
     print(f"  fail      {summary['fail']}")
     print(f"  orphaned  {summary['orphaned']}")
     print(f"\n  published: {out_path}")
+    return 0
+
+
+def _cmd_patch_backfill(args, config: dict) -> int:
+    """Stamp existing patches that lack a version header with the current
+    upstream version, establishing a baseline so future drift is detectable."""
+    pkgbuilds_dir = config["pkgbuilds_dir"]
+    pkgnames = _list_local_patches(pkgbuilds_dir)
+    if not pkgnames:
+        print("no local patches found")
+        return 0
+
+    stamped = skipped = 0
+    for pkgname in sorted(pkgnames):
+        patch_file = os.path.join(pkgbuilds_dir, "local", pkgname, f"{pkgname}.patch")
+        with open(patch_file) as f:
+            body = f.read()
+        if body.startswith("# arch-native-patch:"):
+            skipped += 1
+            continue
+
+        pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
+        upstream_priority = [t for t in pkg_priority if t != "local"]
+        try:
+            upstream_dir, tier = resolve_pkgbuild(
+                pkgname, pkgbuilds_dir, None, upstream_priority,
+                tier_sources=config["tier_sources"],
+                version_select=config.get("tier_version_select", "priority"),
+            )
+            content = open(os.path.join(upstream_dir, "PKGBUILD")).read()
+        except (FileNotFoundError, OSError):
+            print(f"  {pkgname:<28} skipped (upstream not found)")
+            skipped += 1
+            continue
+
+        pv = re.search(r'^pkgver\s*=\s*(\S+)', content, re.MULTILINE)
+        pr = re.search(r'^pkgrel\s*=\s*(\S+)', content, re.MULTILINE)
+        if not (pv and pr):
+            print(f"  {pkgname:<28} skipped (no pkgver/pkgrel)")
+            skipped += 1
+            continue
+
+        header = f"# arch-native-patch: pkgver={pv.group(1)} pkgrel={pr.group(1)}\n"
+        with open(patch_file, "w") as f:
+            f.write(header + body)
+        print(f"  {pkgname:<28} stamped {pv.group(1)}-{pr.group(1)}  (tier: {tier})")
+        stamped += 1
+
+    print(f"\nbackfill: stamped {stamped}, skipped {skipped}")
     return 0
 
 
@@ -3088,7 +3139,7 @@ def main():
                     "Safe to re-run — skips steps already complete.")
 
     p_patch = sub.add_parser("patch",
-        usage="buildbot patch {create|show|check|status} <PKG>",
+        usage="buildbot patch {create|show|check|status|backfill} <PKG>",
         formatter_class=_HelpFormatter,
         description="Manage local PKGBUILD patches stored in "
                     "/var/lib/arch-native/pkgbuilds/local/.")
@@ -3124,6 +3175,12 @@ def main():
         formatter_class=_HelpFormatter,
         description="Recompute patch health and publish patch-status.json into "
                     "the repo dir for clients (native-sync) to read.")
+
+    patch_sub.add_parser("backfill",
+        usage="buildbot patch backfill",
+        formatter_class=_HelpFormatter,
+        description="Stamp existing patches that lack a version header with the "
+                    "current upstream version, so future drift is detectable.")
 
     args = parser.parse_args()
     if args.command:

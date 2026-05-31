@@ -34,9 +34,10 @@ except Exception:
 
     (( ${total:-0} > 0 )) || return 0
 
-    local line="${ok} ok"
-    (( ${review:-0}   > 0 )) && line+=", ${review} review"
-    (( ${fail:-0}     > 0 )) && line+=", ${fail} fail"
+    # Always show the health triad (ok/review/fail) including zeros so the
+    # check is visibly accounted for. Append orphaned only when non-zero —
+    # it's a cleanup note, not a health concern.
+    local line="${ok:-0} ok, ${review:-0} review, ${fail:-0} fail"
     (( ${orphaned:-0} > 0 )) && line+=", ${orphaned} orphaned"
     printf '\033[1mnative-sync:\033[0m patches  %s\n' "$line"
 }
