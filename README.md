@@ -788,11 +788,16 @@ sudo buildbot patch check --all
 ```
 ```
   elogind                      ok  (tier: artix)
+  flashrom                     orphaned  (not installed)
   networkmanager               ok  (tier: artix)
-  zip                          ok  (tier: artix)
+  zip                          FAIL  checking file PKGBUILD
 ```
 
-If a patch no longer applies, the build for that package fails loudly with:
+`orphaned` means the package is no longer installed on the client — the patch
+can be safely removed. `FAIL` means the patch no longer applies cleanly against
+the current upstream PKGBUILD, and must be updated before the next build.
+
+If a patch fails to apply, the build for that package fails loudly with:
 ```
 [networkmanager] local patch no longer applies cleanly — upstream PKGBUILD
 may have changed. Review and update the patch:

@@ -1857,11 +1857,26 @@ def _cmd_patch_check(args, config: dict) -> int:
     else:
         pkgnames = [args.pkgname]
 
+    installed = None
+    if args.all:
+        try:
+            if config.get("mode") == "local":
+                manifest = read_local_packages()
+            else:
+                manifest = load_manifest(config["manifest_path"])
+            installed = {pkg["name"] for pkg in manifest}
+        except (FileNotFoundError, ValueError):
+            pass
+
     any_failed = False
     for pkgname in sorted(pkgnames):
         patch_file = os.path.join(pkgbuilds_dir, "local", pkgname, f"{pkgname}.patch")
         if not os.path.isfile(patch_file):
             print(f"  {pkgname:<28} NO PATCH FILE")
+            any_failed = True
+            continue
+        if installed is not None and pkgname not in installed:
+            print(f"  {pkgname:<28} orphaned  (not installed)")
             any_failed = True
             continue
         pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
