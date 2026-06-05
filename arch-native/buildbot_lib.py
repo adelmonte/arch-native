@@ -321,6 +321,41 @@ def diff_manifest(
             todo.append({**pkg, "build_reason": "update"})
 
     return todo
+
+
+def inject_always_build(manifest: list, config: dict) -> list:
+    """Append virtual manifest entries for config['always_build'] packages.
+
+    These are packages the build server should build and keep in the repo even
+    when they are not installed on the client. Injecting them into the in-memory
+    manifest each cycle makes the rest of the pipeline treat them as installed:
+    diff_manifest builds them, check_upstream_updates rebuilds on upstream bumps,
+    and prune_uninstalled_from_repo no longer deletes them (their name is now in
+    manifest_names). Because the injection is in memory only, an rsync of the
+    real client manifest can't clobber it.
+
+    The sentinel version "0" makes a never-built entry resolve as "new" while a
+    built one won't re-trigger diff_manifest (upstream-bump rebuilds are handled
+    by check_upstream_updates against the built version). Mutates and returns the
+    list. A name already present in the manifest (genuinely installed) is skipped.
+    """
+    extra = config.get("always_build") or []
+    if not extra:
+        return manifest
+    present = {p["name"] for p in manifest}
+    for name in extra:
+        if name in present:
+            continue
+        manifest.append({
+            "name": name,
+            "version": "0",
+            "repo": "always_build",
+            "reason": "always_build",
+        })
+        present.add(name)
+    return manifest
+
+
 # ---------------------------------------------------------------------------
 # PKGBUILD resolution (four-tier)
 # ---------------------------------------------------------------------------

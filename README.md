@@ -557,6 +557,26 @@ lto_blacklist = llvm,rust
 See [Building your blacklist](#building-your-blacklist) for guidance on what
 to add.
 
+#### Always-build packages
+
+The inverse of the blacklist. By default the server builds only your installed
+manifest and prunes everything else from the repo (see `autoprune_uninstalled`).
+Listing a package here builds and keeps it **even when it isn't installed** on
+the client.
+
+```ini
+# Plain package names only (no wildcards).
+always_build = xdg-desktop-portal-kde
+```
+
+Each named package is injected as a virtual manifest entry every cycle, so it is
+built — applying a `pkgbuilds/local/` patch if one exists — and exempted from
+uninstalled-pruning. Use it to seed a **patched** build into the repo so you can
+install the optimized build instead of the upstream one, without the
+chicken-and-egg of needing the package installed before the server will build it.
+Remove a name and the normal uninstalled-prune cleans it from the repo on the
+next cycle.
+
 #### Build behavior
 
 ```ini

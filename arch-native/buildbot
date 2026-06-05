@@ -33,6 +33,7 @@ from buildbot_lib import (
     get_built_state,
     save_built_state,
     diff_manifest,
+    inject_always_build,
     _DEFERRED_STATUSES,
     build_pkgbase_map,
     resolve_pkgbuild,
@@ -230,6 +231,14 @@ def load_config(path: str) -> dict:
     lto_blacklist_str = sec.get("lto_blacklist", "")
     cfg["lto_blacklist"] = [
         s.strip() for s in lto_blacklist_str.split(",") if s.strip()
+    ]
+
+    # Packages to build and keep in the repo even when they are not installed
+    # on the client (not in the manifest). Injected as virtual manifest entries
+    # each cycle — see inject_always_build. Plain names only, no wildcards.
+    always_build_str = sec.get("always_build", "")
+    cfg["always_build"] = [
+        s.strip() for s in always_build_str.split(",") if s.strip()
     ]
 
     return cfg
@@ -759,6 +768,9 @@ def cmd_status(args, config: dict) -> int:
             row("blacklisted", f"{blacklisted_count} / {installed_total}  ({blacklisted_count / installed_total * 100:.0f}%)  {DIM}(see /etc/arch-native.conf){R}")
         if ineligible_count:
             row("ineligible", f"{ineligible_count} / {installed_total}  ({ineligible_count / installed_total * 100:.0f}%)  {DIM}(arch=any — not rebuilt){R}")
+        always_build_count = sum(1 for n in config.get("always_build", []) if n in built)
+        if always_build_count:
+            row("always-build", f"{always_build_count}  {DIM}(built + kept, not installed){R}")
     if repo_size:
         row("size", repo_size)
     if cycle_str:
@@ -1053,6 +1065,9 @@ def cmd_why(args, config: dict) -> int:
             return ""
 
     print(f"\n  {pkg}\n")
+
+    if pkg in config.get("always_build", []) and not installed:
+        print(f"  Note      always_build — built and kept in forge though not installed\n")
 
     if pending_rec:
         reason = pending_rec.get("build_reason", "?")
@@ -2440,7 +2455,11 @@ def run_daemon(config_path: str, debug: bool):
                     log.debug("No manifest file at %s", manifest_path)
 
             if manifest:
-                manifest_names = {p["name"] for p in manifest}
+                # Add always_build packages as virtual entries so they build and
+                # are exempt from uninstalled-pruning. Inject into a copy so the
+                # raw client manifest used for change detection above is untouched.
+                effective_manifest = inject_always_build(list(manifest), config)
+                manifest_names = {p["name"] for p in effective_manifest}
 
                 # Prune stale pending/failed entries for uninstalled packages
                 pp, pf = prune_stale_queue_entries(config, manifest_names)
@@ -2448,8 +2467,8 @@ def run_daemon(config_path: str, debug: bool):
                     log.info("Pruned stale queue entries: %d pending, %d failed removed", pp, pf)
 
                 built = get_built_state(config["state_path"])
-                built = _prune_cycle(config, manifest, manifest_names, built)
-                _queue_from_manifest(config, manifest, built, pkgbase_map)
+                built = _prune_cycle(config, effective_manifest, manifest_names, built)
+                _queue_from_manifest(config, effective_manifest, built, pkgbase_map)
         except Exception as e:
             log.error("Error processing manifest: %s", e)
 
@@ -2488,7 +2507,7 @@ def run_daemon(config_path: str, debug: bool):
                     log.warning("Patch status write failed: %s", e)
 
                 _upstream_built_snapshot = get_built_state(config["state_path"])
-                _thread_manifest = list(manifest)
+                _thread_manifest = inject_always_build(list(manifest), config)
 
                 def _upstream_worker(m, b, cfg, results_q, stop_fn):
                     try:
