@@ -24,6 +24,7 @@ Works on any pacman-based distro.
   - [Building your blacklist](#building-your-blacklist)
   - [Why a package might not be queued or built](#why-a-package-might-not-be-queued-or-built)
 - [Local PKGBUILD patches](#local-pkgbuild-patches)
+  - [Build a package from a full PKGBUILD](#build-a-package-from-a-full-pkgbuild)
 - [Architecture](#architecture)
   - [Data flow](#data-flow-remote-mode)
   - [PKGBUILD tier resolution](#pkgbuild-tier-resolution)
@@ -772,13 +773,33 @@ re-queue them after fixing the underlying issue.
 arch-native can build a *modified* version of any package, not just a
 CPU-optimized copy of the upstream one. A patch is a unified diff applied on top
 of the fetched upstream PKGBUILD on every build — to disable a failing test, add
-a `./configure` flag, strip a dependency, or change a source file — and it is
+a `./configure` flag, strip a dependency, or change build flags — and it is
 re-applied automatically as upstream moves forward, with version-drift checking
 to flag when it needs review.
 
 Patches live at `/var/lib/arch-native/pkgbuilds/local/<pkg>/<pkg>.patch`. Pair
 one with [`always_build`](#always-build-packages) to build and publish a custom
-package that isn't even installed on the client.
+package that isn't even installed on the client. To build a package that
+*doesn't exist upstream at all*, drop a complete PKGBUILD instead — see
+[below](#build-a-package-from-a-full-pkgbuild).
+
+### Build a package from a full PKGBUILD
+
+A patch overlays an *existing* upstream package. To build a package that has no
+upstream PKGBUILD in any tier — your own software, or anything no repo carries —
+drop a complete PKGBUILD instead:
+
+```
+/var/lib/arch-native/pkgbuilds/local/<pkg>/PKGBUILD
+```
+
+With no `.patch` alongside it, the file resolves as tier `local` and gets built,
+signed, and published like any other package. Add the name to
+[`always_build`](#always-build-packages) so it builds without needing to be
+installed on the client first.
+
+For a package that *does* exist upstream, prefer a patch — a full copy won't pick
+up upstream's updates, and the daemon logs a reminder each time it builds one.
 
 ### Create a patch
 
