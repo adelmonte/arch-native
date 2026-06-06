@@ -23,7 +23,7 @@ Works on any pacman-based distro.
   - [Configuration reference](#configuration-reference)
   - [Building your blacklist](#building-your-blacklist)
   - [Why a package might not be queued or built](#why-a-package-might-not-be-queued-or-built)
-  - [Local PKGBUILD patches](#local-pkgbuild-patches)
+- [Local PKGBUILD patches](#local-pkgbuild-patches)
 - [Architecture](#architecture)
   - [Data flow](#data-flow-remote-mode)
   - [PKGBUILD tier resolution](#pkgbuild-tier-resolution)
@@ -767,12 +767,20 @@ re-queue them after fixing the underlying issue.
 
 ---
 
-### Local PKGBUILD patches
+## Local PKGBUILD patches
 
-Per-package fixes live in `/var/lib/arch-native/pkgbuilds/local/<pkg>/<pkg>.patch`
-as unified diffs applied on top of the fetched upstream PKGBUILD.
+arch-native can build a *modified* version of any package, not just a
+CPU-optimized copy of the upstream one. A patch is a unified diff applied on top
+of the fetched upstream PKGBUILD on every build — to disable a failing test, add
+a `./configure` flag, strip a dependency, or change a source file — and it is
+re-applied automatically as upstream moves forward, with version-drift checking
+to flag when it needs review.
 
-#### Create a patch
+Patches live at `/var/lib/arch-native/pkgbuilds/local/<pkg>/<pkg>.patch`. Pair
+one with [`always_build`](#always-build-packages) to build and publish a custom
+package that isn't even installed on the client.
+
+### Create a patch
 
 ```bash
 sudo buildbot patch create networkmanager
@@ -788,7 +796,7 @@ diff as `networkmanager.patch` when you exit. Example session:
   saved: /var/lib/arch-native/pkgbuilds/local/networkmanager/networkmanager.patch
 ```
 
-#### Common patch use-cases
+### Common patch use-cases
 
 **Disable a failing test:**
 ```diff
@@ -808,13 +816,13 @@ diff as `networkmanager.patch` when you exit. Example session:
 +CFLAGS ?= -O2
 ```
 
-#### View a patch
+### View a patch
 
 ```bash
 sudo buildbot patch show networkmanager
 ```
 
-#### Verify patches after upstream updates
+### Verify patches after upstream updates
 
 ```bash
 sudo buildbot patch check --all
@@ -856,7 +864,7 @@ may have changed. Review and update the patch:
 Run `buildbot patch check --all` after each upstream update cycle
 (`upstream_check_interval`) to catch drift early.
 
-#### Update a stale patch
+### Update a stale patch
 
 ```bash
 sudo buildbot patch create --force networkmanager
@@ -872,7 +880,7 @@ To see your old changes while editing:
 sudo buildbot patch show networkmanager   # read the old diff in another terminal
 ```
 
-#### Publish patch health to clients
+### Publish patch health to clients
 
 The daemon publishes a `patch-status.json` summary into the repo directory at
 startup and once per `upstream_check_interval`, so `native-sync` on the desktop
