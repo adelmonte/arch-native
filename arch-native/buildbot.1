@@ -101,10 +101,17 @@ Show what would be cleared without writing.
 Diff the installed package list against
 .I built.json
 and queue any new or updated packages.
-Requires the service to be stopped first.
+Works whether or not the service is running: when the daemon is active,
+.B sync
+signals it to run an immediate build pass rather than waiting for the next poll
+cycle; when it is stopped,
+.B sync
+writes the queue so the next start picks it up.
 .TP
 .B \-\-reset
 Clear the existing queue first, then rebuild from scratch.
+Stop the service first when using
+.BR \-\-reset .
 .TP
 .B \-\-dry\-run
 Show what would be queued without writing.

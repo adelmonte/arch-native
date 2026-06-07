@@ -34,6 +34,7 @@ from buildbot_lib import (
     save_built_state,
     diff_manifest,
     inject_always_build,
+    strip_local_pkgrel_bump,
     _DEFERRED_STATUSES,
     build_pkgbase_map,
     resolve_pkgbuild,
@@ -64,12 +65,20 @@ from buildbot_lib import (
 # Globals
 # ---------------------------------------------------------------------------
 shutdown_flag = False
+wake_flag = False
 log = logging.getLogger("buildbot")
 
 def handle_sigterm(signum, frame):
     global shutdown_flag
     log.info("Received signal %d, finishing current work and shutting down...", signum)
     shutdown_flag = True
+
+
+def handle_sigusr1(signum, frame):
+    """Wake the daemon for an immediate build pass (sent by `buildbot sync`)."""
+    global wake_flag
+    wake_flag = True
+    log.info("Received wake signal — will run an immediate build pass")
 
 
 # ---------------------------------------------------------------------------
@@ -244,25 +253,6 @@ def load_config(path: str) -> dict:
     return cfg
 
 
-def strip_local_pkgrel_bump(version: str) -> str:
-    """Normalize local dot-bumped pkgrel back to upstream version form."""
-    if "-" not in version:
-        return version
-
-    pkgver, pkgrel = version.rsplit("-", 1)
-    if "." not in pkgrel:
-        return version
-
-    parts = pkgrel.split(".")
-    if len(parts) < 2 or not parts[-1].isdigit():
-        return version
-
-    base_pkgrel = ".".join(parts[:-1])
-    if not base_pkgrel:
-        return version
-    return f"{pkgver}-{base_pkgrel}"
-
-
 def prune_stale_queue_entries(config: dict, manifest_names: set) -> tuple[int, int]:
     """
     Remove pending and failed entries for packages no longer in the manifest.
@@ -376,7 +366,8 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
     received during the upstream check can interrupt it cleanly.
     """
     updates = []
-    repo_priority = config.get("repo_priority", ["local", "arch"])
+    default_priority = config.get("repo_priority", ["local", "arch"])
+    tier_overrides = config.get("package_tier_overrides", {})
     tier_sources = config.get("tier_sources", {})
     pkgbuilds_dir = config["pkgbuilds_dir"]
 
@@ -399,6 +390,12 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
             base_ver = ver_parts[0] + "-" + ver_parts[1].split(".")[0]
         else:
             base_ver = built_ver
+
+        # Honor per-package tier overrides, exactly like the build path does.
+        # Otherwise the upstream check can flag an "update" from a tier the build
+        # is configured to skip (e.g. python is pinned to arch because the CachyOS
+        # PKGBUILD needs a blacklisted dep) — producing an endless rebuild loop.
+        repo_priority = tier_overrides.get(name) or default_priority
 
         version_select = config.get("tier_version_select", "priority")
         best_dir = best_tier = None
@@ -524,6 +521,33 @@ def _service_active() -> bool:
     return False
 
 
+def _daemon_main_pid() -> int:
+    """Return the running daemon's PID via systemd, or 0 if not found."""
+    for svc in ("arch-native", "buildbot"):
+        result = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", svc],
+                                capture_output=True, text=True)
+        pid = result.stdout.strip()
+        if result.returncode == 0 and pid.isdigit() and int(pid) > 0:
+            return int(pid)
+    return 0
+
+
+def _wake_daemon() -> bool:
+    """Signal the running daemon to run an immediate build pass. Returns True on success."""
+    pid = _daemon_main_pid()
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+        return True
+    except (ProcessLookupError, PermissionError) as e:
+        log.debug("could not signal daemon (pid %d): %s", pid, e)
+        return False
+
+
+_STOPPED_MSG = "error: service is running — stop it first with: sudo systemctl stop arch-native"
+
+
 def _load_json_strict(path: str):
     with open(path, "r") as f:
         raw = f.read().strip()
@@ -598,10 +622,27 @@ def cmd_status(args, config: dict) -> int:
     active      = _service_active()
     timeout     = int(config.get("build_timeout") or 0)
 
+    metrics = {}
     metrics_mtime = None
     if os.path.exists(config["metrics_path"]):
         try: metrics_mtime = os.stat(config["metrics_path"]).st_mtime
         except Exception: pass
+        try:
+            with open(config["metrics_path"]) as f:
+                metrics = json.load(f)
+        except Exception:
+            pass
+
+    # Published patch-health summary (written by the daemon / `buildbot patch status`).
+    # Read-only here — recomputing is expensive, so we just surface what's on disk.
+    patch_summary = {}
+    _patch_path = os.path.join(config["repo_dir"], "patch-status.json")
+    if os.path.exists(_patch_path):
+        try:
+            with open(_patch_path) as f:
+                patch_summary = json.load(f)
+        except Exception:
+            pass
 
     building = in_progress.get("name") if in_progress else None
     elapsed = 0
@@ -690,19 +731,28 @@ def cmd_status(args, config: dict) -> int:
         section("Building")
         row("package", f"{BOLD}{building}{R}")
         row("elapsed", _age(elapsed) if elapsed else "just started")
+    elif active and metrics.get("status") not in ("sleeping", None):
+        # Daemon is mid-cycle (upgrading chroot / checking upstream) but not yet building.
+        section("Building", f"{DIM}working — preparing cycle{R}")
     else:
         section("Building", f"{DIM}idle{R}")
     print()
 
-    # Queue
+    # Queue — counts plus a short preview of what's up next (folds in `buildbot queue`)
     section("Queue", f"{len(pending)} pending")
     if pending:
-        row("new", str(len(new_pkgs)))
-        row("updates", str(len(update_pkgs)))
+        parts = [f"{len(new_pkgs)} new", f"{len(update_pkgs)} updates"]
         if retry_pkgs:
-            row("retries", str(len(retry_pkgs)))
-        if next_pkg:
-            row("next", f"{BOLD}{next_pkg}{R}")
+            parts.append(f"{len(retry_pkgs)} retries")
+        row("breakdown", DIM + " · ".join(parts) + R)
+        preview = pending[:5]
+        nw = max(len(p["name"]) for p in preview)
+        for i, p in enumerate(preview):
+            mark = f"{BOLD}▸{R}" if i == 0 else " "
+            reason = p.get("build_reason", "?")
+            print(f"  {mark} {p['name']:<{nw}}  {DIM}{p.get('version', '?')}  {reason}{R}")
+        if len(pending) > len(preview):
+            print(f"  {DIM}  +{len(pending) - len(preview)} more — run: buildbot queue{R}")
     print()
 
     # Recently built
@@ -715,7 +765,16 @@ def cmd_status(args, config: dict) -> int:
             print(f"  {n:<{nw}}  {DIM}{v:<{vw}}{R}  {DIM}{_age(age)} ago{R}")
         print()
 
-    # Failed — split into stalled (needs human attention) and active
+    # Failed — split into stalled (needs human attention) and active.
+    # A package can be published-ok AND have a failed rebuild attempt; annotate
+    # those so the Failed list doesn't read as "broken/missing" (matches `why`).
+    def _published_note(name):
+        e = built.get(name)
+        if (isinstance(e, dict) and e.get("version") and e.get("built_at")
+                and e.get("status") not in _DEFERRED_STATUSES):
+            return f"  {DIM}(repo has {e['version']}){R}"
+        return ""
+
     if failed_map:
         stalled_rows = [(n, r) for n, r in failed_map.items() if _is_stalled(r, config)]
         active_rows  = [(n, r) for n, r in failed_map.items() if not _is_stalled(r, config)]
@@ -734,7 +793,7 @@ def cmd_status(args, config: dict) -> int:
                     except Exception: pass
                 retries = rec.get("retries", 0)
                 reason = _sanitize_reason(rec.get("reason", "unknown"))[:50]
-                print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {retries}x  {reason}")
+                print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {retries}x  {reason}{_published_note(n)}")
             if len(stalled_rows) > SHOW:
                 print(f"  {DIM}+{len(stalled_rows) - SHOW} more — run: buildbot failed{R}")
             print()
@@ -752,7 +811,7 @@ def cmd_status(args, config: dict) -> int:
                         age = f"{_age(int((now - datetime.fromisoformat(ts)).total_seconds()))} ago"
                     except Exception: pass
                 reason = _sanitize_reason(rec.get("reason", "unknown"))[:60]
-                print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {reason}")
+                print(f"  {RED}{n:<{nw}}{R}  {DIM}{age:<10}{R}  {reason}{_published_note(n)}")
             if len(rows) > SHOW:
                 print(f"  {DIM}+{len(rows) - SHOW} more — run: buildbot failed{R}")
             print()
@@ -763,7 +822,21 @@ def cmd_status(args, config: dict) -> int:
         pct = rebuilt_count / installed_total * 100
         row("rebuilt", f"{rebuilt_count} / {installed_total}  ({pct:.0f}%)")
         if cascade_count:
-            row("pending", f"{cascade_count}  {DIM}(built, releasing once library updates land){R}")
+            # Show how long each has been staged so a long stall is visible rather
+            # than an opaque "pending N". A cascade can wait indefinitely if a world
+            # repo never finishes migrating reverse-deps off the old soname.
+            staged = []
+            for n, e in built.items():
+                if isinstance(e, dict) and e.get("status") == "pending_world_cascade" and e.get("built_at"):
+                    try:
+                        staged.append((n, int((now - datetime.fromisoformat(e["built_at"])).total_seconds())))
+                    except Exception:
+                        pass
+            staged.sort(key=lambda x: -x[1])
+            detail = ", ".join(f"{n} {_age(a)}" for n, a in staged[:4])
+            oldest = staged[0][1] if staged else 0
+            warn = RED if oldest > 14 * 86400 else DIM
+            row("pending", f"{cascade_count}  {warn}(staged, awaiting world soname migration: {detail}){R}")
         if blacklisted_count:
             row("blacklisted", f"{blacklisted_count} / {installed_total}  ({blacklisted_count / installed_total * 100:.0f}%)  {DIM}(see /etc/arch-native.conf){R}")
         if ineligible_count:
@@ -771,6 +844,17 @@ def cmd_status(args, config: dict) -> int:
         always_build_count = sum(1 for n in config.get("always_build", []) if n in built)
         if always_build_count:
             row("always-build", f"{always_build_count}  {DIM}(built + kept, not installed){R}")
+    if patch_summary.get("total"):
+        # Always show all four counts (including zeros) so this matches
+        # `buildbot patch status`; highlight review/fail red only when non-zero.
+        review, fail = patch_summary.get("review", 0), patch_summary.get("fail", 0)
+        bits = [
+            f"{patch_summary.get('ok', 0)} ok",
+            (f"{RED}{review} review{R}" if review else f"{review} review"),
+            (f"{RED}{fail} fail{R}" if fail else f"{fail} fail"),
+            f"{patch_summary.get('orphaned', 0)} orphaned",
+        ]
+        row("patches", f"{patch_summary['total']}  {DIM}({R}" + f"{DIM} · {R}".join(bits) + f"{DIM}){R}")
     if repo_size:
         row("size", repo_size)
     if cycle_str:
@@ -828,6 +912,28 @@ def cmd_doctor(args, config: dict) -> int:
     else:
         add("chroot_keyring", False, f"chroot not found: {chroot_root}")
 
+    # Stuck world-cascade packages: staged but never published. A long stall
+    # usually means a distro repo never finished migrating off the old soname.
+    try:
+        _b = get_built_state(config["state_path"])
+        _now = datetime.now(timezone.utc)
+        stuck = []
+        for n, e in _b.items():
+            if isinstance(e, dict) and e.get("status") == "pending_world_cascade" and e.get("built_at"):
+                try:
+                    days = int((_now - datetime.fromisoformat(e["built_at"])).total_seconds()) // 86400
+                    stuck.append((n, days))
+                except Exception:
+                    pass
+        if stuck:
+            stuck.sort(key=lambda x: -x[1])
+            detail = ", ".join(f"{n} {d}d" for n, d in stuck[:4])
+            add("cascades", stuck[0][1] <= 14, f"{len(stuck)} staged ({detail}) — see: buildbot why <pkg>")
+        else:
+            add("cascades", True, "none staged")
+    except Exception as e:
+        add("cascades", False, str(e))
+
     ok_all = True
     for name, ok, detail in checks:
         print(f"{'OK' if ok else 'FAIL':4} {name:14} {detail}")
@@ -851,7 +957,12 @@ def cmd_queue_show(args, config: dict) -> int:
 
 
 def cmd_sync(args, config: dict) -> int:
-    if not args.dry_run and _service_active():
+    daemon_active = _service_active()
+
+    # --reset clears the queue and rebuilds from scratch — a destructive rewrite
+    # of pending.json that must not race the daemon's own queue writes (the daemon
+    # does not take _queue_lock). Require a stop, consistent with retry/clear.
+    if args.reset and not args.dry_run and daemon_active:
         print(_STOPPED_MSG)
         return 2
 
@@ -860,6 +971,18 @@ def cmd_sync(args, config: dict) -> int:
     built = get_built_state(config["state_path"])
     pkgbase_map = build_pkgbase_map()
     needed = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
+
+    # When the daemon is running it owns the queue: writing pending.json from the
+    # CLI would race its own queue mutations. Instead just nudge it to run an
+    # immediate build pass — it re-derives the queue (step 2) and starts building.
+    if daemon_active and not args.dry_run and not args.reset:
+        need_count = len(needed)
+        summary = f"{need_count} package(s) need building" if need_count else "queue already up to date"
+        if _wake_daemon():
+            print(f"{summary} — building now (follow: journalctl -fu arch-native)")
+        else:
+            print(f"{summary} — daemon will pick them up within one poll cycle")
+        return 0
 
     lock_ctx = _queue_lock(config) if not args.dry_run else nullcontext()
     with lock_ctx:
@@ -885,10 +1008,12 @@ def cmd_sync(args, config: dict) -> int:
     action = "reset and rebuilt" if args.reset else "updated"
     suffix = "  (dry run)" if args.dry_run else ""
     print(f"queue {action}: {added} added, {len(existing)} total{suffix}")
+    if not args.dry_run:
+        if daemon_active and _wake_daemon():
+            print("building now (follow: journalctl -fu arch-native)")
+        elif not daemon_active:
+            print("start the service to build: sudo systemctl start arch-native")
     return 0
-
-
-_STOPPED_MSG = "error: service is running — stop it first with: sudo systemctl stop arch-native"
 
 
 def cmd_queue_retry_failed(args, config: dict) -> int:
@@ -1086,6 +1211,20 @@ def cmd_why(args, config: dict) -> int:
         print(f"  Version   {forge_ver}  (built {built_at})")
         if installed_ver:
             print(f"  Installed {installed_ver}")
+        # A package can be published-ok AND have a newer failed rebuild attempt —
+        # both are true. Surface the failed attempt instead of hiding it behind "ok".
+        if failed_rec:
+            fv = failed_rec.get("version", "?")
+            fts = _age_str(failed_rec.get("timestamp", ""))
+            freason = _sanitize_reason(failed_rec.get("reason", "unknown"))
+            fretries = failed_rec.get("retries", 0)
+            print(f"  Last try  {fv} failed {fts} — {freason} ({fretries}x)")
+            flog = failed_rec.get("log_path", "")
+            if flog:
+                print(f"  Log       {flog}")
+            print()
+            print(f"  The repo copy ({forge_ver}) is fine; only the rebuild to {fv} failed.")
+            print(f"  Retry: buildbot retry {pkg}   ·   Dismiss the failure: buildbot clear {pkg}")
         print()
         return 0
 
@@ -1101,12 +1240,32 @@ def cmd_why(args, config: dict) -> int:
         return 0
 
     if status == "pending_world_cascade":
+        staged_age = _age_str(built_rec.get("built_at", ""))
         print(f"  Status    built, waiting for library soname update in distro repos")
-        print(f"  Version   {forge_ver}")
+        print(f"  Version   {forge_ver}  (staged {staged_age})")
+        # Diagnose each awaited soname: not-yet-provided vs provided-but-a-world
+        # reverse-dep still needs the old one (the conservative second gate).
+        repo_name = config.get("repo_name", "")
+        blocking = []
+        for s in built_rec.get("cascade_sonames", []):
+            lib = s.split("=", 1)[0]
+            if not _world_has_soname(s, repo_name):
+                state = "not in distro repos yet"
+                blocking.append(s)
+            elif _world_depends_on_old_soname(lib, s, repo_name):
+                state = "provided, but a distro package still depends on the old soname"
+                blocking.append(s)
+            else:
+                state = "ready"
+            print(f"  Soname    {s} — {state}")
         print()
-        print("  The package was built successfully but uses a library whose new soname")
-        print("  hasn't landed in the distro repos yet. It will be released automatically")
-        print("  once the distro ships the updated library.")
+        if blocking:
+            print("  It releases automatically once every distro repo has migrated off the old")
+            print("  soname. Note: if the distro already ships this version (e.g. via CachyOS),")
+            print("  your client already gets it from there, so the staged copy is harmless to")
+            print("  leave waiting — it is not blocking your client from having the package.")
+        else:
+            print("  All sonames are ready — it should publish on the next cycle.")
         print()
         return 0
 
@@ -2247,7 +2406,7 @@ def _queue_from_manifest(config: dict, manifest: list, built: dict, pkgbase_map:
 # Main loop
 # ---------------------------------------------------------------------------
 def run_daemon(config_path: str, debug: bool):
-    global shutdown_flag
+    global shutdown_flag, wake_flag
 
     config = load_config(config_path)
 
@@ -2273,6 +2432,7 @@ def run_daemon(config_path: str, debug: bool):
     # Signal handlers
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
 
     log.info(
         "Buildbot starting (march=%s, mode=%s, distro=%s, poll=%ds, build_user=%s, repo_priority=%s)",
@@ -2419,10 +2579,19 @@ def run_daemon(config_path: str, debug: bool):
     while not shutdown_flag:
         cycle_start = time.time()
 
+        # A wake signal (from `buildbot sync`) requests a fast pass: skip the
+        # slow per-cycle work (chroot upgrade, upstream check) and go straight to
+        # building whatever the manifest/queue needs. The next natural cycle is full.
+        fast_pass = wake_flag
+        wake_flag = False
+
         # ----- Step 1: Chroot upgrade -----
-        log.info("Upgrading chroot...")
-        if not upgrade_chroot(config["chroot_root"], config.get("chroot_extra_packages", [])):
-            log.warning("Chroot upgrade did not complete — builds will use existing chroot state")
+        if fast_pass:
+            log.info("Fast build pass — skipping chroot upgrade and upstream check")
+        else:
+            log.info("Upgrading chroot...")
+            if not upgrade_chroot(config["chroot_root"], config.get("chroot_extra_packages", [])):
+                log.warning("Chroot upgrade did not complete — builds will use existing chroot state")
 
         if shutdown_flag:
             break
@@ -2477,7 +2646,7 @@ def run_daemon(config_path: str, debug: bool):
 
         # ----- Step 3: Upstream update check (async) -----
         now = time.time()
-        if manifest and (now - last_upstream_check) >= config["upstream_check_interval"]:
+        if not fast_pass and manifest and (now - last_upstream_check) >= config["upstream_check_interval"]:
             if _upstream_thread is None or not _upstream_thread.is_alive():
                 log.info("Starting async upstream update check...")
                 last_upstream_check = now
@@ -2659,9 +2828,10 @@ def run_daemon(config_path: str, debug: bool):
 
                 # c2. Skip if PKGBUILD version is older than what's already installed.
                 # Use _fmt_srcinfo_ver to include epoch so epoch packages compare correctly.
-                # Strip the local forge pkgrel bump (.1 suffix) from the manifest version
-                # before comparing — the upstream PKGBUILD will never have our added bump,
-                # so comparing against the raw version would permanently defer the rebuild.
+                # Strip the installed version's dotted pkgrel (.1 suffix) before comparing.
+                # That sub-pkgrel comes from the client side (the installed package was built
+                # by a vendor/helper at a dotted rel the server rebuilds at the plain rel);
+                # the PKGBUILD never carries it, so comparing raw would permanently defer.
                 pkgbuild_ver = _fmt_srcinfo_ver(srcinfo)
                 _manifest_base_ver = strip_local_pkgrel_bump(pkg["version"])
                 if vercmp(pkgbuild_ver, _manifest_base_ver) < 0:
@@ -2997,9 +3167,9 @@ def run_daemon(config_path: str, debug: bool):
             int(sleep_time),
         )
 
-        # Interruptible sleep
+        # Interruptible sleep — a wake signal cuts it short for an immediate pass.
         sleep_end = time.time() + sleep_time
-        while time.time() < sleep_end and not shutdown_flag:
+        while time.time() < sleep_end and not shutdown_flag and not wake_flag:
             time.sleep(1)
 
     log.info("Buildbot shutting down cleanly.")

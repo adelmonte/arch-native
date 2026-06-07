@@ -289,6 +289,32 @@ _DEFERRED_STATUSES = frozenset({
 })
 
 
+def strip_local_pkgrel_bump(version: str) -> str:
+    """Normalize a dot-bumped pkgrel back to upstream version form.
+
+    A version like '1.2.3-1.1' becomes '1.2.3-1'. The dotted pkgrel comes from
+    the client side — the installed package was built by a vendor/helper (e.g.
+    CachyOS) at a sub-pkgrel that the server rebuilds at the plain pkgrel. Every
+    version comparison normalizes through this so a plain server rebuild isn't
+    seen as perpetually behind the dotted installed version.
+    """
+    if "-" not in version:
+        return version
+
+    pkgver, pkgrel = version.rsplit("-", 1)
+    if "." not in pkgrel:
+        return version
+
+    parts = pkgrel.split(".")
+    if len(parts) < 2 or not parts[-1].isdigit():
+        return version
+
+    base_pkgrel = ".".join(parts[:-1])
+    if not base_pkgrel:
+        return version
+    return f"{pkgver}-{base_pkgrel}"
+
+
 def diff_manifest(
     manifest: list,
     built: dict,
@@ -317,7 +343,11 @@ def diff_manifest(
             todo.append({**pkg, "build_reason": "new"})
             continue
 
-        if vercmp(pkg["version"], built[name]["version"]) > 0:
+        # Normalize the installed version's dotted pkgrel before comparing, the
+        # same way every other comparison path does. Without this a package
+        # installed at e.g. '1.2.3-1.1' but rebuilt by the server at '1.2.3-1'
+        # would be re-queued every cycle forever.
+        if vercmp(strip_local_pkgrel_bump(pkg["version"]), built[name]["version"]) > 0:
             todo.append({**pkg, "build_reason": "update"})
 
     return todo
