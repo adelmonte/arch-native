@@ -54,6 +54,7 @@ _buildbot_patch_cmds() {
         'create:open upstream PKGBUILD in $EDITOR and save the diff as a local patch'
         'show:print the local patch for a package'
         'check:verify a local patch still applies against current upstream'
+        'status:recompute and publish patch health summary'
     )
     _describe 'patch subcommand' cmds
 }
@@ -74,6 +75,15 @@ _buildbot() {
 
     case ${words[1]} in
         status|doctor|init)
+            ;;
+        why)
+            _arguments '1:package:'
+            ;;
+        fsck)
+            _arguments \
+                '--dry-run[report issues without making changes]' \
+                '(-v --verbose)'{-v,--verbose}'[also print consistent packages]' \
+                '--force[run even if service is active]'
             ;;
         built|queue|failed)
             _arguments '-n[max entries to show]:count:'
@@ -114,11 +124,13 @@ _buildbot_cmds() {
         'logs:print or follow the build log for a package'
         'queue:list the pending build queue'
         'failed:list failed builds'
-        'retry:re-queue failed package(s)'
+        'retry:re-queue failed package(s) or force-rebuild any package'
         'clear:drop package(s) from the failed list'
         'sync:rebuild queue from manifest'
         'init:initialize a new installation'
         'patch:manage local PKGBUILD patches'
+        'why:explain why a package is in its current state'
+        'fsck:verify and repair repo/state consistency'
     )
     _describe 'command' cmds
 }

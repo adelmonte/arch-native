@@ -29,8 +29,8 @@ Show service state, the package currently being built, queue and failure
 counts, and stats from the most recent poll cycle.
 .SS doctor
 Verify that all required paths exist, JSON state files are valid, the GPG
-home has correct permissions (0700), and the chroot pacman keyring is
-initialised.
+home has correct permissions (0700), the chroot pacman keyring is
+initialised, and no packages are stuck in a pending cascade state.
 Safe to run while the service is active.
 .SS fsck [\-\-dry\-run] [\-v] [\-\-force]
 Verify and repair consistency between
@@ -81,6 +81,10 @@ Limit output to the first
 entries (default: all).
 .SS retry \fIPKG\fR [\-\-all] [\-\-dry\-run]
 Re\-queue failed package(s) for another build attempt.
+If a package is not in the failed list it is force\-queued for a fresh rebuild
+(its
+.I built.json
+entry is cleared first so the daemon does not skip it as already built).
 Requires the service to be stopped first.
 .TP
 .B \-\-all
@@ -166,7 +170,7 @@ Explicitly listed in
 .TP
 .B not\ found
 No PKGBUILD found in any configured tier (AUR packages, binary packages).
-.SS "patch {create|show|check|status|backfill} \fIPKG\fR"
+.SS "patch {create|show|check|status} \fIPKG\fR"
 Manage local PKGBUILD patches stored in
 .IR /var/lib/arch\-native/pkgbuilds/local/ .
 .TP
@@ -220,15 +224,6 @@ have failed.
 The daemon refreshes this file at startup and once per
 .B upstream_check_interval
 automatically; run this command to refresh it on demand.
-.TP
-.B "patch backfill"
-Stamp existing patches that lack a version header with the current upstream
-pkgver and pkgrel, establishing a baseline so future upstream drift is reported
-as
-.BR review .
-Patches that already have a header are left untouched.
-Useful once after upgrading to a version of arch\-native that records patch
-versions.
 .SH OPTIONS
 .TP
 .BI \-\-config " file"
@@ -285,7 +280,7 @@ buildbot logs firefox \-f
 .EE
 .RE
 .PP
-Re\-queue a single failed package:
+Re\-queue a single failed package (or force\-rebuild any package):
 .PP
 .RS 4
 .EX

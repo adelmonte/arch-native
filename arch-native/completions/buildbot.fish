@@ -13,12 +13,12 @@ complete -c buildbot -l debug   -d 'verbose logging (daemon mode only)'
 # ---------------------------------------------------------------------------
 function __buildbot_no_subcommand
     not __fish_seen_subcommand_from \
-        status doctor built logs queue failed retry clear sync init patch
+        status doctor built logs queue failed retry clear sync init patch why fsck
 end
 
 function __buildbot_no_patch_subcmd
     __fish_seen_subcommand_from patch
-    and not __fish_seen_subcommand_from create show check
+    and not __fish_seen_subcommand_from create show check status
 end
 
 # ---------------------------------------------------------------------------
@@ -54,6 +54,8 @@ complete -c buildbot -n __buildbot_no_subcommand -a clear   -d 'drop package(s) 
 complete -c buildbot -n __buildbot_no_subcommand -a sync    -d 'rebuild queue from manifest'
 complete -c buildbot -n __buildbot_no_subcommand -a init    -d 'initialize a new installation'
 complete -c buildbot -n __buildbot_no_subcommand -a patch   -d 'manage local PKGBUILD patches'
+complete -c buildbot -n __buildbot_no_subcommand -a why     -d 'explain why a package is in its current state'
+complete -c buildbot -n __buildbot_no_subcommand -a fsck    -d 'verify and repair repo/state consistency'
 
 # ---------------------------------------------------------------------------
 # built / queue / failed
@@ -88,11 +90,28 @@ complete -c buildbot -n '__fish_seen_subcommand_from sync' \
     -l dry-run -d 'preview without writing'
 
 # ---------------------------------------------------------------------------
+# why
+# ---------------------------------------------------------------------------
+complete -c buildbot -n '__fish_seen_subcommand_from why' \
+    -a '(__buildbot_built_pkgs)'
+
+# ---------------------------------------------------------------------------
+# fsck
+# ---------------------------------------------------------------------------
+complete -c buildbot -n '__fish_seen_subcommand_from fsck' \
+    -l dry-run -d 'report issues without making changes'
+complete -c buildbot -n '__fish_seen_subcommand_from fsck' \
+    -s v -l verbose -d 'also print consistent packages'
+complete -c buildbot -n '__fish_seen_subcommand_from fsck' \
+    -l force -d 'run even if service is active'
+
+# ---------------------------------------------------------------------------
 # patch subcommands
 # ---------------------------------------------------------------------------
 complete -c buildbot -n __buildbot_no_patch_subcmd -a create -d 'create or update a local patch'
 complete -c buildbot -n __buildbot_no_patch_subcmd -a show   -d 'print the local patch'
 complete -c buildbot -n __buildbot_no_patch_subcmd -a check  -d 'verify patch still applies'
+complete -c buildbot -n __buildbot_no_patch_subcmd -a status -d 'recompute and publish patch health summary'
 
 # patch create
 complete -c buildbot \

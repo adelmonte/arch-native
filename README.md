@@ -53,7 +53,7 @@ Works on any pacman-based distro.
 
 Build from source with `makepkg -si` from each directory.
 
-**Naming** — three names appear throughout this doc:
+**Naming** — four names appear throughout this doc:
 - **arch-native** — the project. What you install.
 - **buildbot** — the server binary (`/usr/bin/buildbot`). Both the daemon and the CLI.
 - **native-sync** — the client upgrade tool (`/usr/bin/native-sync`). Reads `FORGE_REPO` from the environment (default: `forge`).
@@ -591,7 +591,7 @@ download_retry_limit = 3
 # When all keyserver PGP key imports fail, retry the build with
 # --skippgpcheck. Source hashes (sha256/sha512) are still verified.
 # Packages built this way are flagged pgp_skipped:true in built.json.
-skip_pgp_on_import_failure = true
+skip_pgp_on_import_failure = false
 
 # Auto-prune stale package files from the repo dir.
 # When a package is rebuilt with a new version, repo-add updates the database
@@ -681,14 +681,18 @@ a non-standard layout:
 
 ```ini
 # chroot_dir         = /var/lib/arch-native/chroots
+# chroot_root        = /var/lib/arch-native/chroots/root
 # repo_dir           = /var/lib/arch-native/repo
 # repo_db            = /var/lib/arch-native/repo/<repo_name>.db.tar.zst
 # pkgbuilds_dir      = /var/lib/arch-native/pkgbuilds
+# makepkg_configs_dir = /var/lib/arch-native/makepkg-configs
 # manifest_path      = /var/lib/arch-native/manifests/client.json
 # gnupg_home         = /var/lib/arch-native/gnupg
 # log_dir            = /var/lib/arch-native/logs
 # metrics_path       = /var/lib/arch-native/metrics.json
 ```
+
+> `chroot_dir` is the parent directory; `chroot_root` is the clean base chroot inside it. If you override `chroot_dir` without also setting `chroot_root`, the clean base chroot will still be at the original default path — set both.
 
 ---
 
@@ -733,8 +737,9 @@ blacklist = gcc,glibc,binutils,coreutils,linux-api-headers,
             *-translations,hunspell-*,tesseract-data-*
 ```
 
-Run `buildbot status` after editing the blacklist to see the updated skipped
-count. Use `buildbot queue -n 200` to review what is actually queued.
+Run `buildbot status` after editing the blacklist to see the updated
+**blacklisted** count under the Repo section. Use `buildbot queue -n 200` to
+review what is actually queued.
 
 ---
 
@@ -744,7 +749,7 @@ Beyond the explicit blacklist, there are a few other reasons a package never
 appears in the queue:
 
 **Auto-ineligible packages** — these are detected automatically and counted
-under "skipped" in `buildbot status`, without needing a blacklist entry:
+under **ineligible** in `buildbot status`, without needing a blacklist entry:
 
 - `arch=any` packages — no compiled code, so no benefit from rebuilding.
 - Packages with `ghc` or `haskell-ghc` as a `makedepends` — Haskell
@@ -759,6 +764,15 @@ is held in `pending_upstream` rather than queued. It will be released
 automatically once the upstream tier catches up and the hourly upstream check
 detects the new PKGBUILD version. Run `buildbot sync` to force a re-scan if
 you want to check the current state.
+
+**`pending_world_cascade` — waiting for a soname migration** — if a package
+introduces a soname bump, the built files are staged in the repo directory but
+not published to the pacman DB until the world repos (Arch, Artix, CachyOS)
+finish migrating their reverse-dependencies off the old soname. A package in
+this state is visible in `buildbot status` under the **pending** row, annotated
+with how long it has been staged. Use `buildbot why <pkg>` to check. This state
+resolves automatically once the upstream cascade completes; no manual action is
+needed unless the package has been staged for more than a few weeks.
 
 **Stalled failures** — packages that have failed ≥ `failed_stall_retries`
 times (default 5) and whose last failure was ≥ `failed_stall_days` days ago
@@ -1043,7 +1057,7 @@ in the "skipped" total in `buildbot status`.
 
 ### AUR and binary packages
 
-AUR packages have no upstream PKGBUILD in any of the four tiers. The daemon
+AUR packages have no upstream PKGBUILD in any configured tier. The daemon
 detects them as unresolvable and marks them `not_found` in `failed.json`.
 Binary packages (e.g. `*-bin`) have no source to compile.
 
@@ -1170,25 +1184,30 @@ Building
   elapsed    1h23m
 
 Queue  52 pending
-  new        8
-  updates    44
-  next       thunderbird
+  breakdown  8 new · 44 updates
+  ▸ thunderbird  115.12.0-1  update
+    curl         8.12.1-1    update
+    ...
 
 Recently built
   fish          3.7.1-2   2h ago
   curl          8.7.1-1   3h ago
   zstd          1.5.6-1   5h ago
 
-Failed  3
-  gpgme      3d ago    build failed: collect2: error: ld returned 1
-  krb5       5d ago    download failed after 3 attempts
+Stalled  needs attention  1
+  gpgme      7d ago       5x  collect2: error: ld returned 1 exit status
+
+Failed  2
+  krb5       2h ago    download failed after 3 attempts
   +1 more — run: buildbot failed
 
 Repo  forge
-  rebuilt    987 / 1189  (83%)
-  skipped    47 / 1189  (blacklist — see /etc/arch-native.conf)
-  size       12G
-  next cycle in 4m
+  rebuilt      987 / 1189  (83%)
+  blacklisted  47 / 1189  (4%)  (see /etc/arch-native.conf)
+  ineligible   12 / 1189  (1%)  (arch=any — not rebuilt)
+  patches      44  (41 ok · 2 review · 1 fail · 0 orphaned)
+  size         12G
+  next cycle   in 4m
 ```
 
 **next cycle** is the countdown to the next poll cycle. Each cycle:
@@ -1234,7 +1253,8 @@ Both conditions mean the build is stuck and the daemon needs attention.
 buildbot doctor
 ```
 Checks: paths exist, JSON files are valid, gnupg home has correct permissions
-(0700), chroot keyring is initialized.
+(0700), chroot keyring is initialized, and no packages are stuck in a pending
+cascade state.
 
 ```
 buildbot fsck [--dry-run] [-v] [--force]
@@ -1274,19 +1294,35 @@ buildbot logs PKG [-f]
 Prints the latest build log for PKG. `-f` follows the log in real time
 (equivalent to `tail -f`), useful while a build is running.
 
+```
+buildbot why PKG
+```
+Explains in plain English why PKG is in its current state — built, failed,
+stalled, pending, deferred (`pending_upstream`, `pending_world_cascade`),
+ineligible, blacklisted, or not found. Useful when a package is missing from
+the repo and the reason isn't obvious from `buildbot status`.
+
 ### Queue management
 
-These commands require the service to be stopped first (command depends on
-your init system; see [Service management](#service-management)):
+`retry`, `clear`, and `sync --reset` require the service to be stopped first.
+`sync` without `--reset` works while the daemon is running — it signals the
+daemon to start an immediate build pass rather than waiting for the next poll.
 
 ```bash
-# Stop the daemon
-sudo systemctl stop arch-native      # systemd
-# sudo rc-service arch-native stop   # OpenRC
-# sudo dinitctl stop arch-native     # dinit
+# Re-scan the installed package list and signal the daemon to build now.
+# Works whether or not the service is running.
+sudo buildbot sync
 
-# Move one failed package back to the queue
+# Move one failed package back to the queue (service must be stopped)
+sudo systemctl stop arch-native
 sudo buildbot retry firefox
+sudo systemctl start arch-native
+
+# Force-rebuild any package (not just failed ones) — clears its built.json
+# entry so the daemon treats it as unbuilt
+sudo systemctl stop arch-native
+sudo buildbot retry networkmanager
+sudo systemctl start arch-native
 
 # Move all failed packages back (skips ones no longer in the manifest)
 sudo buildbot retry --all
@@ -1300,15 +1336,11 @@ sudo buildbot clear firefox
 # Remove all packages from the failed list
 sudo buildbot clear --all
 
-# Preview what clear --all would do
-sudo buildbot clear --all --dry-run
-
-# Recompute the pending queue from the current installed package list.
-# Use --reset to clear existing queue first (removes stale entries).
-# Use --dry-run to preview what would be added without writing anything.
+# Clear queue and rebuild from scratch (service must be stopped)
+sudo systemctl stop arch-native      # systemd
+# sudo rc-service arch-native stop   # OpenRC
+# sudo dinitctl stop arch-native     # dinit
 sudo buildbot sync --reset
-
-# Restart the daemon
 sudo systemctl start arch-native
 ```
 

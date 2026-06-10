@@ -43,11 +43,17 @@ _buildbot() {
                 COMPREPLY=($(compgen -W "--config --debug" -- "$cur"))
             else
                 COMPREPLY=($(compgen -W \
-                    "status doctor built logs queue failed retry clear sync init patch" \
+                    "status doctor built logs queue failed retry clear sync init patch why fsck" \
                     -- "$cur"))
             fi
             ;;
         status|doctor|init)
+            ;;
+        why)
+            COMPREPLY=($(compgen -W "$(_buildbot_built_pkgs)" -- "$cur"))
+            ;;
+        fsck)
+            COMPREPLY=($(compgen -W "--dry-run -v --verbose --force" -- "$cur"))
             ;;
         built|queue|failed)
             COMPREPLY=($(compgen -W "-n" -- "$cur"))
@@ -72,7 +78,7 @@ _buildbot() {
         patch)
             case "$patch_cmd" in
                 "")
-                    COMPREPLY=($(compgen -W "create show check" -- "$cur"))
+                    COMPREPLY=($(compgen -W "create show check status" -- "$cur"))
                     ;;
                 create)
                     [[ "$cur" == -* ]] && \
