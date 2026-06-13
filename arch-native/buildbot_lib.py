@@ -218,8 +218,11 @@ LDFLAGS="-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now -Wl,-
 LTOFLAGS="-flto=auto -falign-functions=32"
 RUSTFLAGS="{rustflags}"
 MAKEFLAGS="-j$(nproc)"
-BUILDDIR=/tmp/makepkg
-SRCDEST=/tmp/makepkg-src
+# On-disk, not /tmp: nspawn mounts /tmp as a small tmpfs, and stripping the
+# huge unstripped libxul.so (firefox/thunderbird) overflows it — objcopy then
+# truncates the .so to 0 bytes. /var/tmp lives on the chroot's real filesystem.
+BUILDDIR=/var/tmp/makepkg
+SRCDEST=/var/tmp/makepkg-src
 PACKAGER="Buildbot <buildbot@{config.get('repo_name', 'arch-native')}>"
 
 BUILDENV=(!distcc color !ccache {check_flag} !sign)
@@ -1129,10 +1132,62 @@ def build_package(
 
     log.info("[%s] build produced %d package(s)", pkg["name"], len(pkg_files))
 
+    # Reject packages containing 0-byte shared libraries or executables before
+    # they can be signed and published. A truncated libxul.so otherwise sails
+    # through as a "success" because makepkg still emits a .pkg.tar.zst.
+    offenders = _validate_package_contents(pkg_files)
+    if offenders:
+        for pkg_base, member in offenders:
+            log.error("[%s] content validation FAILED: 0-byte %s in %s",
+                      pkg["name"], member, pkg_base)
+        _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                       remove_packages=True)
+        return False, [], None
+
     # Cleanup chroot copies and build artifacts
     _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"])
 
     return True, pkg_files, None
+
+
+# ---------------------------------------------------------------------------
+# Package content validation
+# ---------------------------------------------------------------------------
+def _validate_package_contents(pkg_files: list[str]) -> list[tuple[str, str]]:
+    """Detect packages that contain 0-byte shared libraries or executables.
+
+    A build can exit 0 and still emit a .pkg.tar.zst whose libxul.so (or other
+    binary) was truncated to 0 bytes by an interrupted strip/link step. Such a
+    package installs cleanly but the file is unusable ("file too short"). Catch
+    that class before signing/repo-add. Returns a list of (package_basename,
+    member_path) offenders; empty means the packages are OK.
+    """
+    offenders = []
+    for f in pkg_files:
+        try:
+            result = subprocess.run(
+                ["bsdtar", "-tvf", f],
+                capture_output=True, text=True, timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("content validation: listing %s timed out — skipping", f)
+            continue
+        if result.returncode != 0:
+            log.warning("content validation: cannot list %s: %s", f, result.stderr.strip())
+            continue
+        for line in result.stdout.splitlines():
+            # libarchive tvf: "perms links owner group size month day time name"
+            fields = line.split(None, 8)
+            if len(fields) < 9:
+                continue
+            perms, _, _, _, size, _, _, _, name = fields
+            if not perms.startswith("-") or size != "0":
+                continue  # only zero-byte regular files
+            is_lib = name.endswith(".so") or ".so." in name
+            is_exec = "x" in perms and name.startswith(("usr/bin/", "usr/lib/", "usr/sbin/"))
+            if is_lib or is_exec:
+                offenders.append((os.path.basename(f), name))
+    return offenders
 
 
 # ---------------------------------------------------------------------------
