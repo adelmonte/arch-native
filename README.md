@@ -367,7 +367,9 @@ sudo FORGE_REPO=myrepo native-sync
 ### Configuration reference
 
 All settings live in the `[arch-native]` section of `/etc/arch-native.conf`. The
-**Default** column is the built-in fallback used when a key is omitted.
+**Default** column is the built-in fallback used when a key is omitted. Inline
+comments are allowed (`key = value   # note`); values themselves must not
+contain `#`.
 
 > The bundled config ships with opinionated starter values that differ from the
 > code defaults — `mode = local`, `distro = arch`, an example `blacklist`,
@@ -379,10 +381,29 @@ All settings live in the `[arch-native]` section of `/etc/arch-native.conf`. The
 | Key | Default | Meaning |
 |---|---|---|
 | `repo_name` | `forge` | pacman DB filename and `PACKAGER` field |
-| `march` | `native` | compiler target CPU. `native` for local; an explicit value (`znver4`, `pantherlake`, …) for remote cross-builds. Find yours: `gcc -march=native -Q --help=target \| grep march` |
 | `mode` | `remote` | `local` or `remote` (see [Modes](#modes)) |
 | `distro` | `artix` | `arch` or `artix`. `artix` installs libelogind/elogind/libudev into the chroot each cycle and deploys an artix-meson wrapper |
 | `build_user` | `buildbot` | system user that owns and runs builds; must exist |
+
+#### Build optimization
+
+These shape the generated `makepkg.conf`. Each is optional; leaving it unset
+keeps the tuned default, so the conf is unchanged out of the box. Editing one
+regenerates the conf on the next daemon start.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `march` | `native` | compiler target CPU → `-march=`. `native` for local; an explicit value (`znver4`, `pantherlake`, …) for remote cross-builds. Find yours: `gcc -march=native -Q --help=target \| grep march` |
+| `opt_level` | `3` | optimization level → `-O<opt_level>` (C/C++) and `-C opt-level` (Rust). Valid: `0 1 2 3 s g fast` (`fast`→`-Ofast`/rust `3`, `g`→`-Og`/rust `1`) |
+| `lto` | `true` | LTO master switch. `false` clears `LTOFLAGS` and sets `!lto` |
+| `ltoflags` | `-flto=auto -falign-functions=32` | LTO flags used when `lto = true` |
+| `cflags_base` | `-pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -fstack-clash-protection -fcf-protection -fno-semantic-interposition` | static portion of CFLAGS (everything except `-march`/`-O`, which come from `march`/`opt_level`) |
+| `ldflags` | `-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now -Wl,-z,pack-relative-relocs` | linker flags (LDFLAGS) |
+| `extra_cflags` | *(empty)* | appended verbatim to CFLAGS on top of `cflags_base`. GCC 15 made several legacy C patterns hard errors — demote them while upstream catches up: `-Wno-error=incompatible-pointer-types -Wno-error=discarded-qualifiers -Wno-error=implicit-function-declaration` |
+
+> In remote mode Rust still only gets `-C opt-level=<opt_level>` (no
+> `target-cpu`) — Cargo runs `build.rs` on the build host. C/C++ gets the full
+> `-march` via CFLAGS. See [Build host / target CPU mismatch](#build-host--target-cpu-mismatch-remote-mode).
 
 #### PKGBUILD resolution
 
@@ -465,7 +486,6 @@ cleans it out next cycle.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `extra_cflags` | *(empty)* | appended to CFLAGS for every build. GCC 15 made several legacy C patterns hard errors — demote them while upstream catches up: `-Wno-error=incompatible-pointer-types -Wno-error=discarded-qualifiers -Wno-error=implicit-function-declaration` |
 | `log_level` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`; `DEBUG` traces per-package resolution |
 
 #### Artix / chroot
@@ -707,8 +727,9 @@ that version.
 
 A build that fails with a linker error (`collect2: error: ld returned`) or Rust
 LTO incompatibility is retried once with LTO disabled (`LTOFLAGS=""`, `!lto`),
-logged as `<timestamp>-nolto.log`. Add packages to `lto_blacklist` to skip the
-doomed first attempt.
+logged as `<timestamp>-nolto.log`. Add packages to `lto_blacklist` (fnmatch
+globs allowed) to build them with LTO off from the start and skip the doomed
+first attempt. To turn LTO off globally, set `lto = false`.
 
 ### Build host / target CPU mismatch (remote mode)
 
@@ -718,7 +739,7 @@ When the build server can't execute target-CPU binaries, the daemon:
   SIGILL;
 - omits `target-cpu=<march>` from `RUSTFLAGS` — Cargo runs `build.rs` on the
   build host; C/C++ still gets full `-march` via `CFLAGS`, only Rust is limited
-  to `-C opt-level=3`.
+  to `-C opt-level=<opt_level>`.
 
 In local mode (`march = native`) both limitations lift and tests run.
 

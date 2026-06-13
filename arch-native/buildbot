@@ -85,7 +85,7 @@ def handle_sigusr1(signum, frame):
 # Config loading
 # ---------------------------------------------------------------------------
 def load_config(path: str) -> dict:
-    cp = configparser.ConfigParser()
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#",))
     cp.read(path)
 
     # Accept either [arch-native] or legacy [buildbot] section name
@@ -132,6 +132,19 @@ def load_config(path: str) -> dict:
     cfg["failed_stall_retries"] = sec.getint("failed_stall_retries", 5)
     cfg["failed_stall_days"] = sec.getint("failed_stall_days", 7)
     cfg["extra_cflags"] = sec.get("extra_cflags", "")
+
+    # Build optimization knobs. Each is optional; empty means "use the built-in
+    # default" (see DEFAULT_* in buildbot_lib), so the generated makepkg.conf is
+    # unchanged unless the user sets one.
+    opt_level = sec.get("opt_level", "3").strip()
+    if opt_level not in ("0", "1", "2", "3", "s", "g", "fast"):
+        log.warning("Unknown opt_level '%s', defaulting to '3'", opt_level)
+        opt_level = "3"
+    cfg["opt_level"] = opt_level
+    cfg["lto"] = sec.getboolean("lto", True)
+    cfg["ltoflags"] = sec.get("ltoflags", "")
+    cfg["cflags_base"] = sec.get("cflags_base", "")
+    cfg["ldflags"] = sec.get("ldflags", "")
 
     raw_vs = sec.get("tier_version_select", "priority").strip().lower()
     if raw_vs not in ("priority", "highest"):

@@ -175,6 +175,36 @@ def read_local_packages(db_path: str = "/var/lib/pacman") -> list[dict]:
     return packages
 
 
+# Defaults for the optimization knobs, used when the config leaves them blank.
+DEFAULT_CFLAGS_BASE = (
+    "-pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 "
+    "-fstack-clash-protection -fcf-protection -fno-semantic-interposition"
+)
+DEFAULT_LDFLAGS = (
+    "-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now "
+    "-Wl,-z,pack-relative-relocs"
+)
+DEFAULT_LTOFLAGS = "-flto=auto -falign-functions=32"
+
+
+def _rust_opt_level(opt: str) -> str:
+    """Map a GCC -O level to a valid Rust -C opt-level (rustc accepts 0-3, s, z)."""
+    return {"fast": "3", "g": "1"}.get(opt, opt)
+
+
+def _write_nolto_conf(src_conf: str) -> str:
+    """Write a copy of src_conf with LTO disabled (LTOFLAGS="" and OPTIONS !lto).
+    Returns the path to the new <src_conf>.nolto file."""
+    dst = src_conf + ".nolto"
+    with open(src_conf, "r") as f:
+        text = f.read()
+    text = re.sub(r'^LTOFLAGS=".*"$', 'LTOFLAGS=""', text, flags=re.MULTILINE)
+    text = re.sub(r"\blto\b", "!lto", text)
+    with open(dst, "w") as f:
+        f.write(text)
+    return dst
+
+
 def generate_makepkg_conf(config: dict, output_path: str):
     """
     Write a makepkg.conf to output_path based on config values.
@@ -186,24 +216,35 @@ def generate_makepkg_conf(config: dict, output_path: str):
     mode  = config.get("mode", "remote")
     local = (mode == "local")
 
+    # Optimization knobs — each falls back to the long-standing default when the
+    # config leaves it unset (empty string), so behavior is unchanged out of the box.
+    opt_level   = str(config.get("opt_level") or "3").strip()
+    cflags_base = (config.get("cflags_base") or DEFAULT_CFLAGS_BASE).strip()
+    ldflags     = (config.get("ldflags") or DEFAULT_LDFLAGS).strip()
+    ltoflags    = (config.get("ltoflags") or DEFAULT_LTOFLAGS).strip()
+    lto_enabled = config.get("lto", True)
+
     extra = config.get("extra_cflags", "").strip()
     cflags = (
-        f"-march={march} -O3 -pipe -fno-plt -fexceptions "
-        f"-Wp,-D_FORTIFY_SOURCE=3 -fstack-clash-protection "
-        f"-fcf-protection -fno-semantic-interposition"
+        f"-march={march} -O{opt_level} {cflags_base}"
         + (f" {extra}" if extra else "")
     )
 
+    rust_opt = _rust_opt_level(opt_level)
     if local:
-        rustflags = "-C opt-level=3 -C target-cpu=native"
+        rustflags = f"-C opt-level={rust_opt} -C target-cpu=native"
         check_flag = "check"
         mode_comment = "local mode — building and running on the same machine"
     else:
-        rustflags = "-C opt-level=3"
+        rustflags = f"-C opt-level={rust_opt}"
         check_flag = "!check"
         mode_comment = (
             "remote mode — !check: test suites may SIGILL if march != build host CPU"
         )
+
+    # LTO is a master toggle: when disabled, clear LTOFLAGS and flip OPTIONS to !lto.
+    lto_option    = "lto" if lto_enabled else "!lto"
+    ltoflags_line = ltoflags if lto_enabled else ""
 
     content = f"""\
 #!/hint/bash
@@ -214,8 +255,8 @@ CHOST="x86_64-pc-linux-gnu"
 
 CFLAGS="{cflags}"
 CXXFLAGS="$CFLAGS -Wp,-D_GLIBCXX_ASSERTIONS"
-LDFLAGS="-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now -Wl,-z,pack-relative-relocs"
-LTOFLAGS="-flto=auto -falign-functions=32"
+LDFLAGS="{ldflags}"
+LTOFLAGS="{ltoflags_line}"
 RUSTFLAGS="{rustflags}"
 MAKEFLAGS="-j$(nproc)"
 # On-disk, not /tmp: nspawn mounts /tmp as a small tmpfs, and stripping the
@@ -226,7 +267,7 @@ SRCDEST=/var/tmp/makepkg-src
 PACKAGER="Buildbot <buildbot@{config.get('repo_name', 'arch-native')}>"
 
 BUILDENV=(!distcc color !ccache {check_flag} !sign)
-OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge debug lto)
+OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge debug {lto_option})
 
 DLAGENTS=("file::/usr/bin/curl -qgC - -o %o %u"
           "ftp::/usr/bin/curl -qfC - --ftp-pasv --retry 3 --retry-delay 3 -o %o %u"
@@ -1052,8 +1093,25 @@ def build_package(
                 log.error("[%s] build timed out after %ds", pkg["name"], timeout)
                 return -2  # sentinel: timeout
 
+    # Packages known to break under LTO are built with it off from the start,
+    # skipping the doomed first attempt. Only meaningful when LTO is globally on.
+    lto_disabled = (
+        config.get("lto", True)
+        and _in_blacklist(pkg["name"], config.get("lto_blacklist", []))
+    )
+    primary_conf = makepkg_conf
+    if lto_disabled:
+        log.info("[%s] in lto_blacklist — building with LTO disabled", pkg["name"])
+        primary_conf = _write_nolto_conf(makepkg_conf)
+
     chroots_used = [chroot_name]
-    rc = _run_build(makepkg_conf, chroot_name, log_file)
+    rc = _run_build(primary_conf, chroot_name, log_file)
+
+    if lto_disabled:
+        try:
+            os.remove(primary_conf)
+        except OSError:
+            pass
 
     if rc != 0:
         # Check for LTO errors
@@ -1091,19 +1149,13 @@ def build_package(
                            remove_packages=True)
             return False, [], "timeout"
 
-        if RE_LD_ERROR.search(build_output) or RE_RUST_LTO_ERROR.search(build_output):
+        if not lto_disabled and (
+            RE_LD_ERROR.search(build_output) or RE_RUST_LTO_ERROR.search(build_output)
+        ):
             log.warning(
                 "[%s] LTO error detected, retrying with LTO disabled", pkg["name"]
             )
-            nolto_conf = makepkg_conf + ".nolto"
-            with open(makepkg_conf, "r") as f:
-                conf_text = f.read()
-            conf_text = re.sub(
-                r'^LTOFLAGS=".*"$', 'LTOFLAGS=""', conf_text, flags=re.MULTILINE
-            )
-            conf_text = re.sub(r"\blto\b", "!lto", conf_text)
-            with open(nolto_conf, "w") as f:
-                f.write(conf_text)
+            nolto_conf = _write_nolto_conf(makepkg_conf)
 
             timestamp2 = datetime.now().strftime("%Y%m%d-%H%M%S")
             log_file_retry = os.path.join(log_dir, f"{timestamp2}-nolto.log")
