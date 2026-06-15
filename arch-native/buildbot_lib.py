@@ -82,6 +82,10 @@ RE_DOWNLOAD_FAILURE = re.compile(
     r"|error: Could not resolve host"
     r"|Network is unreachable"
 )
+# PGP source-signature verification failed (key missing/invalid/revoked in the
+# build keyring, or keyserver unreachable). makepkg also prints "Could not
+# download sources" for this, so it must be detected before RE_DOWNLOAD_FAILURE.
+RE_PGP_FAILURE = re.compile(r"(?mi)One or more PGP signatures could not be verified")
 # Missing makedep — pacman can't find a required build dependency in any repo.
 # This is tier-specific, not transient: retrying on the same tier will always fail.
 RE_DEP_NOT_FOUND = re.compile(r"error: target not found: (\S+)")
@@ -1042,7 +1046,7 @@ def build_package(
     if skippgpcheck:
         log.warning("[%s] PGP key import failed — building with --skippgpcheck (source hashes still verified)", pkg["name"])
 
-    def _run_build(conf_path, chroot_id, logpath):
+    def _run_build(conf_path, chroot_id, logpath, skippgp=skippgpcheck):
         cmd = [
             "makechrootpkg",
             "-c",
@@ -1056,7 +1060,7 @@ def build_package(
             "-m",
             "--noprogressbar",
         ]
-        if skippgpcheck:
+        if skippgp:
             cmd.append("--skippgpcheck")
         env = os.environ.copy()
         env["GNUPGHOME"] = config["gnupg_home"]
@@ -1117,6 +1121,30 @@ def build_package(
         # Check for LTO errors
         with open(log_file, "r", errors="replace") as lf:
             build_output = lf.read()
+
+        # PGP source-signature verification failed and import_pgp_keys couldn't
+        # fix it (key invalid in the chroot keyring, never imported, keyserver
+        # down, etc.). When skip_pgp_on_import_failure is set, retry once with
+        # --skippgpcheck — source hashes are still verified and the build is
+        # signed with buildbot's own key. Must run before the download check,
+        # which would otherwise mislabel this as a transient network failure.
+        if (not skippgpcheck and config.get("skip_pgp_on_import_failure")
+                and RE_PGP_FAILURE.search(build_output)):
+            log.warning("[%s] PGP verification failed; retrying with --skippgpcheck "
+                        "(source hashes still verified)", pkg["name"])
+            retry_conf = _write_nolto_conf(makepkg_conf) if lto_disabled else makepkg_conf
+            timestamp_pgp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_file = os.path.join(log_dir, f"{timestamp_pgp}-skippgp.log")
+            pgp_chroot = chroot_name + "-skippgp"
+            chroots_used.append(pgp_chroot)
+            rc = _run_build(retry_conf, pgp_chroot, log_file, skippgp=True)
+            if lto_disabled:
+                try:
+                    os.remove(retry_conf)
+                except OSError:
+                    pass
+            with open(log_file, "r", errors="replace") as lf:
+                build_output = lf.read()
 
         # Missing makedep — tier-specific, retrying won't help. Return a typed
         # error so the daemon can skip this tier and try the next one.
