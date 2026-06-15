@@ -4,6 +4,7 @@ exec /usr/bin/meson setup \
   --sysconfdir=/etc \
   --localstatedir=/var \
   --sbindir=/usr/bin \
+  --libexecdir=/usr/lib \
   --buildtype=plain \
   --auto-features=enabled \
   --wrap-mode=nodownload \
