@@ -2485,16 +2485,18 @@ def run_daemon(config_path: str, debug: bool):
     if os.path.isdir(chroot_root):
         # artix-meson wrapper — only needed for Artix
         if config["distro"] == "artix":
-            artix_meson_src = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "artix-meson"
-            )
-            if os.path.isfile(artix_meson_src):
-                dest = os.path.join(chroot_root, "usr/local/bin/artix-meson")
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                import shutil as _shutil
-                _shutil.copy2(artix_meson_src, dest)
-                os.chmod(dest, 0o755)
-                log.info("Deployed artix-meson into chroot")
+            for artix_meson_src in (
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "artix-meson"),
+                "/usr/share/arch-native/artix-meson",
+            ):
+                if os.path.isfile(artix_meson_src):
+                    dest = os.path.join(chroot_root, "usr/local/bin/artix-meson")
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    import shutil as _shutil
+                    _shutil.copy2(artix_meson_src, dest)
+                    os.chmod(dest, 0o755)
+                    log.info("Deployed artix-meson into chroot")
+                    break
 
         # chroot pacman.conf — only redeploy if explicitly configured.
         # The install/deploy script handles the initial copy; this path is for
