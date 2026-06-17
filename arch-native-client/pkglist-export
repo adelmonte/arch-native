@@ -63,12 +63,22 @@ print(json.dumps(packages, indent=2))
 
 PKG_COUNT=$(python3 -c "import json; print(len(json.load(open('$EXPORT_FILE'))))")
 
-# Best-effort sync: tolerate a transient network / Tailscale route flap
-# (e.g. Wi-Fi roam or DHCP renew right as the hook fires). A failed sync
-# must never fail the pacman transaction — the packages are already installed.
+# pacman runs transaction hooks inside an isolated network namespace that has no
+# tailscale0 interface, so a Tailscale-addressed build server is unroutable from
+# here ("Network is unreachable"). Re-enter PID 1's network namespace (the host
+# ns, which has tailscale0) for the sync. No-op when already in the host ns
+# (e.g. run by hand); only attempted as root with nsenter available.
+NSENTER=()
+if [[ $EUID -eq 0 ]] && command -v nsenter >/dev/null 2>&1 \
+    && [[ "$(readlink /proc/self/ns/net)" != "$(readlink /proc/1/ns/net)" ]]; then
+    NSENTER=(nsenter --net=/proc/1/ns/net)
+fi
+
+# Best-effort sync: a failed sync must never fail the pacman transaction — the
+# packages are already installed. Retry briefly to ride out any real network blip.
 attempts=3
 for ((i = 1; i <= attempts; i++)); do
-    if rsync -az --checksum -e "ssh ${SSH_OPTS[*]}" "$EXPORT_FILE" "$REMOTE"; then
+    if "${NSENTER[@]}" rsync -az --checksum -e "ssh ${SSH_OPTS[*]}" "$EXPORT_FILE" "$REMOTE"; then
         logger -t pkglist-export "Synced $PKG_COUNT packages to $REMOTE_HOST"
         exit 0
     fi
