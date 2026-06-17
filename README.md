@@ -464,7 +464,7 @@ cleans it out next cycle.
 |---|---|---|
 | `build_timeout` | `14400` | per-build limit in seconds; `0` disables |
 | `download_retry_limit` | `3` | re-queue transient download failures this many times before failing |
-| `skip_pgp_on_import_failure` | `false` | if all keyserver imports fail, retry with `--skippgpcheck` (source hashes still verified; flagged `pgp_skipped` in built.json) |
+| `skip_pgp_on_import_failure` | `false` | when a source signature can't be verified (key missing/invalid/untrusted), retry with `--skippgpcheck` (source hashes still verified; flagged `pgp_skipped` in built.json). A **bad signature or revoked key is never skipped** — it stays a hard failure |
 | `autoprune` | `true` | delete old `.pkg.tar.zst` (+ `.sig`) after each rebuild |
 | `autoprune_keep` | `1` | versions retained per package (≥ 1; raise for rollback) |
 | `autoprune_blacklisted` | `true` | drop newly-blacklisted packages from repo + DB each cycle |

@@ -82,10 +82,17 @@ RE_DOWNLOAD_FAILURE = re.compile(
     r"|error: Could not resolve host"
     r"|Network is unreachable"
 )
-# PGP source-signature verification failed (key missing/invalid/revoked in the
-# build keyring, or keyserver unreachable). makepkg also prints "Could not
-# download sources" for this, so it must be detected before RE_DOWNLOAD_FAILURE.
-RE_PGP_FAILURE = re.compile(r"(?mi)One or more PGP signatures could not be verified")
+# PGP source signature could not be *checked* — the key is missing, invalid, or
+# untrusted in the build keyring. Safe to fall back from: the source still has to
+# match the PKGBUILD checksums. makepkg also prints "Could not download sources"
+# for this, so it must be detected before RE_DOWNLOAD_FAILURE.
+RE_PGP_UNVERIFIABLE = re.compile(
+    r"(?mi)FAILED \((?:unknown public key|invalid public key)"
+    r"|the public key .* is not trusted"
+)
+# Verification actively FAILED — a bad signature (tampering/corruption) or a
+# revoked key (compromised/retired). Never fall back to --skippgpcheck on these.
+RE_PGP_BADSIG = re.compile(r"(?mi)bad signature from public key|has been revoked")
 # Missing makedep — pacman can't find a required build dependency in any repo.
 # This is tier-specific, not transient: retrying on the same tier will always fail.
 RE_DEP_NOT_FOUND = re.compile(r"error: target not found: (\S+)")
@@ -1122,14 +1129,16 @@ def build_package(
         with open(log_file, "r", errors="replace") as lf:
             build_output = lf.read()
 
-        # PGP source-signature verification failed and import_pgp_keys couldn't
-        # fix it (key invalid in the chroot keyring, never imported, keyserver
-        # down, etc.). When skip_pgp_on_import_failure is set, retry once with
-        # --skippgpcheck — source hashes are still verified and the build is
-        # signed with buildbot's own key. Must run before the download check,
-        # which would otherwise mislabel this as a transient network failure.
+        # PGP source signature couldn't be checked (key missing/invalid/untrusted)
+        # and import_pgp_keys couldn't fix it. When skip_pgp_on_import_failure is
+        # set, retry once with --skippgpcheck — source hashes are still verified
+        # and the build is signed with buildbot's own key. A genuinely bad
+        # signature or a revoked key (RE_PGP_BADSIG) is never skipped: that is a
+        # tampering/compromise signal, so it stays a hard failure. Must run before
+        # the download check, which would mislabel this as a transient failure.
         if (not skippgpcheck and config.get("skip_pgp_on_import_failure")
-                and RE_PGP_FAILURE.search(build_output)):
+                and RE_PGP_UNVERIFIABLE.search(build_output)
+                and not RE_PGP_BADSIG.search(build_output)):
             log.warning("[%s] PGP verification failed; retrying with --skippgpcheck "
                         "(source hashes still verified)", pkg["name"])
             retry_conf = _write_nolto_conf(makepkg_conf) if lto_disabled else makepkg_conf
