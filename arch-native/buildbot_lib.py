@@ -1400,11 +1400,28 @@ def prune_blacklisted_from_repo(
 
     Returns the list of package names removed.
     """
-    to_remove = [
-        name for name in built
-        if _in_blacklist(name, blacklist)
-        and built[name].get("status") != "ineligible"
-    ]
+    # Split packages share the full pkg_files list across all subpackage entries,
+    # so a blacklisted name sharing files with a non-blacklisted entry is a
+    # subpackage of a pkgbase we do rebuild. Those must stay in the db: the sibling
+    # we publish carries a hard `libfoo=<pkgver>` dep that only our own build can
+    # satisfy once forge's pkgver runs ahead of the world repo — dropping libudev
+    # left udev 261.2-1 needing libudev=261.2, which world's libudev 261-2 can't
+    # fill. Blacklisting only means "never resolve this as its own pkgbase".
+    sibling_files = set()
+    for name in built:
+        if not _in_blacklist(name, blacklist):
+            sibling_files.update(built[name].get("pkg_files", []))
+
+    to_remove = []
+    for name in built:
+        if not _in_blacklist(name, blacklist):
+            continue
+        if built[name].get("status") == "ineligible":
+            continue
+        if any(f in sibling_files for f in built[name].get("pkg_files", [])):
+            log.debug("Keeping blacklisted %s: subpackage of a rebuilt pkgbase", name)
+            continue
+        to_remove.append(name)
     if not to_remove:
         return []
 
