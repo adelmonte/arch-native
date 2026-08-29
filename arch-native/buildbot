@@ -2234,6 +2234,11 @@ def write_patch_status(config: dict) -> tuple:
         log.debug("Wrote patch status: %d ok, %d review, %d fail",
                   summary["ok"], summary["review"], summary["fail"])
         return summary, True
+    except PermissionError:
+        # Expected whenever a human runs `buildbot patch status`: the repo dir is
+        # writable by the daemon only. The counts still print, just unpublished.
+        log.debug("Not publishing patch status to %s: no write access", out_path)
+        return summary, False
     except OSError as e:
         log.warning("Could not write patch status to %s: %s", out_path, e)
         return summary, False
