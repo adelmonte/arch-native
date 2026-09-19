@@ -573,6 +573,33 @@ Beyond the blacklist:
   `failed_stall_days` ago; excluded from auto-retry. `buildbot retry <pkg>` after
   fixing the cause.
 
+#### Soname repair
+
+`pending_world_cascade` keeps forge from breaking the distro repos. The reverse
+also needs guarding: when forge rebuilds a library whose soname moved, forge's
+*own* reverse-deps are left pointing at a soname nothing provides. They install
+cleanly and then fail to start. A soname change needs no version change to
+happen — `abseil-cpp 20260817.0-1` → `-2` moved every `libabsl` from `2605` to
+`2608` — so nothing in the package metadata flags it.
+
+Each cycle the daemon reads the real ELF `SONAME` and `DT_NEEDED` entries of the
+packages in the repo, caching them in `sonames.json` beside `built.json`.
+Declared metadata cannot be used here: soname `provides`/`depends` are optional
+in a PKGBUILD and usually absent for exactly the libraries that drift.
+
+A package whose link is dangling is handled one of two ways:
+
+- **stale** — forge's library moved on and the package still points at the old
+  soname. Queued for rebuild with `build_reason: soname`.
+- **ahead** — the package wants a *newer* soname than forge's copy of that
+  library provides, because that library is itself stale or failing to build.
+  Rebuilding would change nothing, so it is reported and left alone; fix the
+  library instead.
+
+Only libraries forge itself builds are considered, so distro libraries never
+enter into it. A package rebuilt once against an unchanged gap is not retried.
+`buildbot doctor` reports the current state from the cache without scanning.
+
 ---
 
 ## Local PKGBUILD patches
@@ -786,7 +813,7 @@ pattern and re-queued up to `download_retry_limit` times before moving to
 |---|---|
 | `init` | bootstrap a new install (layout, base chroot, keyring); safe to re-run |
 | `status` | one-screen overview (see below) |
-| `doctor` | check paths, JSON validity, gnupg perms, chroot keyring, cascade state |
+| `doctor` | check paths, JSON validity, gnupg perms, chroot keyring, cascade state, soname consistency |
 | `fsck [--dry-run] [-v] [--force]` | verify/repair built.json ↔ repo DB ↔ `.pkg` files; service must be stopped (`--force` overrides). Also runs each cycle |
 | `built [-n N]` | list built packages (N most recent) |
 | `queue [-n N]` | list the pending queue (default 25) |

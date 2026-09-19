@@ -1295,6 +1295,81 @@ def _validate_package_contents(pkg_files: list[str]) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# ELF soname graph
+# ---------------------------------------------------------------------------
+# Directories that can hold ELF objects. Extracting only these keeps a scan off
+# the docs, locale and headers that are most of a package by size.
+_ELF_BEARING = ("usr/lib", "usr/lib32", "usr/bin", "usr/sbin", "opt")
+
+
+def _is_elf(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def elf_sonames_from_pkg(pkg_file: str) -> tuple[set, set]:
+    """Read the real soname graph out of a built package.
+
+    Returns (provides, needs): the SONAMEs this package's shared libraries
+    declare, and the DT_NEEDED entries its ELF objects reference, both as bare
+    library file names ('libfoo.so.1').
+
+    Package metadata cannot answer this. Declaring soname provides and depends
+    is optional in a PKGBUILD and most upstreams skip it, so .PKGINFO is empty
+    for exactly the libraries that keep drifting here — abseil-cpp declares no
+    provides, grpc no depends, yet grpc links libabsl_*.so.2605. Reading the
+    binaries is the only way to see the edge.
+    """
+    provides, needs = set(), set()
+    with tempfile.TemporaryDirectory(prefix="arch-native-elf-") as tmp:
+        cmd = ["bsdtar", "-xf", pkg_file, "-C", tmp, "--no-same-owner",
+               "--no-same-permissions"] + list(_ELF_BEARING)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        # A package with none of those paths exits non-zero with nothing
+        # extracted; that is a normal result, not a failure.
+        if r.returncode != 0 and not os.listdir(tmp):
+            return provides, needs
+
+        objects = [
+            os.path.join(root, fn)
+            for root, _dirs, files in os.walk(tmp)
+            for fn in files
+            if not os.path.islink(os.path.join(root, fn))
+            and _is_elf(os.path.join(root, fn))
+        ]
+        if not objects:
+            return provides, needs
+
+        # readelf takes many files per call and labels each with "File:", so a
+        # package costs a handful of processes rather than one per object.
+        for i in range(0, len(objects), 200):
+            r = subprocess.run(
+                ["readelf", "-d"] + objects[i:i + 200],
+                capture_output=True, text=True,
+            )
+            for line in r.stdout.splitlines():
+                if "(NEEDED)" in line:
+                    m = re.search(r"\[(.+?)\]", line)
+                    if m:
+                        needs.add(m.group(1))
+                elif "(SONAME)" in line:
+                    m = re.search(r"\[(.+?)\]", line)
+                    if m:
+                        provides.add(m.group(1))
+
+    return provides, needs - provides
+
+
+def soname_lib_base(soname: str) -> str:
+    """'libfoo.so.2.1.0' -> 'libfoo.so'. The version-independent library name."""
+    idx = soname.find(".so")
+    return soname[:idx + 3] if idx != -1 else soname
+
+
+# ---------------------------------------------------------------------------
 # Signing
 # ---------------------------------------------------------------------------
 def sign_packages(pkg_files: list[str], gnupg_home: str, build_user: str = "buildbot"):
