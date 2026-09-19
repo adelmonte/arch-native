@@ -1242,6 +1242,17 @@ def build_package(
 # ---------------------------------------------------------------------------
 # Package content validation
 # ---------------------------------------------------------------------------
+# Suffixes that are legitimately zero bytes, so an empty file carrying one is
+# never a truncated binary. Python namespace markers (__init__.py) and typing
+# markers (py.typed) are the common case; bazel-built wheels ship them 0755,
+# which matched the executable test below and failed protobuf's python
+# subpackage on every build after a successful 8-minute compile.
+_LEGITIMATELY_EMPTY_SUFFIXES = (
+    ".py", ".pyi", ".typed", ".sh", ".txt", ".json", ".cfg", ".conf",
+    ".keep", ".gitkeep", ".placeholder",
+)
+
+
 def _validate_package_contents(pkg_files: list[str]) -> list[tuple[str, str]]:
     """Detect packages that contain 0-byte shared libraries or executables.
 
@@ -1273,7 +1284,11 @@ def _validate_package_contents(pkg_files: list[str]) -> list[tuple[str, str]]:
             if not perms.startswith("-") or size != "0":
                 continue  # only zero-byte regular files
             is_lib = name.endswith(".so") or ".so." in name
-            is_exec = "x" in perms and name.startswith(("usr/bin/", "usr/lib/", "usr/sbin/"))
+            is_exec = (
+                "x" in perms
+                and name.startswith(("usr/bin/", "usr/lib/", "usr/sbin/"))
+                and not name.endswith(_LEGITIMATELY_EMPTY_SUFFIXES)
+            )
             if is_lib or is_exec:
                 offenders.append((os.path.basename(f), name))
     return offenders
