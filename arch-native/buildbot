@@ -22,7 +22,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, nullcontext
 
 sys.path.insert(0, "/usr/lib/arch-native")
@@ -1132,6 +1132,44 @@ def _is_stalled(rec: dict, config: dict) -> bool:
             except Exception:
                 pass
     return False
+
+
+# Minimum wait before a failed package may build again, indexed by how many
+# times it has already failed. A mirror hiccup or a hung build clears on its
+# own, so those start short; a compile failure needs a human or an upstream
+# change, so it starts long. The last entry repeats until failed_stall_retries
+# trips and the stall / auto-retry path takes over.
+_RETRY_BACKOFF_HOURS = {
+    "download":       [1, 3, 8, 24],
+    "timeout":        [1, 3, 8, 24],
+    "dep":            [1, 6, 24],
+    "missing_source": [1, 6, 24],
+}
+_RETRY_BACKOFF_DEFAULT = [6, 24, 48]
+
+
+def _retry_due(rec: dict, config: dict) -> bool:
+    """True if a failed record has waited out its backoff and may build again.
+
+    Both queue paths skip a package whose failed version matches the version
+    they are about to queue. Without a backoff that skip never expires on its
+    own: the record only clears once it goes stalled at failed_stall_days and
+    the auto-retry path picks it up, so a single transient download error
+    parked a package for a week and a recorded failed_tier never got its
+    next-tier attempt.
+    """
+    if not rec:
+        return False
+    ts = rec.get("timestamp") or rec.get("first_failed_at")
+    if not ts:
+        return False
+    try:
+        last = datetime.fromisoformat(ts)
+    except ValueError:
+        return False
+    schedule = _RETRY_BACKOFF_HOURS.get(rec.get("error_type"), _RETRY_BACKOFF_DEFAULT)
+    idx = min(max(rec.get("retries", 1), 1) - 1, len(schedule) - 1)
+    return (datetime.now(timezone.utc) - last) >= timedelta(hours=schedule[idx])
 
 
 def cmd_failed_list(args, config: dict) -> int:
@@ -2414,8 +2452,12 @@ def _queue_from_manifest(config: dict, manifest: list, built: dict, pkgbase_map:
             continue
         failed_rec = failed_now.get(pkg["name"], {})
         if failed_rec.get("version") == pkg["version"]:
-            skipped_failed += 1
-            continue
+            if not _retry_due(failed_rec, config):
+                skipped_failed += 1
+                continue
+            log.info("[%s] failure backoff elapsed (%s, %d prior) — retrying",
+                     pkg["name"], failed_rec.get("error_type", "build"),
+                     failed_rec.get("retries", 0))
         if _is_stalled(failed_rec, config):
             skipped_stalled += 1
             continue
@@ -2752,8 +2794,12 @@ def run_daemon(config_path: str, debug: bool):
                             continue
                         failed_rec = failed_now.get(pname, {})
                         if failed_rec.get("version") == pkg["version"]:
-                            skipped_failed += 1
-                            continue
+                            if not _retry_due(failed_rec, config):
+                                skipped_failed += 1
+                                continue
+                            log.info("[%s] failure backoff elapsed (%s, %d prior) — retrying",
+                                     pname, failed_rec.get("error_type", "build"),
+                                     failed_rec.get("retries", 0))
                         if _is_stalled(failed_rec, config):
                             skipped_stalled += 1
                             continue
@@ -2815,8 +2861,12 @@ def run_daemon(config_path: str, debug: bool):
             write_in_progress(config, pkg)
             name = pkg["name"]
 
-            # Skip if currently failed at this version
-            if name in failed and failed[name].get("version") == pkg["version"]:
+            # Skip if currently failed at this version and still inside its
+            # backoff. This guard also stops a package that failed earlier in
+            # this same drain from being retried immediately, since the
+            # shortest backoff is an hour.
+            if (name in failed and failed[name].get("version") == pkg["version"]
+                    and not _retry_due(failed[name], config)):
                 cycle_stats["skipped_previous_failure"] += 1
                 log.info("[%s] skipping (previously failed at %s)", name, pkg["version"])
                 clear_in_progress(config)
