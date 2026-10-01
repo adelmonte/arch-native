@@ -2234,6 +2234,8 @@ def cmd_patch(args, config: dict) -> int:
         return _cmd_patch_show(args, config)
     if subcmd == "check":
         return _cmd_patch_check(args, config)
+    if args.patch_cmd == "ack":
+        return _cmd_patch_ack(args, config)
     if subcmd == "status":
         return _cmd_patch_status(args, config)
     print("error: specify a subcommand: create, show, check, status")
@@ -2351,6 +2353,126 @@ def _installed_names(config: dict):
         return None
 
 
+_PATCH_HEADER_RE = re.compile(
+    r'^# arch-native-patch: pkgver=(\S+) pkgrel=(\S+)(?:\s+policy=(\S+))?')
+
+
+def _read_patch_header(patch_file: str) -> tuple:
+    """(pkgver, pkgrel, policy) from a patch's leading comment, or Nones.
+
+    policy is 'permanent' for a patch that fixes this build setup rather than
+    an upstream defect; anything else (including absent) is treated as a
+    transient workaround that upstream may one day make unnecessary.
+    """
+    try:
+        with open(patch_file) as pf:
+            for line in pf:
+                if not line.startswith("#"):
+                    break
+                m = _PATCH_HEADER_RE.match(line)
+                if m:
+                    return m.group(1), m.group(2), m.group(3)
+    except OSError:
+        pass
+    return None, None, None
+
+
+def _write_patch_header(patch_file: str, pkgver: str, pkgrel: str,
+                        policy: str = None) -> bool:
+    """Rewrite the patch's stamp in place, leaving the diff byte-identical."""
+    try:
+        with open(patch_file) as pf:
+            lines = pf.readlines()
+    except OSError as e:
+        print(f"error: cannot read {patch_file}: {e}")
+        return False
+
+    stamp = f"# arch-native-patch: pkgver={pkgver} pkgrel={pkgrel}"
+    if policy:
+        stamp += f" policy={policy}"
+    stamp += "\n"
+
+    at = next((i for i, line in enumerate(lines)
+               if line.startswith("#") and _PATCH_HEADER_RE.match(line)), None)
+    if at is None:
+        lines.insert(0, stamp)
+    else:
+        lines[at] = stamp
+
+    tmp = patch_file + ".tmp"
+    try:
+        with open(tmp, "w") as pf:
+            pf.writelines(lines)
+        os.replace(tmp, patch_file)
+    except OSError as e:
+        print(f"error: cannot write {patch_file}: {e}")
+        return False
+    return True
+
+
+def _upstream_pkgver_for(pkgname: str, config: dict) -> tuple:
+    """(pkgver, pkgrel, tier) read statically from the resolved upstream PKGBUILD."""
+    pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
+    upstream_priority = [t for t in pkg_priority if t != "local"]
+    upstream_dir, tier = resolve_pkgbuild(
+        pkgname, config["pkgbuilds_dir"], None, upstream_priority,
+        tier_sources=config["tier_sources"],
+        version_select=config.get("tier_version_select", "priority"),
+    )
+    content = open(os.path.join(upstream_dir, "PKGBUILD")).read()
+    pv = re.search(r'^pkgver\s*=\s*(\S+)', content, re.MULTILINE)
+    pr = re.search(r'^pkgrel\s*=\s*(\S+)', content, re.MULTILINE)
+    return (pv.group(1) if pv else None, pr.group(1) if pr else None, tier)
+
+
+def _cmd_patch_ack(args, config: dict) -> int:
+    """Re-stamp reviewed patches as seen at the current upstream version.
+
+    Without this there is no way to clear 'review'. The status compares a
+    patch against the version it was written at, forever, so one upstream bump
+    flags a patch permanently and the review list only ever grows. Acking says
+    "I looked at this against today's upstream", which makes review mean
+    "drifted since you last looked" — a short, actionable list.
+    """
+    pkgbuilds_dir = config["pkgbuilds_dir"]
+    if args.all:
+        installed = _installed_names(config)
+        names = [n for n in (_list_local_patches(pkgbuilds_dir) or [])
+                 if _check_one_patch(n, config, installed, no_clone=True)[0] == "review"]
+        if not names:
+            print("no patches in review")
+            return 0
+    else:
+        names = [args.pkgname]
+
+    policy = "permanent" if args.permanent else None
+    acked = 0
+    for name in names:
+        patch_file = os.path.join(pkgbuilds_dir, "local", name, f"{name}.patch")
+        if not os.path.isfile(patch_file):
+            print(f"  {name}: no patch file")
+            continue
+        try:
+            pkgver, pkgrel, tier = _upstream_pkgver_for(name, config)
+        except FileNotFoundError as e:
+            print(f"  {name}: {e}")
+            continue
+        if not pkgver:
+            print(f"  {name}: could not read upstream pkgver")
+            continue
+        # Preserve an existing policy unless this call sets one.
+        _ov, _or, existing = _read_patch_header(patch_file)
+        if _write_patch_header(patch_file, pkgver, pkgrel, policy or existing):
+            note = f" policy={policy or existing}" if (policy or existing) else ""
+            print(f"  {name}: stamped {pkgver}-{pkgrel} ({tier}){note}")
+            acked += 1
+
+    print(f"\nacked {acked} patch(es)")
+    if acked:
+        write_patch_status(config)
+    return 0
+
+
 def _check_one_patch(pkgname: str, config: dict, installed=None, no_clone: bool = False) -> tuple:
     """Check a single local patch against current upstream.
 
@@ -2390,19 +2512,8 @@ def _check_one_patch(pkgname: str, config: dict, installed=None, no_clone: bool 
     except FileNotFoundError:
         return ("not_found", "upstream not found", None)
 
-    # Read version metadata written by patch create, if present.
-    patch_pkgver = patch_pkgrel = None
-    try:
-        with open(patch_file) as pf:
-            for line in pf:
-                if not line.startswith('#'):
-                    break
-                m = re.match(r'^# arch-native-patch: pkgver=(\S+) pkgrel=(\S+)', line)
-                if m:
-                    patch_pkgver, patch_pkgrel = m.group(1), m.group(2)
-                    break
-    except OSError:
-        pass
+    # Read metadata written by patch create / patch ack, if present.
+    patch_pkgver, patch_pkgrel, policy = _read_patch_header(patch_file)
 
     # Read current upstream pkgver/pkgrel for version drift detection.
     # Static text read — not a shell eval — so packages with a computed pkgver
@@ -2431,12 +2542,41 @@ def _check_one_patch(pkgname: str, config: dict, installed=None, no_clone: bool 
         )
 
     if dry.returncode == 0:
-        if (patch_pkgver and upstream_pkgver and
-                (patch_pkgver != upstream_pkgver or patch_pkgrel != upstream_pkgrel)):
-            written = f"{patch_pkgver}-{patch_pkgrel}"
-            current = f"{upstream_pkgver}-{upstream_pkgrel}"
-            return ("review", f"written for {written}, upstream now {current}", tier)
-        return ("ok", f"tier: {tier}", tier)
+        drifted = (patch_pkgver and upstream_pkgver
+                   and (patch_pkgver != upstream_pkgver
+                        or patch_pkgrel != upstream_pkgrel))
+        if not drifted:
+            return ("ok", f"tier: {tier}", tier)
+        written = f"{patch_pkgver}-{patch_pkgrel}"
+        current = f"{upstream_pkgver}-{upstream_pkgrel}"
+        # A patch marked permanent fixes something about this build setup, not
+        # an upstream defect — a cross-march host, the Artix libexec layout, a
+        # broken LTO build. Upstream releasing a new version cannot retire it,
+        # so version drift is not a reason to look at it again. It is still
+        # checked for applying, which is the failure that would matter.
+        if policy == "permanent":
+            return ("ok", f"tier: {tier} (permanent)", tier)
+        # Same pkgver, higher pkgrel: the upstream sources are byte-identical
+        # and only the packaging moved. The patch still applies, so whatever
+        # the packager changed did not touch the lines this patch depends on,
+        # and the need for it cannot have changed either.
+        if patch_pkgver == upstream_pkgver:
+            return ("ok", f"tier: {tier} (pkgrel {patch_pkgrel} to {upstream_pkgrel})", tier)
+        return ("review", f"written for {written}, upstream now {current}", tier)
+
+    # The patch does not apply. If it reverse-applies, the PKGBUILD already
+    # contains what the patch adds — upstream adopted the same fix and the
+    # patch is now dead weight rather than broken. mupdf failed this way for
+    # weeks reporting only "checking file PKGBUILD".
+    with tempfile.TemporaryDirectory(prefix=f"arch-native-rev-{pkgname}-") as tmpdir:
+        work_dir = os.path.join(tmpdir, "work")
+        _shutil.copytree(upstream_dir, work_dir, ignore=ignore_special_files)
+        rev = subprocess.run(
+            ["patch", "-R", "--dry-run", "-p1", "--input", patch_file],
+            capture_output=True, text=True, cwd=work_dir,
+        )
+    if rev.returncode == 0:
+        return ("obsolete", "upstream already contains this change", tier)
 
     first_err = next(
         (l for l in (dry.stdout + dry.stderr).splitlines() if l.strip()),
@@ -2458,7 +2598,7 @@ def write_patch_status(config: dict) -> tuple:
     installed = _installed_names(config)
 
     counts = {"ok": 0, "review": 0, "fail": 0, "orphaned": 0,
-              "not_found": 0, "no_patch_file": 0}
+              "obsolete": 0, "not_found": 0, "no_patch_file": 0}
     patches = []
     for pkgname in sorted(pkgnames):
         status, detail, _tier = _check_one_patch(pkgname, config, installed,
@@ -2474,6 +2614,8 @@ def write_patch_status(config: dict) -> tuple:
         # not_found / no_patch_file are broken patches too — fold into fail.
         "fail": counts["fail"] + counts["not_found"] + counts["no_patch_file"],
         "orphaned": counts["orphaned"],
+        # Applies in reverse: upstream took the change, so the patch can go.
+        "obsolete": counts["obsolete"],
         "patches": patches,
     }
 
@@ -3600,7 +3742,7 @@ def main():
                     "Safe to re-run — skips steps already complete.")
 
     p_patch = sub.add_parser("patch",
-        usage="buildbot patch {create|show|check|status} <PKG>",
+        usage="buildbot patch {create|show|check|ack|status} <PKG>",
         formatter_class=_HelpFormatter,
         description="Manage local PKGBUILD patches stored in "
                     "/var/lib/arch-native/pkgbuilds/local/.")
@@ -3630,6 +3772,21 @@ def main():
     p_pck_group.add_argument("pkgname", nargs="?", metavar="PKG")
     p_pck_group.add_argument("--all", action="store_true",
         help="check every local patch")
+
+    p_pa = patch_sub.add_parser("ack",
+        usage="buildbot patch ack [--permanent] <PKG>  |  buildbot patch ack [--permanent] --all",
+        formatter_class=_HelpFormatter,
+        description="Record that a patch has been reviewed against the current upstream "
+                    "PKGBUILD, clearing its 'review' flag without touching the diff. "
+                    "With --permanent the patch is never flagged for version drift again "
+                    "— for patches that fix this build setup (cross-march host, Artix "
+                    "libexec layout, a broken LTO build) rather than an upstream defect.")
+    p_pa_group = p_pa.add_mutually_exclusive_group(required=True)
+    p_pa_group.add_argument("pkgname", nargs="?", metavar="PKG")
+    p_pa_group.add_argument("--all", action="store_true",
+        help="ack every patch currently in review")
+    p_pa.add_argument("--permanent", action="store_true",
+        help="exempt from version-drift review for good; still checked for applying")
 
     patch_sub.add_parser("status",
         usage="buildbot patch status",

@@ -634,6 +634,9 @@ sudo buildbot patch create networkmanager          # open upstream PKGBUILD in $
 sudo buildbot patch show networkmanager            # print the current diff
 sudo buildbot patch create --force networkmanager  # re-author against current upstream
 sudo buildbot patch check --all                    # check all patches for drift
+sudo buildbot patch ack networkmanager             # reviewed against today's upstream
+sudo buildbot patch ack --permanent gstreamer      # never flag for version drift again
+sudo buildbot patch ack --all                      # ack everything in review
 sudo buildbot patch status                          # recompute + publish patch-status.json
 ```
 
@@ -661,15 +664,37 @@ zip              FAIL      checking file PKGBUILD
 
 - **ok** — applies cleanly.
 - **orphaned** — package no longer installed; safe to remove.
-- **review** — still applies, but upstream moved past the version it was written
-  for; check whether it's still needed, then `buildbot patch create --force`.
+- **review** — still applies, but upstream released a new `pkgver` since the
+  patch was last looked at. Check whether it's still needed, then
+  `buildbot patch ack <pkg>` (or `patch create --force` to re-author it).
+- **obsolete** — does not apply, but applies *in reverse*: upstream already
+  contains this change and adopted the same fix. Retire the patch.
 - **FAIL** — no longer applies; the next build of that package fails loudly until
   you update it.
 
 `review` works by recording the upstream `pkgver`/`pkgrel` as a header in the
-`.patch` (catching the case where upstream fixes the issue but the patch still
-applies). Pre-header patches just report `ok`/`FAIL`; recreate with `--force` to
+`.patch`. Pre-header patches just report `ok`/`FAIL`; recreate with `--force` to
 opt in. VCS packages get pkgrel-drift detection only.
+
+#### Keeping review meaningful
+
+Left alone, `review` is a ratchet that only ever grows: the status compares a
+patch against the version it was *written* at, so a single upstream release
+flags it forever and the list fills with patches nothing will ever retire. Three
+things keep it short:
+
+- **`buildbot patch ack <pkg>`** re-stamps a patch as seen at today's upstream
+  without touching the diff, so `review` means "drifted since you last looked"
+  rather than "drifted since you wrote it". `--all` acks everything in review.
+- **A `pkgrel`-only bump is not drift.** The upstream sources are byte-identical
+  and only the packaging moved; since the patch still applies, the packager
+  cannot have touched the lines it depends on.
+- **`policy=permanent`** (set with `patch ack --permanent`, stored in the patch
+  header) exempts a patch from version drift for good. Use it for patches that
+  fix *this build setup* rather than an upstream defect — stripping `-march` for
+  a cross-march build host, the Artix `libexec` layout, disabling LTO. Upstream
+  releasing a new version cannot retire those, so drift is not a reason to look
+  again. They are still checked for applying, which is the failure that matters.
 
 The daemon publishes `patch-status.json` to the repo at startup and each
 `upstream_check_interval` so `native-sync` can show the **patches** line. Run
