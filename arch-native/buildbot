@@ -612,7 +612,13 @@ def _soname_index_path(config: dict) -> str:
 
 
 def _repo_packages(config: dict) -> dict:
-    """{pkgname: (version, path)} for the published packages, debug ones aside."""
+    """{pkgname: (version, path, stamp)} for published packages, debug aside.
+
+    stamp fingerprints the file itself, not just its version. forge rebuilds
+    the same pkgver-pkgrel constantly — that is the whole point of it — so a
+    version string cannot tell a rebuilt package from the one scanned before,
+    and keying the index on version alone left it stale in the common case.
+    """
     out = {}
     for path in Path(config["repo_dir"]).glob("*.pkg.tar.zst"):
         name = _pkgname_from_filename(path.name)
@@ -623,7 +629,12 @@ def _repo_packages(config: dict) -> dict:
         # the newest is the one the repo DB points at.
         if name in out and vercmp(ver or "0", out[name][0] or "0") <= 0:
             continue
-        out[name] = (ver, str(path))
+        try:
+            st = path.stat()
+            stamp = f"{ver}:{int(st.st_mtime)}:{st.st_size}"
+        except OSError:
+            continue
+        out[name] = (ver, str(path), stamp)
     return out
 
 
@@ -641,8 +652,8 @@ def _refresh_soname_index(config: dict, budget: int = _SONAME_SCAN_BUDGET) -> di
     for gone in dropped:
         del index[gone]
 
-    stale = [n for n, (ver, _p) in current.items()
-             if index.get(n, {}).get("version") != ver]
+    stale = [n for n, (_v, _p, stamp) in current.items()
+             if index.get(n, {}).get("stamp") != stamp]
     if not stale:
         if dropped:
             _save_json_file(path, index)
@@ -650,7 +661,7 @@ def _refresh_soname_index(config: dict, budget: int = _SONAME_SCAN_BUDGET) -> di
 
     log.info("Soname index: %d package(s) to scan", len(stale))
     for name in stale[:budget]:
-        ver, pkg_path = current[name]
+        ver, pkg_path, stamp = current[name]
         try:
             provides, needs = elf_sonames_from_pkg(pkg_path)
         except Exception as e:
@@ -658,11 +669,13 @@ def _refresh_soname_index(config: dict, budget: int = _SONAME_SCAN_BUDGET) -> di
             continue
         prior = index.get(name, {})
         entry = {"version": ver,
+                 "stamp": stamp,
                  "provides": sorted(provides),
                  "needs": sorted(needs)}
-        # Carry a repair stamp forward only while the package is unchanged;
-        # a new build deserves a fresh attempt.
-        if prior.get("version") == ver and "repair" in prior:
+        # Carry a repair stamp forward only while the file is byte-for-byte
+        # the one that was already rebuilt; any new build deserves a fresh
+        # attempt, including a rebuild at the same version.
+        if prior.get("stamp") == stamp and "repair" in prior:
             entry["repair"] = prior["repair"]
         index[name] = entry
 
@@ -677,7 +690,17 @@ def _soname_version(soname: str) -> str:
     return soname[len(soname_lib_base(soname)):].lstrip(".")
 
 
-def _find_soname_breakage(index: dict) -> dict:
+def _deferred_names(config: dict) -> set:
+    """Packages forge is knowingly not rebuilding, from built.json status."""
+    try:
+        built = get_built_state(config["state_path"])
+    except Exception:
+        return set()
+    return {n for n, e in built.items()
+            if isinstance(e, dict) and e.get("status") in _DEFERRED_STATUSES}
+
+
+def _find_soname_breakage(index: dict, deferred: set = None) -> dict:
     """Packages linking a soname no forge package provides.
 
     Only libraries forge itself builds are considered. If nothing in the repo
@@ -704,6 +727,13 @@ def _find_soname_breakage(index: dict) -> dict:
 
     broken = {}
     for name, entry in index.items():
+        # A package forge cannot rebuild right now (arch=any, a PKGBUILD older
+        # than what is installed, a staged soname bump) is already reported
+        # under that status. Naming it here too would leave this check red for
+        # something no rebuild can fix, which is how a health signal stops
+        # being read at all.
+        if deferred and name in deferred:
+            continue
         stale, ahead = [], []
         for soname in sorted(entry.get("needs", [])):
             base = soname_lib_base(soname)
@@ -731,7 +761,7 @@ def _queue_soname_repairs(config: dict, manifest_map: dict) -> int:
     2608). Those packages install cleanly and then fail to start.
     """
     index = _refresh_soname_index(config)
-    broken = _find_soname_breakage(index)
+    broken = _find_soname_breakage(index, _deferred_names(config))
     if not broken:
         return 0
 
@@ -756,9 +786,9 @@ def _queue_soname_repairs(config: dict, manifest_map: dict) -> int:
         entry = index.get(name, {})
         missing = kinds["stale"]
         prior = entry.get("repair")
-        # Already rebuilt at this exact version against this exact gap and
-        # still broken: rebuilding again would only loop. Leave it alone.
-        if prior and prior.get("version") == entry.get("version") \
+        # Already rebuilt against this exact gap and still broken, with the
+        # file unchanged since: rebuilding again would only loop. Leave it.
+        if prior and prior.get("stamp") == entry.get("stamp") \
                 and prior.get("missing") == missing:
             continue
         item = _queue_item_for(name, manifest_map, entry.get("version", "unknown"))
@@ -766,7 +796,8 @@ def _queue_soname_repairs(config: dict, manifest_map: dict) -> int:
         item["queued_at"] = datetime.now(timezone.utc).isoformat()
         pending.append(item)
         pending_names.add(name)
-        entry["repair"] = {"version": entry.get("version"), "missing": missing}
+        entry["repair"] = {"version": entry.get("version"),
+                           "stamp": entry.get("stamp"), "missing": missing}
         index[name] = entry
         queued += 1
         log.warning("[%s] links missing soname(s) %s — queued rebuild",
@@ -1148,7 +1179,7 @@ def cmd_doctor(args, config: dict) -> int:
         if not _idx:
             add("sonames", True, "index not built yet")
         else:
-            _broken = _find_soname_breakage(_idx)
+            _broken = _find_soname_breakage(_idx, _deferred_names(config))
             _ahead = {n: k["ahead"] for n, k in _broken.items() if k["ahead"]}
             _stale = [n for n, k in _broken.items() if k["stale"] and not k["ahead"]]
             if not _broken:
@@ -1159,8 +1190,23 @@ def cmd_doctor(args, config: dict) -> int:
                     f"{len(_ahead)} package(s) need a newer {', '.join(_libs[:3])} "
                     f"than forge builds — rebuild that library first")
             else:
-                add("sonames", False,
-                    f"{len(_stale)} package(s) link a stale soname — rebuild queued")
+                # A package whose repair stamp still matches its current file
+                # was already rebuilt against this same gap and did not come
+                # out fixed, so no rebuild is pending for it. Saying otherwise
+                # would leave this line permanently red and unread.
+                _tried = [n for n in _stale
+                          if (_idx[n].get("repair") or {}).get("stamp")
+                          == _idx[n].get("stamp")]
+                _queued = [n for n in _stale if n not in _tried]
+                _parts = []
+                if _queued:
+                    _parts.append(f"{len(_queued)} queued for rebuild")
+                if _tried:
+                    _parts.append(
+                        f"{len(_tried)} not fixable by rebuild "
+                        f"({', '.join(sorted(_tried)[:3])}) — see: buildbot why <pkg>")
+                add("sonames", not _queued and bool(_tried),
+                    f"{len(_stale)} package(s) link a stale soname: " + "; ".join(_parts))
     except Exception as e:
         add("sonames", False, str(e))
 
