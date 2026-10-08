@@ -16,3 +16,4 @@ Releases/
 *.pkg.tar.xz
 pkg/
 src/
+.pytest_cache/
