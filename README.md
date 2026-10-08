@@ -7,17 +7,6 @@ for your CPU (`-march=znver4`, `-march=native`, …), signs them, and serves the
 a pacman repo. A helper then swaps your installed packages for the optimized
 builds. It works on any pacman-based distro.
 
-```
-  your machine                          build host (can be the same machine)
- ┌─────────────────────┐   package    ┌───────────────────────────────────────┐
- │ pacman              │    list      │ buildbot daemon                        │
- │   └ pkglist-export ─┼────────────▶ │   fetch PKGBUILD → build in clean      │
- │                     │              │   chroot with your -march → sign →     │
- │ native-sync  ◀──────┼──────────────┤   publish to the "forge" repo          │
- └─────────────────────┘ optimized    └───────────────────────────────────────┘
-                         packages
-```
-
 It ships as two packages:
 
 | Package | Runs on | Provides |
@@ -207,6 +196,7 @@ The first line shows how many of your installed packages forge has built. The
 
 When the distro releases a newer version, `pacman -Syu` installs it first. Once
 buildbot rebuilds that version, `native-sync` swaps the forge build back in.
+Packages in `IgnorePkg` or `IgnoreGroup` are never touched.
 
 If you renamed the repo, set `REPO_NAME="myrepo"` in
 `/etc/arch-native-client.conf`.
@@ -320,6 +310,7 @@ one of these:
 | State | Meaning | Resolves |
 |---|---|---|
 | `pending_upstream` | your installed version is newer than any PKGBUILD in your tiers | automatically, once the tier catches up |
+| `pending_release` | the PKGBUILD is newer than anything your distro has released (still in staging or testing) | automatically, once the distro releases it |
 | `pending_world_cascade` | the build bumped a library soname that the distro repos haven't migrated to yet; it is held back so the build doesn't break distro packages | automatically |
 | stalled | failed repeatedly | after fixing the cause, run `buildbot retry <pkg>` |
 
