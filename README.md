@@ -2,163 +2,106 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-Rebuilds your installed packages from source with CPU-optimized compiler flags,
-signs them, and publishes them as a local pacman repo.
+Rebuilds the packages you have installed from source with compiler flags tuned
+for your CPU (`-march=znver4`, `-march=native`, …), signs them, and serves them as
+a pacman repo. A helper then swaps your installed packages for the optimized
+builds. It works on any pacman-based distro.
 
-Works on any pacman-based distro.
+```
+  your machine                          build host (can be the same machine)
+ ┌─────────────────────┐   package    ┌───────────────────────────────────────┐
+ │ pacman              │    list      │ buildbot daemon                        │
+ │   └ pkglist-export ─┼────────────▶ │   fetch PKGBUILD → build in clean      │
+ │                     │              │   chroot with your -march → sign →     │
+ │ native-sync  ◀──────┼──────────────┤   publish to the "forge" repo          │
+ └─────────────────────┘ optimized    └───────────────────────────────────────┘
+                         packages
+```
+
+It ships as two packages:
+
+| Package | Runs on | Provides |
+|---|---|---|
+| `arch-native` | build host | `buildbot`: the daemon and its CLI |
+| `arch-native-client` | the machine using the packages | `native-sync`: installs forge builds · `pkglist-export`: pacman hook that sends your package list to a remote build host |
+
+**forge** is the default repo name and is used throughout this README.
 
 ---
 
 ## Contents
 
-- [Packages](#packages)
-- [Modes](#modes)
-- [Dependencies](#dependencies)
-- [Installation](#installation)
-  - [On the build server](#on-the-build-server)
-  - [On the desktop](#on-the-desktop)
-  - [Set up pkglist-export (remote mode)](#set-up-pkglist-export-remote-mode)
-- [native-sync](#native-sync)
-- [Configuration](#configuration)
-  - [Configuration reference](#configuration-reference)
-  - [What gets built: blacklist & eligibility](#what-gets-built-blacklist--eligibility)
-- [Local PKGBUILD patches](#local-pkgbuild-patches)
+- [Choose a mode](#choose-a-mode)
+- [Quick start](#quick-start)
+- [Everyday use](#everyday-use)
+- [Choosing what gets built](#choosing-what-gets-built)
+- [Patching packages](#patching-packages)
+- [Configuration reference](#configuration-reference)
 - [How it works](#how-it-works)
-- [buildbot CLI reference](#buildbot-cli-reference)
 - [License](#license)
 
 ---
 
-## Packages
+## Choose a mode
 
-| Package | Installs | Purpose |
+| | **Local** | **Remote** |
 |---|---|---|
-| `arch-native` | `/usr/bin/buildbot` | Build daemon and CLI |
-| `arch-native-client` | `/usr/bin/native-sync`, `/usr/bin/pkglist-export` | Client tools (both modes) |
+| Builds on | the machine that uses the packages | a separate build server |
+| Package list | read straight from the local pacman DB | pushed by a pacman hook over SSH/rsync |
+| Repo served by | `file://`, no web server needed | nginx (or any HTTP server) |
+| `march` | `native` | your target CPU, e.g. `znver4` |
+| Test suites and Rust `target-cpu` | run | run only if the server's CPU supports the target ISA ([details](#build-host--target-cpu-mismatch)) |
 
-Build from source with `makepkg -si` in each directory.
-
-**Names used throughout:** **buildbot** is the server binary (daemon + CLI).
-**native-sync** is the client upgrade tool. **forge** is the example
-`repo_name` — substitute your own wherever it appears.
-
----
-
-## Modes
-
-**Local mode** — the daemon runs on the machine that uses the packages, reading
-the local pacman DB directly (no manifest or rsync). `-march=native` plus
-`target-cpu=native` in RUSTFLAGS, and test suites run. Best for a single machine
-fast enough to build its own packages.
-
-**Remote mode** — the daemon runs on a dedicated build server; a pacman hook on
-the desktop rsyncs its installed-package list there after each transaction, and
-the server builds, signs, and publishes for the desktop to pull. Use it to
-offload builds to a separate machine. The build server ideally shares the
-target's microarchitecture, so test suites and full Rust optimization run. If it
-is older than your desktop it can still cross-build — C/C++ gets the full
-`-march=<target>` — but test suites and full Rust optimization are disabled,
-because those run on the build server and would SIGILL on the unsupported ISA
-(see [Build host / target CPU
-mismatch](#build-host--target-cpu-mismatch-remote-mode)).
+Pick **local** if the machine is fast enough to build its own packages. Pick
+**remote** to offload builds. A remote server with an older CPU still builds
+full `-march=<target>` C/C++.
 
 ---
 
-## Dependencies
+## Quick start
 
-Both packages declare these via pacman, so they install automatically — listed
-here for reference.
+Steps 1–4 run on the build host. Steps 5–6 run on the machine that uses the
+packages. In local mode they are the same machine.
 
-**`arch-native`** (build server):
-
-| Dependency | Used for |
-|---|---|
-| `python` | `buildbot` daemon and CLI (pure Python) |
-| `devtools` | `mkarchroot`, `arch-nspawn`, `makechrootpkg`, `pkgctl` |
-| `pacman` | `pacman-key`, DB reads, `repo-add` |
-| `gnupg` | package signing and PGP key import |
-| `rsync` | manifest sync in remote mode (receives the list from the desktop) |
-| `git` | cloning and pulling upstream PKGBUILD repos |
-
-**`arch-native-client`** (desktop): `python` and `rsync`.
-
----
-
-## Installation
-
-**Local mode** — every step runs on the same machine; skip the pkglist-export
-setup at the end.
-
-**Remote mode** — steps 1–6 run on the build server; step 7 onward runs on the
-desktop that will use the packages.
-
-## On the build server
-
-### 1. Install the package
+### 1. Install and configure the server
 
 ```bash
-yay -S arch-native          # or: cd arch-native && makepkg -si
+cd arch-native && makepkg -si
+sudoedit /etc/arch-native.conf
 ```
 
-### 2. Edit the config
-
-```bash
-$EDITOR /etc/arch-native.conf
-```
-
-Local mode (build and use on the same machine):
+The shipped config is a working starting point. Check these keys:
 
 ```ini
 [arch-native]
-repo_name = myrepo     # pacman DB name
-march = native         # let gcc optimize for this CPU
-mode = local
-distro = arch          # or "artix"
+repo_name = forge
+mode      = local          # or: remote
+march     = native         # remote: your target CPU, e.g. znver4, pantherlake
+distro    = arch           # or: artix
+
+# Arch only: the bundled chroot pacman.conf is set up for Artix + CachyOS.
+chroot_pacman_conf = /usr/share/devtools/pacman.conf.d/extra.conf
+
+blacklist = gcc,glibc,binutils,coreutils,linux-api-headers,
+            ttf-*,otf-*,font-*,*-icon-theme,*-cursors,
+            linux-firmware,linux-firmware-*,*-keyring,*-bin
+lto_blacklist = llvm,rust
 ```
 
-Remote mode (build server cross-compiling for your desktop CPU):
+> **⚠ Get the blacklist right before the first start.** Without one, the daemon
+> rebuilds your toolchain (`gcc`, `glibc`, `binutils`) with a custom `-march`,
+> which can leave the system unbootable. See [Choosing what gets
+> built](#choosing-what-gets-built).
 
-```ini
-[arch-native]
-repo_name = myrepo
-march = znver4         # explicit target, e.g. znver4, skylake, pantherlake
-mode = remote
-distro = arch
-```
+To find a remote target's `march`, run this on the target machine:
+`gcc -march=native -Q --help=target | grep -m1 march`.
 
-> **⚠ Set your blacklist now, before the daemon ever runs.** With no blacklist
-> the daemon will try to rebuild toolchain packages (`gcc`, `glibc`, `binutils`,
-> …) with custom `-march`, which can leave your system unbootable. Add `blacklist`
-> and `lto_blacklist` to this file before step 6 — see [Building your
-> blacklist](#building-your-blacklist). The bundled config ships with a starter
-> blacklist; review it against your installed packages.
-
-### 3. Serve the repo with nginx
+### 2. Initialize and create a signing key
 
 ```bash
-cp /usr/share/arch-native/nginx.conf.example /etc/nginx/sites-available/arch-native
-ln -s /etc/nginx/sites-available/arch-native /etc/nginx/sites-enabled/arch-native
-# or copy to /etc/nginx/conf.d/arch-native.conf if your nginx uses conf.d
-sudo systemctl reload nginx
-```
+sudo buildbot init          # data dir, clean build chroot, chroot keyring; safe to re-run
 
-Serves the repo at `:8081/repo/` by default; edit the port in the example first
-if needed.
-
-### 4. Initialize
-
-```bash
-sudo buildbot init
-```
-
-Creates `/var/lib/arch-native/`, builds the clean chroot, and initializes its
-keyring. Safe to re-run.
-
-### 5. Generate the signing key
-
-```bash
-sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg \
-    --batch --gen-key <<'EOF'
+sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg --batch --gen-key <<'EOF'
 %no-protection
 Key-Type: EdDSA
 Key-Curve: ed25519
@@ -167,690 +110,132 @@ Name-Email: arch-native@localhost
 Expire-Date: 0
 EOF
 
-# Export the public key for clients, and note the fingerprint for step 7:
-sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg \
-    --export --armor > /var/lib/arch-native/repo/buildbot-public.asc
-sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg -K
+sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg --export --armor \
+    | sudo tee /var/lib/arch-native/repo/buildbot-public.asc >/dev/null
 ```
 
-### 6. Start the service
+### 3. Remote mode only: serve the repo over HTTP
 
-> Confirm your [blacklist](#building-your-blacklist) is in place (step 2) — the
-> first cycle starts building immediately.
+```bash
+sudo cp /usr/share/arch-native/nginx.conf.example /etc/nginx/conf.d/arch-native.conf
+sudo systemctl reload nginx        # serves http://<host>:8081/repo/
+```
 
-`buildbot` is a long-running daemon. With systemd:
+### 4. Start the daemon
 
 ```bash
 sudo systemctl enable --now arch-native
-sudo systemctl stop arch-native      # to pause for queue edits
-sudo systemctl start arch-native
+sudo buildbot status               # what's building, queued, failed
 ```
 
-**Graceful shutdown** — SIGTERM (`systemctl stop`) lets the current build finish
-before exiting, so stopping mid-Firefox can take up to `build_timeout` to return.
-If killed (SIGKILL, power loss), the in-progress build is re-queued at the front
-on restart and `fsck` runs automatically to repair any divergence.
+The first cycle starts building immediately and works through every installed
+package, which can take days. Builds go straight into the repo as they finish.
+Using a different init system? See
+[Other init systems](#other-init-systems).
 
-<details>
-<summary>Other init systems (dinit, OpenRC, runit)</summary>
+### 5. Point pacman at the repo
 
-**dinit** — `/etc/dinit.d/arch-native`:
-
-```
-type = process
-command = /usr/bin/buildbot
-options = --config /etc/arch-native.conf
-logfile = /var/log/arch-native.log
-restart = true
-```
-
-```bash
-sudo dinitctl enable arch-native && sudo dinitctl start arch-native
-```
-
-**OpenRC** — `/etc/init.d/arch-native`:
-
-```bash
-#!/sbin/openrc-run
-description="arch-native package build daemon"
-command=/usr/bin/buildbot
-command_args="--config /etc/arch-native.conf"
-pidfile=/run/arch-native.pid
-command_background=true
-output_log=/var/log/arch-native.log
-error_log=/var/log/arch-native.log
-```
-
-```bash
-sudo chmod +x /etc/init.d/arch-native
-sudo rc-update add arch-native default && sudo rc-service arch-native start
-```
-
-**runit** — `/etc/runit/sv/arch-native/run`:
-
-```bash
-#!/bin/sh
-exec /usr/bin/buildbot --config /etc/arch-native.conf 2>&1
-```
-
-```bash
-sudo chmod +x /etc/runit/sv/arch-native/run
-sudo ln -s /etc/runit/sv/arch-native /run/runit/service/
-```
-
-</details>
-
-## On the desktop
-
-> **Local mode:** the desktop *is* the build server — stay on the same machine.
-
-### 7. Add the repo to pacman.conf
-
-In `/etc/pacman.conf`, place your repo **after** the distro repos:
+Add the repo to `/etc/pacman.conf` **below** your distro's repos:
 
 ```ini
-[myrepo]
+[forge]
 SigLevel = Required DatabaseOptional
-Server = http://your-build-host:8081/repo   # or http://localhost:8081/repo (local mode)
+Server = file:///var/lib/arch-native/repo        # local mode
+# Server = http://build-host:8081/repo           # remote mode
 ```
 
 Trust the signing key:
 
 ```bash
-sudo pacman-key --fetch-keys http://your-build-host:8081/repo/buildbot-public.asc
-sudo pacman-key --lsign-key <KEY-FINGERPRINT>
+curl -sO http://build-host:8081/repo/buildbot-public.asc   # remote mode only
+sudo pacman-key --add buildbot-public.asc                   # local: /var/lib/arch-native/repo/buildbot-public.asc
+sudo pacman-key --lsign-key arch-native@localhost
 ```
 
-### 8. Install arch-native-client
+Install the client and pull in the first forge builds:
 
 ```bash
-yay -S arch-native-client          # or: cd arch-native-client && makepkg -si
+cd arch-native-client && makepkg -si
+sudo pacman -Sy && sudo native-sync
 ```
 
-This installs two tools:
+**Local mode setup is complete.**
 
-- **`native-sync`** — upgrades your installed packages to the forge builds (see
-  [native-sync](#native-sync)).
-- **`pkglist-export`** — a pacman hook that syncs your package list to the build
-  server after each transaction. It does nothing until you configure it, and is
-  unused in local mode.
+### 6. Remote mode only: send your package list to the server
 
-**Local mode:** you're done. **Remote mode:** configure `pkglist-export` next.
-
-## Set up pkglist-export (remote mode)
+`pkglist-export` runs as a pacman hook after every transaction and rsyncs your
+installed-package list to the build server. Until it is configured, it does
+nothing.
 
 ```bash
-sudo cp /usr/share/arch-native-client/arch-native-client.conf.example \
-        /etc/arch-native-client.conf
-sudo $EDITOR /etc/arch-native-client.conf
+sudo cp /usr/share/arch-native-client/arch-native-client.conf.example /etc/arch-native-client.conf
+sudoedit /etc/arch-native-client.conf
 ```
 
 ```bash
-REMOTE_HOST="user@build-server"
+REMOTE_HOST="user@build-host"
 REMOTE_PATH="/var/lib/arch-native/manifests/client.json"
-# SSH_KEY="/path/to/id_ed25519"   # omit to use ssh-agent or default key
+# SSH_KEY="/root/.ssh/id_ed25519"     # omit to use the default key
 ```
 
-The hook runs as root and rsyncs your package list after every transaction, so
-root on the desktop needs SSH access to the build server:
+The hook runs as root, so root on this machine needs SSH access to the server:
 
 ```bash
-# desktop:
+# this machine
 sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ""
-sudo cat /root/.ssh/id_ed25519.pub        # add to the build server
+sudo cat /root/.ssh/id_ed25519.pub       # append to ~user/.ssh/authorized_keys on the server
 
-# build server:
-echo "ssh-ed25519 AAAA... root@desktop" >> ~/.ssh/authorized_keys
-sudo setfacl -m u:myuser:rwx /var/lib/arch-native/manifests
+# build server
+sudo setfacl -m u:user:rwx /var/lib/arch-native/manifests
 
-# verify end-to-end (desktop):
+# this machine: test it end to end
 sudo pkglist-export
 ```
 
 ---
 
-## native-sync
+## Everyday use
 
-Upgrades installed packages that have a newer build in the forge repo. Run it
-manually, or right after `pacman -Syu` (it reuses the synced DBs and finishes in
-under a second when there's nothing to do):
+### Upgrading
+
+`native-sync` installs every package that has a newer forge build than the one
+installed. Run it after each system upgrade:
 
 ```bash
-sudo native-sync
+update() { yay -Syu && sudo native-sync; }          # bash/zsh
+function update; yay -Syu; and sudo native-sync; end   # fish
 ```
 
 ```
 native-sync: 853 / 1197  (71%)
 native-sync: patches  41 ok, 2 review, 1 fail
-native-sync: nothing to upgrade
+native-sync: upgrading 3 package(s) from forge
 ```
 
-The first line is forge coverage of your installed packages. The **patches** line
-is the build server's local-patch health (`ok`/`review`/`fail`/`orphaned`
-explained under [Local PKGBUILD patches](#local-pkgbuild-patches)); it's omitted
-if the server publishes none. Works in both modes.
+The first line shows how many of your installed packages forge has built. The
+`patches` line reports the health of your [local patches](#patching-packages).
 
-**Run it after every upgrade.** Add a function to your shell config so one
-command syncs the official repos and then pulls forge builds. `native-sync` needs
-root; the upgrade itself runs as your user.
+When the distro releases a newer version, `pacman -Syu` installs it first. Once
+buildbot rebuilds that version, `native-sync` swaps the forge build back in.
 
-bash / zsh — in `~/.bashrc` or `~/.zshrc`:
+If you renamed the repo, pass the name on the sudo line so it isn't stripped:
+`sudo FORGE_REPO=myrepo native-sync`.
 
-```bash
-update() {
-    yay -Syu
-    sudo native-sync
-}
-```
+### Checking on the server
 
-fish — in `~/.config/fish/config.fish`:
-
-```fish
-function update
-    yay -Syu
-    and sudo native-sync
-end
-```
-
-**Non-default repo name** — `native-sync` reads the repo name from the
-`FORGE_REPO` environment variable (default `forge`). Because it runs under sudo,
-set the variable *on the sudo line* so it isn't stripped:
-
-```bash
-sudo FORGE_REPO=myrepo native-sync
-```
-
----
-
-## Configuration
-
-### Configuration reference
-
-All settings live in the `[arch-native]` section of `/etc/arch-native.conf`. The
-**Default** column is the built-in fallback used when a key is omitted. Inline
-comments are allowed (`key = value   # note`); values themselves must not
-contain `#`.
-
-> The bundled config ships with opinionated starter values that differ from the
-> code defaults — `mode = local`, `distro = arch`, an example `blacklist`,
-> `lto_blacklist = llvm,rust`, `skip_pgp_on_import_failure = true`, and GCC-15
-> `extra_cflags`. Edit it rather than starting from a blank file.
-
-#### Core
-
-| Key | Default | Meaning |
-|---|---|---|
-| `repo_name` | `forge` | pacman DB filename and `PACKAGER` field |
-| `mode` | `remote` | `local` or `remote` (see [Modes](#modes)) |
-| `distro` | `artix` | `arch` or `artix`. `artix` installs libelogind/elogind/libudev into the chroot each cycle and deploys an artix-meson wrapper |
-| `build_user` | `buildbot` | system user that owns and runs builds; must exist |
-
-#### Build optimization
-
-These shape the generated `makepkg.conf`. Each is optional; leaving it unset
-keeps the tuned default, so the conf is unchanged out of the box. Editing one
-regenerates the conf on the next daemon start.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `march` | `native` | compiler target CPU → `-march=`. `native` for local; an explicit value (`znver4`, `pantherlake`, …) for remote cross-builds. Find yours: `gcc -march=native -Q --help=target \| grep march` |
-| `opt_level` | `3` | optimization level → `-O<opt_level>` (C/C++) and `-C opt-level` (Rust). Valid: `0 1 2 3 s g fast` (`fast`→`-Ofast`/rust `3`, `g`→`-Og`/rust `1`) |
-| `lto` | `true` | LTO master switch. `false` clears `LTOFLAGS` and sets `!lto` |
-| `ltoflags` | `-flto=auto -falign-functions=32` | LTO flags used when `lto = true` |
-| `cflags_base` | `-pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -fstack-clash-protection -fcf-protection -fno-semantic-interposition` | static portion of CFLAGS (everything except `-march`/`-O`, which come from `march`/`opt_level`) |
-| `ldflags` | `-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now -Wl,-z,pack-relative-relocs` | linker flags (LDFLAGS) |
-| `extra_cflags` | *(empty)* | appended verbatim to CFLAGS on top of `cflags_base`. GCC 15 made several legacy C patterns hard errors — demote them while upstream catches up: `-Wno-error=incompatible-pointer-types -Wno-error=discarded-qualifiers -Wno-error=implicit-function-declaration` |
-
-> In remote mode Rust still only gets `-C opt-level=<opt_level>` (no
-> `target-cpu`) — Cargo runs `build.rs` on the build host. C/C++ gets the full
-> `-march` via CFLAGS. See [Build host / target CPU mismatch](#build-host--target-cpu-mismatch-remote-mode).
-
-#### PKGBUILD resolution
-
-| Key | Default | Meaning |
-|---|---|---|
-| `repo_priority` | `local,arch` | ordered tier list. `local` is always available; each other tier needs a `<tier>_source` |
-| `<tier>_source` | built-ins below | `clone <url>` (per-package git, `{pkgname}` substituted), `monorepo` (walk the tree), or `pkgctl` (Arch devtools). Built-ins: `artix`=clone gitea, `cachyos`=monorepo, `arch`=pkgctl |
-| `tier_version_select` | `priority` | when a package is in several tiers: `priority` = first tier wins; `highest` = highest `pkgver` wins |
-
-See [PKGBUILD tier resolution](#pkgbuild-tier-resolution) for the full model.
-
-#### Per-package tier overrides
-
-Override `repo_priority` for specific packages (e.g. pin Artix's elogind-patched
-builds). Keep `local` first to retain patch support. `buildbot patch` respects
-these too.
-
-```ini
-[package_tiers]
-networkmanager = local,artix,arch
-ffmpeg         = local,cachyos,arch
-```
-
-#### Per-package timeout overrides
-
-Override `build_timeout` per package (seconds):
-
-```ini
-[package_timeouts]
-firefox = 28800
-llvm    = 28800
-```
-
-#### Blacklists
-
-| Key | Default | Meaning |
-|---|---|---|
-| `blacklist` | `gcc,glibc,coreutils,linux-api-headers` | never built; supports `fnmatch` globs. See [Building your blacklist](#building-your-blacklist) |
-| `lto_blacklist` | *(empty)* | built with LTO disabled (e.g. `llvm,rust`) |
-
-#### Always-build packages
-
-The inverse of the blacklist: build and keep a package **even when it isn't
-installed**. Plain names only.
-
-```ini
-always_build = xdg-desktop-portal-kde
-```
-
-Each name is injected as a virtual manifest entry every cycle — built (applying a
-`pkgbuilds/local/` patch if present) and exempt from uninstalled-pruning. Handy
-for seeding a *patched* build into the repo. Remove a name and the normal prune
-cleans it out next cycle.
-
-#### Build behavior
-
-| Key | Default | Meaning |
-|---|---|---|
-| `build_timeout` | `14400` | per-build limit in seconds; `0` disables |
-| `download_retry_limit` | `3` | re-queue transient download failures this many times before failing |
-| `skip_pgp_on_import_failure` | `false` | when a source signature can't be verified (key missing/invalid/untrusted), retry with `--skippgpcheck` (source hashes still verified; flagged `pgp_skipped` in built.json). A **bad signature or revoked key is never skipped** — it stays a hard failure |
-| `autoprune` | `true` | delete old `.pkg.tar.zst` (+ `.sig`) after each rebuild |
-| `autoprune_keep` | `1` | versions retained per package (≥ 1; raise for rollback) |
-| `autoprune_blacklisted` | `true` | drop newly-blacklisted packages from repo + DB each cycle |
-| `autoprune_uninstalled` | `true` | drop packages no longer in the manifest |
-| `autoprune_pkgbuild_clones` | `true` | drop cached PKGBUILD clones for packages no longer needed |
-| `failed_stall_retries` | `5` | mark "stalled" after this many failures (with the days rule) |
-| `failed_stall_days` | `7` | …and the last failure ≥ this many days ago |
-| `stall_auto_retry_days` | `3` | clear and re-queue a stalled package after this long; `0` disables |
-
-#### Timing
-
-| Key | Default | Meaning |
-|---|---|---|
-| `poll_interval` | `300` | main loop interval (seconds) |
-| `upstream_check_interval` | `3600` | how often to git-pull upstream PKGBUILDs |
-| `log_retention_days` | `7` | build-log retention |
-
-#### Debugging
-
-| Key | Default | Meaning |
-|---|---|---|
-| `log_level` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`; `DEBUG` traces per-package resolution |
-
-#### Artix / chroot
-
-| Key | Default | Meaning |
-|---|---|---|
-| `chroot_pacman_conf` | *(bundled)* | pacman.conf deployed into the chroot. Artix users must supply their own; default looks for `/usr/share/arch-native/chroot-pacman.conf` |
-| `chroot_extra_packages` | artix: `libelogind,libudev,elogind` · arch: empty | extra packages installed into the chroot after each upgrade |
-
-#### Paths
-
-All default to `/var/lib/arch-native/<subdir>`; override only for a non-standard
-layout: `chroot_dir`, `chroot_root`, `repo_dir`, `repo_db`, `pkgbuilds_dir`,
-`makepkg_configs_dir`, `manifest_path`, `gnupg_home`, `log_dir`, `metrics_path`.
-
-> `chroot_dir` is the parent; `chroot_root` is the clean base chroot inside it.
-> If you override `chroot_dir` alone, the base chroot stays at the old default —
-> set both.
-
----
-
-### What gets built: blacklist & eligibility
-
-What lands in the repo is your installed packages (or manifest) minus what the
-daemon can't or shouldn't build.
-
-#### Building your blacklist
-
-The blacklist stops packages from being rebuilt — get it right early, since a
-bad toolchain rebuild can make the system unbootable. The blacklist supports
-`fnmatch` globs.
-
-- **Always:** toolchain/core (`gcc`, `glibc`, `binutils`, `coreutils`,
-  `linux-api-headers`) — custom `-march` can break the system; AUR/binary
-  packages — no upstream PKGBUILD.
-- **Pure data (no benefit):** `ttf-*`, `otf-*`, `font-*`, `*-icon-theme`,
-  `*-cursors`, `linux-firmware`, `linux-firmware-*`, `*-keyring`,
-  `*-translations`, `hunspell-*`, `tesseract-data-*`, `*-dinit`, `*-openrc`,
-  `*-runit`.
-- **Often problematic:** `llvm`/`rust` (also need LTO off — add to
-  `lto_blacklist`); packages whose build systems ignore `CFLAGS` (some Go/Java).
-
-```ini
-blacklist = gcc,glibc,binutils,coreutils,linux-api-headers,
-            ttf-*,otf-*,font-*,*-icon-theme,*-cursors,
-            linux-firmware,linux-firmware-*,*-keyring,
-            *-translations,hunspell-*,tesseract-data-*
-```
-
-After editing, `buildbot status` shows the **blacklisted** count and
-`buildbot queue -n 200` shows what's actually queued.
-
-#### Split packages and pkgbase resolution
-
-One `pkgbase` (one PKGBUILD) often produces several pkgnames — `gcc` →
-`gcc`, `gcc-libs`, `gcc-fortran`, …; `llvm` → `llvm`, `llvm-libs`, `clang`, ….
-When a pkgname isn't found directly, the daemon looks up its `pkgbase` and builds
-that; all subpackages in `.SRCINFO` are then recorded at once.
-
-So **blacklist the pkgbase, not a subpackage** — `blacklist = gcc` blocks
-`gcc-libs`; `blacklist = gcc-libs` doesn't (it still builds via `pkgbase=gcc`).
-Anything whose pkgbase is blacklisted is skipped automatically and counted under
-**skipped** in `buildbot status`.
-
-#### AUR and binary packages
-
-These have no upstream PKGBUILD to pull (AUR) or no source to compile (`*-bin`),
-so they're marked `not_found` in `failed.json`. Blacklist them to keep the failed
-list clean: `blacklist = ...,*-bin,*-git,*-svn`.
-
-#### Why a package might not be queued
-
-Beyond the blacklist:
-
-- **ineligible** (auto-detected, counted in `buildbot status`): `arch=any`
-  packages; packages with `ghc`/`haskell-ghc` makedepends (GHC-version-locked);
-  anything with a blacklisted pkgbase.
-- **`pending_upstream`** — installed version is newer than the PKGBUILD in your
-  tiers; released automatically once the tier catches up. `buildbot sync` forces
-  a re-scan.
-- **`pending_world_cascade`** — a soname bump is staged but not published until
-  the world repos finish migrating reverse-deps. Resolves on its own; check with
-  `buildbot why <pkg>`.
-- **stalled** — failed ≥ `failed_stall_retries` times with the last failure ≥
-  `failed_stall_days` ago; excluded from auto-retry. `buildbot retry <pkg>` after
-  fixing the cause.
-
-#### Soname repair
-
-`pending_world_cascade` keeps forge from breaking the distro repos. The reverse
-also needs guarding: when forge rebuilds a library whose soname moved, forge's
-*own* reverse-deps are left pointing at a soname nothing provides. They install
-cleanly and then fail to start. A soname change needs no version change to
-happen — `abseil-cpp 20260817.0-1` → `-2` moved every `libabsl` from `2605` to
-`2608` — so nothing in the package metadata flags it.
-
-Each cycle the daemon reads the real ELF `SONAME` and `DT_NEEDED` entries of the
-packages in the repo, caching them in `sonames.json` beside `built.json`.
-Declared metadata cannot be used here: soname `provides`/`depends` are optional
-in a PKGBUILD and usually absent for exactly the libraries that drift.
-
-A package whose link is dangling is handled one of two ways:
-
-- **stale** — forge's library moved on and the package still points at the old
-  soname. Queued for rebuild with `build_reason: soname`.
-- **ahead** — the package wants a *newer* soname than forge's copy of that
-  library provides, because that library is itself stale or failing to build.
-  Rebuilding would change nothing, so it is reported and left alone; fix the
-  library instead.
-
-Only libraries forge itself builds are considered, so distro libraries never
-enter into it. A package rebuilt once against an unchanged gap is not retried.
-`buildbot doctor` reports the current state from the cache without scanning.
-
----
-
-## Local PKGBUILD patches
-
-arch-native can build a *modified* package, not just an optimized copy. A patch
-is a unified diff applied on top of the fetched upstream PKGBUILD on every build
-— to disable a failing test, add a configure flag, strip a dep — re-applied as
-upstream moves, with drift checking to flag when it needs review.
-
-Patches live at `/var/lib/arch-native/pkgbuilds/local/<pkg>/<pkg>.patch`. Pair
-one with [`always_build`](#always-build-packages) to publish a custom build of an
-uninstalled package.
-
-### Build a package from a full PKGBUILD
-
-To build something with **no upstream PKGBUILD anywhere** (your own software),
-drop a complete PKGBUILD instead:
-
-```
-/var/lib/arch-native/pkgbuilds/local/<pkg>/PKGBUILD
-```
-
-With no `.patch` beside it, it resolves as tier `local` and is built like any
-package; add it to [`always_build`](#always-build-packages) so it builds without
-being installed. For a package that *does* exist upstream, prefer a patch — a
-full copy won't track upstream updates (the daemon logs a reminder each build).
-
-### Manage patches
-
-```bash
-sudo buildbot patch create networkmanager          # open upstream PKGBUILD in $EDITOR, save diff
-sudo buildbot patch show networkmanager            # print the current diff
-sudo buildbot patch create --force networkmanager  # re-author against current upstream
-sudo buildbot patch check --all                    # check all patches for drift
-sudo buildbot patch ack networkmanager             # reviewed against today's upstream
-sudo buildbot patch ack --permanent gstreamer      # never flag for version drift again
-sudo buildbot patch ack --all                      # ack everything in review
-sudo buildbot patch status                          # recompute + publish patch-status.json
-```
-
-Common edits:
-
-```diff
--  make check
-+  # make check  # broken with -march=native
-```
-```diff
--  ./configure --prefix=/usr
-+  ./configure --prefix=/usr --disable-foo
-```
-
-### Patch health
-
-`buildbot patch check --all` reports one state per patch:
-
-```
-elogind          ok        (tier: artix)
-flashrom         orphaned  (not installed)
-networkmanager   review    (written for 1.46.0-3, upstream now 1.48.0-2)
-zip              FAIL      checking file PKGBUILD
-```
-
-- **ok** — applies cleanly.
-- **orphaned** — package no longer installed; safe to remove.
-- **review** — still applies, but upstream released a new `pkgver` since the
-  patch was last looked at. Check whether it's still needed, then
-  `buildbot patch ack <pkg>` (or `patch create --force` to re-author it).
-- **obsolete** — does not apply, but applies *in reverse*: upstream already
-  contains this change and adopted the same fix. Retire the patch.
-- **FAIL** — no longer applies; the next build of that package fails loudly until
-  you update it.
-
-`review` works by recording the upstream `pkgver`/`pkgrel` as a header in the
-`.patch`. Pre-header patches just report `ok`/`FAIL`; recreate with `--force` to
-opt in. VCS packages get pkgrel-drift detection only.
-
-#### Keeping review meaningful
-
-Left alone, `review` is a ratchet that only ever grows: the status compares a
-patch against the version it was *written* at, so a single upstream release
-flags it forever and the list fills with patches nothing will ever retire. Three
-things keep it short:
-
-- **`buildbot patch ack <pkg>`** re-stamps a patch as seen at today's upstream
-  without touching the diff, so `review` means "drifted since you last looked"
-  rather than "drifted since you wrote it". `--all` acks everything in review.
-- **A `pkgrel`-only bump is not drift.** The upstream sources are byte-identical
-  and only the packaging moved; since the patch still applies, the packager
-  cannot have touched the lines it depends on.
-- **`policy=permanent`** (set with `patch ack --permanent`, stored in the patch
-  header) exempts a patch from version drift for good. Use it for patches that
-  fix *this build setup* rather than an upstream defect — stripping `-march` for
-  a cross-march build host, the Artix `libexec` layout, disabling LTO. Upstream
-  releasing a new version cannot retire those, so drift is not a reason to look
-  again. They are still checked for applying, which is the failure that matters.
-
-The daemon publishes `patch-status.json` to the repo at startup and each
-`upstream_check_interval` so `native-sync` can show the **patches** line. Run
-`buildbot patch check --all` after upstream cycles to catch drift early.
-
----
-
-## How it works
-
-### Build cycle
-
-```
-Desktop — after each pacman transaction (remote mode):
-  pkglist-export.hook fires
-  → reads pacman -Qi + pacman -Sl, writes a JSON manifest, rsyncs it to:
-  → build-server:/var/lib/arch-native/manifests/client.json
-
-Build server — main loop (poll_interval = 300s):
-  1. Upgrade clean chroot        arch-nspawn -Syu inside chroots/root/
-  2. Detect package list change  local: read pacman DB; remote: watch manifest mtime
-                                 diff against built.json → queue new/changed packages
-  3. Upstream update check       every upstream_check_interval (default 1h):
-                                   git pull cached PKGBUILD repos
-                                   vercmp each built package against PKGBUILD version
-                                   re-queue anything with a newer upstream version
-  4. Drain full pending queue    repeat until empty or shutdown:
-       resolve_pkgbuild()          local patch → tiers in repo_priority
-       parse_srcinfo()             version, deps, pgp keys
-       is_eligible()               skip blacklisted / already-built-at-version
-       import_pgp_keys() → makechrootpkg → sign → repo-add (+ autoprune)
-  5. Sleep remainder of poll_interval
-```
-
-Official-repo updates are thus picked up automatically once an hour; newly
-installed packages on the next cycle. The full queue drains before the daemon
-sleeps; `buildbot status` shows a **next cycle** countdown.
-
-### PKGBUILD tier resolution
-
-`repo_priority` sets the order; tier names are arbitrary and each maps to a
-source type.
-
-| Source | How it works | Auto-updated |
-|---|---|---|
-| `local` | patches/full PKGBUILDs in `pkgbuilds/local/<pkg>/`, applied over upstream | No (user-managed) |
-| `clone <url>` | per-package `git clone --depth=1` (`{pkgname}` substituted), cached; checks root and `trunk/` | Yes, per-package pull each cycle |
-| `monorepo` | walks `pkgbuilds/<tier>/` by pkgname; clone once manually | Yes, whole-repo pull |
-| `pkgctl` | `git clone` from Arch's packaging GitLab; needs `devtools` | Yes, per-package pull |
-
-`tier_version_select`: `priority` (first tier with a PKGBUILD wins — safe when
-higher tiers carry distro patches) or `highest` (highest `pkgver` across tiers
-wins — useful when a tier lags upstream).
-
-Built-in tiers need no config: `artix` (clone gitea), `cachyos` (monorepo, clone
-manually to `pkgbuilds/cachyos/`), `arch` (pkgctl). Add your own by naming a tier
-and defining its source:
-
-```ini
-repo_priority = local,myfork,arch
-myfork_source = clone https://git.example.com/packages/{pkgname}.git
-```
-
-```bash
-# monorepo tiers (incl. cachyos) are cloned once by hand:
-sudo git clone --depth=1 https://github.com/CachyOS/CachyOS-PKGBUILDS \
-    /var/lib/arch-native/pkgbuilds/cachyos
-```
-
-Version detection during the upstream check only covers packages already built
-once (the clone must exist). For a package installed since the last check, run
-`buildbot sync` to force it into the queue.
-
-### native-sync detection
-
-Forge builds keep upstream's pkgver/pkgrel. `native-sync` identifies forge
-packages by the `PACKAGER` field (`Buildbot <buildbot@forge>`), with a
-dotted-pkgrel fallback for older builds. When the distro ships a higher version,
-`pacman -Syu` takes it first; `native-sync` re-upgrades once buildbot rebuilds at
-that version.
-
-### LTO auto-retry
-
-A build that fails with a linker error (`collect2: error: ld returned`) or Rust
-LTO incompatibility is retried once with LTO disabled (`LTOFLAGS=""`, `!lto`),
-logged as `<timestamp>-nolto.log`. Add packages to `lto_blacklist` (fnmatch
-globs allowed) to build them with LTO off from the start and skip the doomed
-first attempt. To turn LTO off globally, set `lto = false`.
-
-### Build host / target CPU mismatch (remote mode)
-
-When the build server can't execute target-CPU binaries, the daemon:
-
-- sets `!check` in `BUILDENV` — test suites run compiled binaries and would
-  SIGILL;
-- omits `target-cpu=<march>` from `RUSTFLAGS` — Cargo runs `build.rs` on the
-  build host; C/C++ still gets full `-march` via `CFLAGS`, only Rust is limited
-  to `-C opt-level=<opt_level>`.
-
-In local mode (`march = native`) both limitations lift and tests run.
-
-### Download failure retry
-
-Transient failures (HTTP 429, SSL errors, connection resets) are detected by log
-pattern and re-queued up to `download_retry_limit` times before moving to
-`failed.json` as `"download failed after N attempts"`.
-
-### File system layout
-
-```
-/var/lib/arch-native/
-├── built.json          {pkgname: {version, pkgrel, built_at, pkg_files, pgp_skipped?}}
-├── pending.json        [{name, version, repo, build_reason, download_retries?}, ...]
-├── failed.json         {pkgname: {version, reason, retries, timestamp}}
-├── metrics.json        last-cycle stats (for external monitoring)
-├── in_progress.json    currently building; re-inserted at front on restart
-├── manifests/client.json    package list from desktop (remote mode)
-├── chroots/
-│   ├── root/           clean base — upgraded each cycle
-│   └── build-<uuid>/   ephemeral per-build copy (stale ones = interrupted build)
-├── gnupg/              signing key (0700)
-├── logs/<pkgname>/YYYYMMDD-HHMMSS.log   (+ -nolto.log on LTO retry)
-├── makepkg-configs/makepkg.<march>.conf
-├── pkgbuilds/
-│   ├── local/<pkg>/    <pkg>.patch (preferred) and/or full PKGBUILD; _patched/ working dir
-│   └── <tier>/<pkg>/   clone/pkgctl per-package, or a monorepo tree
-└── repo/
-    ├── <repo_name>.db.tar.zst
-    ├── *.pkg.tar.zst[.sig]
-    ├── patch-status.json     patch health (read by native-sync)
-    └── buildbot-public.asc
-```
-
----
-
-## buildbot CLI reference
-
-`buildbot` is both the daemon (no subcommand) and the CLI. Full detail in
-`man buildbot`.
-
-| Command | Does |
+| Command | Shows |
 |---|---|
-| `init` | bootstrap a new install (layout, base chroot, keyring); safe to re-run |
-| `status` | one-screen overview (see below) |
-| `doctor` | check paths, JSON validity, gnupg perms, chroot keyring, cascade state, soname consistency |
-| `fsck [--dry-run] [-v] [--force]` | verify/repair built.json ↔ repo DB ↔ `.pkg` files; service must be stopped (`--force` overrides). Also runs each cycle |
-| `built [-n N]` | list built packages (N most recent) |
-| `queue [-n N]` | list the pending queue (default 25) |
-| `failed [-n N]` | list failed builds with reason + retry count |
-| `logs PKG [-f]` | print the latest build log; `-f` follows it |
-| `why PKG` | explain a package's current state in plain English |
-| `sync` | re-scan the package list and build now (works while running) |
-| `retry PKG \| --all [--dry-run]` | re-queue a failed (or any) package; service stopped |
-| `clear PKG \| --all` | drop from the failed list without retrying |
-| `patch …` | manage local patches — see [Local PKGBUILD patches](#local-pkgbuild-patches) |
+| `buildbot status` | one-screen overview: current build, queue, failures, repo coverage |
+| `buildbot why <pkg>` | why a package is or isn't built, in plain English |
+| `buildbot failed` | failed builds with reason and retry count |
+| `buildbot logs <pkg> [-f]` | the latest build log |
+| `buildbot queue` · `buildbot built` | pending queue · recently built |
+| `buildbot doctor` | health checks: paths, permissions, keyring, soname consistency |
 
-### Monitoring
+`man buildbot` has the full reference.
+
+<details>
+<summary>Example <code>buildbot status</code></summary>
 
 ```
 arch-native  ● active
@@ -864,80 +249,376 @@ Queue  52 pending
   ▸ thunderbird  115.12.0-1  update
     curl         8.12.1-1    update
 
-Recently built
-  fish          3.7.1-2   2h ago
-  curl          8.7.1-1   3h ago
-
 Stalled  needs attention  1
   gpgme      7d ago       5x  collect2: error: ld returned 1 exit status
 
-Failed  2
-  krb5       2h ago    download failed after 3 attempts
-  +1 more — run: buildbot failed
-
 Repo  forge
   rebuilt      987 / 1189  (83%)
-  blacklisted  47 / 1189  (4%)  (see /etc/arch-native.conf)
-  ineligible   12 / 1189  (1%)  (arch=any — not rebuilt)
+  blacklisted  47 / 1189  (4%)
   patches      44  (41 ok · 2 review · 1 fail · 0 orphaned)
-  size         12G
   next cycle   in 4m
 ```
 
-**next cycle** counts down to the next poll (see [Build cycle](#build-cycle)).
-**Building** shows the current compile and elapsed time (`idle` when none). If
-the daemon died mid-build it shows `status stale — daemon not running`; if a
-build passed `build_timeout` it shows `⚠ exceeded build_timeout`. Both mean the
-build is stuck.
+`status stale — daemon not running` or `⚠ exceeded build_timeout` under
+**Building** means the build is stuck.
 
-### Queue management
+</details>
 
-`retry`, `clear`, and `sync --reset` need the service stopped. `sync` (no
-`--reset`) works while running — it triggers an immediate pass.
+### Fixing the queue
+
+`buildbot sync` rescans your packages and starts building immediately, whether
+or not the daemon is running. Every other queue change needs the service
+**stopped**:
 
 ```bash
-sudo buildbot sync                   # re-scan + build now (running or not)
-
 sudo systemctl stop arch-native
-sudo buildbot retry firefox          # one failed package back to the queue
-sudo buildbot retry networkmanager   # force-rebuild any package (clears built.json entry)
-sudo buildbot retry --all            # all failed (skips ones no longer in the manifest)
-sudo buildbot retry --all --dry-run  # preview
-sudo buildbot clear firefox          # drop from failed list
-sudo buildbot clear --all
-sudo buildbot sync --reset           # clear queue and rebuild from scratch
+sudo buildbot retry firefox          # retry a failed package, or force-rebuild any package
+sudo buildbot retry --all            # retry every failed package (--dry-run to preview)
+sudo buildbot clear firefox          # drop from the failed list without retrying
+sudo buildbot sync --reset           # discard the queue and rebuild it from scratch
 sudo systemctl start arch-native
 ```
 
-### metrics.json
+Failed packages are retried automatically on a backoff. A package that keeps
+failing is marked **stalled**, and is retried again after
+`stall_auto_retry_days`.
 
-Written atomically after each cycle for scraping (Prometheus/Grafana):
+Stopping the service lets the current build finish first, so it can take up to
+`build_timeout`. If the daemon is killed mid-build, the build is re-queued at the
+front and a consistency check (`fsck`) runs on the next start.
 
-```json
-{
-  "timestamp":               "2025-06-01T03:00:00+00:00",
-  "status":                  "sleeping",
-  "pending_start":           12,
-  "pending_end":             0,
-  "attempted":               12,
-  "succeeded":               11,
-  "failed":                  1,
-  "skipped_previous_failure": 0,
-  "skipped_ineligible":      4,
-  "skipped_missing_keys":    0,
-  "cycle_seconds":           3820,
-  "sleep_seconds":           300
-}
+---
+
+## Choosing what gets built
+
+forge builds what you have installed, minus:
+
+- **The blacklist.** These packages are never built. `fnmatch` globs are allowed.
+- **Ineligible packages.** `arch=any` packages (nothing to compile) and packages
+  that build with GHC are skipped automatically.
+- **AUR and other foreign packages.** These have no upstream PKGBUILD to fetch.
+
+### Writing your blacklist
+
+| Category | Examples | Why |
+|---|---|---|
+| Toolchain and core | `gcc` `glibc` `binutils` `coreutils` `linux-api-headers` | a bad `-march` here can make the system unbootable |
+| Data only | `ttf-*` `otf-*` `font-*` `*-icon-theme` `*-cursors` `linux-firmware*` `*-keyring` `*-translations` `hunspell-*` | nothing to optimize |
+| Prebuilt | `*-bin` | no source to compile |
+| Often troublesome | `llvm` `rust` | also add them to `lto_blacklist` |
+
+**Blacklist the pkgbase, not a subpackage.** One PKGBUILD can produce several
+packages, for example `gcc` → `gcc`, `gcc-libs`, `gcc-fortran`. The daemon builds
+by pkgbase, so `blacklist = gcc` covers `gcc-libs`, but `blacklist = gcc-libs`
+still lets it build through `gcc`.
+
+After editing, `buildbot status` shows the blacklisted count and
+`buildbot queue -n 200` shows what is actually queued.
+
+### Building packages you don't have installed
+
+```ini
+always_build = xdg-desktop-portal-kde
 ```
 
-`status` is `sleeping` / `processing` / `starting`. `cycle_seconds` and
-`sleep_seconds` appear only when `sleeping`.
+Each listed package is built and kept in the repo even when it isn't installed.
+Combine this with a [patch](#patching-packages) to publish a customized build.
+Remove a name from the list and the package is pruned on the next cycle.
+
+### Why isn't my package built?
+
+Run `buildbot why <pkg>`. Besides the cases above, a package can be waiting on
+one of these:
+
+| State | Meaning | Resolves |
+|---|---|---|
+| `pending_upstream` | your installed version is newer than any PKGBUILD in your tiers | automatically, once the tier catches up |
+| `pending_world_cascade` | the build bumped a library soname that the distro repos haven't migrated to yet; it is held back so the build doesn't break distro packages | automatically |
+| stalled | failed repeatedly | after fixing the cause, run `buildbot retry <pkg>` |
+
+---
+
+## Patching packages
+
+arch-native can build a *modified* package, not just an optimized one. A patch
+is a unified diff applied to the upstream PKGBUILD on every build, for example to
+disable a broken test, add a configure flag, or drop a dependency. The patch is
+re-applied as upstream moves and checked for drift.
+
+```bash
+sudo buildbot patch create networkmanager          # edit the upstream PKGBUILD in $EDITOR, save the diff
+sudo buildbot patch show networkmanager
+sudo buildbot patch check --all                    # health of every patch
+sudo buildbot patch ack networkmanager             # mark as reviewed against current upstream
+sudo buildbot patch ack --permanent gstreamer      # never flag for version drift
+sudo buildbot patch create --force networkmanager  # rewrite against current upstream
+```
+
+Patches are stored at `/var/lib/arch-native/pkgbuilds/local/<pkg>/<pkg>.patch`.
+
+### Patch health
+
+```
+elogind          ok        (tier: artix)
+networkmanager   review    (written for 1.46.0-3, upstream now 1.48.0-2)
+zip              FAIL      checking file PKGBUILD
+```
+
+| State | Meaning | What to do |
+|---|---|---|
+| **ok** | applies cleanly | nothing |
+| **review** | applies, but upstream released a new `pkgver` since you last looked | check whether the patch is still needed, then `patch ack` it |
+| **obsolete** | upstream already contains this change | delete the patch |
+| **FAIL** | no longer applies, so the package's next build will fail | `patch create --force` |
+| **orphaned** | package no longer installed | delete the patch |
+
+`review` only triggers on a `pkgver` change. A `pkgrel`-only bump doesn't count,
+because the sources are unchanged. Use `--permanent` for patches that adapt
+upstream to *your build setup* rather than fix an upstream bug (stripping
+`-march` for a cross-build host, the Artix `libexec` layout, disabling LTO), since
+new upstream releases won't make them unnecessary.
+
+### Building your own software
+
+Put a complete `PKGBUILD` at `pkgbuilds/local/<pkg>/PKGBUILD`, with no `.patch`
+file next to it, and add the package to `always_build`. For a package that exists
+upstream, use a patch instead: a full copy doesn't follow upstream updates.
+
+---
+
+## Configuration reference
+
+All settings live in the `[arch-native]` section of `/etc/arch-native.conf`.
+The **Default** column is what applies when a key is omitted. The shipped config
+overrides some of these defaults. Inline `# comments` are allowed.
+
+#### Core
+
+| Key | Default | Meaning |
+|---|---|---|
+| `repo_name` | `forge` | repo DB name, also used in the `PACKAGER` field |
+| `mode` | `remote` | `local` or `remote` |
+| `distro` | `artix` | `artix` installs elogind/libudev into the chroot and deploys an `artix-meson` wrapper |
+| `build_user` | `buildbot` | unprivileged user that runs builds |
+
+#### Compiler flags
+
+These generate `makepkg.conf`. Changes apply on the next daemon start.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `march` | `native` | `-march=` target |
+| `opt_level` | `3` | `-O` level, also Rust `opt-level`: `0 1 2 3 s g fast` |
+| `lto` | `true` | link-time optimization on or off |
+| `ltoflags` | `-flto=auto -falign-functions=32` | used when `lto = true` |
+| `cflags_base` | Arch defaults, plus `-fno-semantic-interposition` | CFLAGS other than `-march`/`-O` |
+| `ldflags` | Arch defaults | LDFLAGS |
+| `extra_cflags` | *(empty)* | appended to CFLAGS. The shipped config demotes the GCC 15 errors `incompatible-pointer-types`, `discarded-qualifiers` and `implicit-function-declaration` to warnings |
+
+#### Package selection
+
+| Key | Default | Meaning |
+|---|---|---|
+| `blacklist` | `gcc,glibc,coreutils,linux-api-headers` | never built (globs allowed) |
+| `lto_blacklist` | *(empty)* | built with LTO off (globs allowed) |
+| `always_build` | *(empty)* | built even when not installed (plain names only) |
+
+#### PKGBUILD sources
+
+| Key | Default | Meaning |
+|---|---|---|
+| `repo_priority` | `local,arch` | ordered list of tiers to fetch PKGBUILDs from ([details](#pkgbuild-tiers)) |
+| `<tier>_source` | see tiers | `clone <url>`, `monorepo`, or `pkgctl` |
+| `tier_version_select` | `priority` | `priority`: first tier that has the package wins. `highest`: highest `pkgver` across tiers wins |
+
+Per-package overrides go in their own sections:
+
+```ini
+[package_tiers]          # keep "local" first to keep patch support
+networkmanager = local,artix,arch
+
+[package_timeouts]       # seconds
+firefox = 28800
+```
+
+#### Build behavior
+
+| Key | Default | Meaning |
+|---|---|---|
+| `build_timeout` | `14400` | per-build limit in seconds; `0` disables |
+| `download_retry_limit` | `3` | re-queue transient download failures this many times |
+| `skip_pgp_on_import_failure` | `false` | if a source signing key can't be fetched, build with `--skippgpcheck` (hashes still verified). A bad signature or revoked key is always a hard failure |
+| `failed_stall_retries` / `failed_stall_days` | `5` / `7` | mark a package stalled after this many failures, once the last failure is this many days old |
+| `stall_auto_retry_days` | `3` | retry stalled packages after this long; `0` disables |
+
+#### Housekeeping
+
+| Key | Default | Meaning |
+|---|---|---|
+| `autoprune` · `autoprune_keep` | `true` · `1` | delete superseded package files, keeping N versions |
+| `autoprune_blacklisted` | `true` | remove newly blacklisted packages from the repo |
+| `autoprune_uninstalled` | `true` | remove packages you no longer have installed |
+| `autoprune_pkgbuild_clones` | `true` | remove cached PKGBUILD clones nothing needs |
+| `poll_interval` | `300` | seconds between daemon cycles |
+| `upstream_check_interval` | `3600` | seconds between checks for upstream PKGBUILD updates |
+| `log_retention_days` | `7` | build log retention |
+| `log_level` | `INFO` | `DEBUG` traces how each package's PKGBUILD is resolved |
+
+#### Chroot and paths
+
+| Key | Default | Meaning |
+|---|---|---|
+| `chroot_pacman_conf` | bundled (Artix + CachyOS) | the build chroot's `pacman.conf` |
+| `chroot_extra_packages` | artix: `libelogind,libudev,elogind` | installed into the chroot on every upgrade |
+
+Every path defaults to a location under `/var/lib/arch-native/`. The overridable
+paths are `chroot_dir`, `chroot_root`, `repo_dir`, `repo_db`, `pkgbuilds_dir`,
+`makepkg_configs_dir`, `manifest_path`, `gnupg_home`, `log_dir` and
+`metrics_path`. If you override `chroot_dir`, set `chroot_root` too.
+
+---
+
+## How it works
+
+### The build cycle
+
+```
+every poll_interval (5 min):
+  1. upgrade the clean chroot
+  2. diff installed packages against built.json → queue new and changed packages
+     queue rebuilds for forge packages that link a soname forge no longer ships
+  3. every upstream_check_interval (1 h): git pull PKGBUILDs, queue upstream bumps
+  4. drain the queue:
+       resolve PKGBUILD (local patch → tiers) → parse .SRCINFO → eligibility check
+       → import PGP keys → makechrootpkg → sign → repo-add
+  5. sleep until the next cycle (buildbot sync wakes it early)
+```
+
+### PKGBUILD tiers
+
+`repo_priority` lists where PKGBUILDs come from, in order. Each tier name maps to
+a source type:
+
+| Source | Behavior |
+|---|---|
+| `local` | your patches or full PKGBUILDs in `pkgbuilds/local/`. Always tried first |
+| `clone <url>` | per-package `git clone`, with `{pkgname}` substituted in the URL |
+| `monorepo` | one big repo walked by package name. Clone it once by hand into `pkgbuilds/<tier>/` |
+| `pkgctl` | Arch's packaging GitLab |
+
+The tiers `artix` (clone from Artix gitea), `cachyos` (monorepo) and `arch`
+(pkgctl) work with no further configuration. To add your own:
+
+```ini
+repo_priority = local,myfork,arch
+myfork_source = clone https://git.example.com/packages/{pkgname}.git
+```
+
+```bash
+sudo git clone --depth=1 https://github.com/CachyOS/CachyOS-PKGBUILDS /var/lib/arch-native/pkgbuilds/cachyos
+```
+
+### Soname safety
+
+A library rebuild can change its soname without any version change. For example,
+`abseil-cpp 20260817.0-1` → `-2` moved every `libabsl` from `2605` to `2608`.
+arch-native guards against this in both directions:
+
+- **Protecting distro packages.** If a forge build introduces a soname that the
+  distro repos haven't migrated to yet, the build is held back as
+  `pending_world_cascade` until they catch up.
+- **Protecting forge packages.** Each cycle the daemon reads the real ELF
+  `SONAME`/`DT_NEEDED` entries of every repo package (cached in `sonames.json`).
+  Forge packages still linking a soname forge no longer ships are rebuilt. A
+  package that needs a *newer* soname than forge provides is only reported, since
+  the library itself has to be fixed first.
+
+### Build host / target CPU mismatch
+
+If the build server can't run binaries built for the target CPU, the daemon
+disables test suites (`!check`) and drops `target-cpu` from `RUSTFLAGS`, because
+both would run target code on the build host and crash with SIGILL. C/C++ still
+gets the full `-march`. Local mode has neither limitation.
+
+### Automatic retries
+
+- **Link failures** (`ld returned`, Rust LTO errors) are retried once with LTO
+  off. Put repeat offenders in `lto_blacklist` to skip the failing first attempt.
+- **Download failures** (HTTP 429, TLS errors, connection resets) are re-queued
+  up to `download_retry_limit` times.
+- **Missing dependencies or sources in one tier** move the next attempt to the
+  next tier.
+
+### How native-sync recognizes forge builds
+
+forge builds keep upstream's `pkgver-pkgrel`. `native-sync` tells them apart by
+the `PACKAGER` field (`Buildbot <buildbot@forge>`) and reinstalls any package at
+the same version that wasn't built by forge. Before installing, it clears cached
+copies from pacman's cache, because a cached distro build of the same version
+would fail checksum verification.
+
+### Files
+
+```
+/var/lib/arch-native/
+├── built.json            per-package build record and status
+├── pending.json          build queue
+├── failed.json           failures with reason, retry count, backoff
+├── in_progress.json      the current build; re-queued if the daemon dies
+├── sonames.json          ELF soname cache
+├── metrics.json          last-cycle stats, for Prometheus etc.
+├── manifests/client.json package list from the client (remote mode)
+├── chroots/root/         clean base chroot
+├── gnupg/                signing key
+├── logs/<pkg>/           build logs (…-nolto.log for an LTO retry)
+├── pkgbuilds/local/      your patches
+├── pkgbuilds/<tier>/     fetched PKGBUILDs
+└── repo/                 the pacman repo, patch-status.json, buildbot-public.asc
+```
+
+### Other init systems
+
+<details>
+<summary>dinit, OpenRC, runit</summary>
+
+The daemon is `/usr/bin/buildbot --config /etc/arch-native.conf` run as root.
+It shuts down cleanly on SIGTERM.
+
+**dinit**: `/etc/dinit.d/arch-native`
+
+```
+type = process
+command = /usr/bin/buildbot --config /etc/arch-native.conf
+logfile = /var/log/arch-native.log
+restart = true
+```
+
+**OpenRC**: `/etc/init.d/arch-native`
+
+```bash
+#!/sbin/openrc-run
+command=/usr/bin/buildbot
+command_args="--config /etc/arch-native.conf"
+command_background=true
+pidfile=/run/arch-native.pid
+output_log=/var/log/arch-native.log
+error_log=/var/log/arch-native.log
+```
+
+**runit**: `/etc/runit/sv/arch-native/run`
+
+```bash
+#!/bin/sh
+exec /usr/bin/buildbot --config /etc/arch-native.conf 2>&1
+```
+
+`buildbot sync` and the "service must be stopped" checks rely on systemd. With
+another init system, stop the daemon yourself before running `retry` or `clear`.
+
+</details>
 
 ---
 
 ## License
 
-[GNU General Public License v3.0 or later](LICENSE) — this program is free
-software; you may redistribute and/or modify it under the terms of the GPL as
-published by the Free Software Foundation, either version 3 or (at your option)
-any later version.
+[GPL-3.0-or-later](LICENSE).

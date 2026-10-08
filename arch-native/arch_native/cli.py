@@ -16,35 +16,20 @@ from .daemon import run_daemon
 from .pacman import _manifest_map, build_pkgbase_map, load_manifest, read_local_packages
 from .patches import cmd_patch
 from .repo import _run_fsck
-from .soname import _deferred_names, _find_soname_breakage, _soname_index_path, _world_depends_on_old_soname, _world_has_soname, soname_lib_base
-from .state import _DEFERRED_STATUSES, _is_stalled, _queue_item_for, _queue_lock, diff_manifest, get_built_state, load_failed, load_in_progress, load_pending, prune_stale_queue_entries, save_built_state, save_failed, save_pending
+from .soname import _deferred_names, _find_soname_breakage, _soname_index_path, soname_lib_base, sync_index
+from .state import _DEFERRED_STATUSES, daemon_pid, _is_stalled, _queue_item_for, _queue_lock, diff_manifest, get_built_state, load_failed, load_in_progress, load_pending, prune_stale_queue_entries, save_built_state, save_failed, save_pending
 from .util import _load_json_file, _load_json_strict, _sanitize_reason
 
 log = logging.getLogger("buildbot")
 
 
-def _service_active() -> bool:
-    for svc in ("arch-native", "buildbot"):  # check new name first, then legacy
-        result = subprocess.run(["systemctl", "is-active", svc], capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip() == "active":
-            return True
-    return False
+def _service_active(config: dict) -> bool:
+    return daemon_pid(config) > 0
 
 
-def _daemon_main_pid() -> int:
-    """Return the running daemon's PID via systemd, or 0 if not found."""
-    for svc in ("arch-native", "buildbot"):
-        result = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", svc],
-                                capture_output=True, text=True)
-        pid = result.stdout.strip()
-        if result.returncode == 0 and pid.isdigit() and int(pid) > 0:
-            return int(pid)
-    return 0
-
-
-def _wake_daemon() -> bool:
+def _wake_daemon(config: dict) -> bool:
     """Signal the running daemon to run an immediate build pass. Returns True on success."""
-    pid = _daemon_main_pid()
+    pid = daemon_pid(config)
     if pid <= 0:
         return False
     try:
@@ -55,7 +40,7 @@ def _wake_daemon() -> bool:
         return False
 
 
-_STOPPED_MSG = "error: service is running — stop it first with: sudo systemctl stop arch-native"
+_STOPPED_MSG = "error: the daemon is running — stop it first (e.g. sudo systemctl stop arch-native)"
 
 
 def cmd_status(args, config: dict) -> int:
@@ -87,7 +72,7 @@ def cmd_status(args, config: dict) -> int:
     failed_map  = load_failed(config["failed_path"])
     built       = get_built_state(config["state_path"])
     in_progress = load_in_progress(config)
-    active      = _service_active()
+    active      = _service_active(config)
     timeout     = int(config.get("build_timeout") or 0)
 
     metrics = {}
@@ -340,7 +325,8 @@ def cmd_doctor(args, config: dict) -> int:
     def add(name, ok, detail):
         checks.append((name, ok, detail))
 
-    add("service", _service_active(), "active" if _service_active() else "inactive")
+    pid = daemon_pid(config)
+    add("service", pid > 0, f"running (pid {pid})" if pid else "not running")
 
     # JSON files
     for path, expected, label in [
@@ -466,14 +452,7 @@ def cmd_queue_show(args, config: dict) -> int:
 
 
 def cmd_sync(args, config: dict) -> int:
-    daemon_active = _service_active()
-
-    # --reset clears the queue and rebuilds from scratch — a destructive rewrite
-    # of pending.json that must not race the daemon's own queue writes (the daemon
-    # does not take _queue_lock). Require a stop, consistent with retry/clear.
-    if args.reset and not args.dry_run and daemon_active:
-        print(_STOPPED_MSG)
-        return 2
+    daemon_active = _service_active(config)
 
     manifest = (read_local_packages() if config.get("mode") == "local"
                 else load_manifest(config["manifest_path"]))
@@ -482,13 +461,12 @@ def cmd_sync(args, config: dict) -> int:
     pkgbase_map = build_pkgbase_map()
     needed = diff_manifest(manifest, built, config["blacklist"], pkgbase_map)
 
-    # When the daemon is running it owns the queue: writing pending.json from the
-    # CLI would race its own queue mutations. Instead just nudge it to run an
-    # immediate build pass — it re-derives the queue (step 2) and starts building.
+    # A running daemon re-derives the queue itself on its next pass, so just
+    # nudge it to start one now.
     if daemon_active and not args.dry_run and not args.reset:
         need_count = len(needed)
         summary = f"{need_count} package(s) need building" if need_count else "queue already up to date"
-        if _wake_daemon():
+        if _wake_daemon(config):
             print(f"{summary} — building now (follow: journalctl -fu arch-native)")
         else:
             print(f"{summary} — daemon will pick them up within one poll cycle")
@@ -519,7 +497,7 @@ def cmd_sync(args, config: dict) -> int:
     suffix = "  (dry run)" if args.dry_run else ""
     print(f"queue {action}: {added} added, {len(existing)} total{suffix}")
     if not args.dry_run:
-        if daemon_active and _wake_daemon():
+        if daemon_active and _wake_daemon(config):
             print("building now (follow: journalctl -fu arch-native)")
         elif not daemon_active:
             print("start the service to build: sudo systemctl start arch-native")
@@ -533,9 +511,6 @@ def cmd_queue_retry_failed(args, config: dict) -> int:
         return 2
 
     manifest_map = _manifest_map(config)
-    if not args.dry_run and _service_active():
-        print(_STOPPED_MSG)
-        return 2
 
     # Build set of manifest package names for filtering (--all only)
     manifest_names = set(manifest_map.keys())
@@ -745,14 +720,14 @@ def cmd_why(args, config: dict) -> int:
         print(f"  Version   {forge_ver}  (staged {staged_age})")
         # Diagnose each awaited soname: not-yet-provided vs provided-but-a-world
         # reverse-dep still needs the old one (the conservative second gate).
-        repo_name = config.get("repo_name", "")
+        world = sync_index(config.get("repo_name", ""))
         blocking = []
         for s in built_rec.get("cascade_sonames", []):
             lib = s.split("=", 1)[0]
-            if not _world_has_soname(s, repo_name):
+            if not world.has_soname(s):
                 state = "not in distro repos yet"
                 blocking.append(s)
-            elif _world_depends_on_old_soname(lib, s, repo_name):
+            elif world.depends_on_old_soname(lib, s):
                 state = "provided, but a distro package still depends on the old soname"
                 blocking.append(s)
             else:
@@ -840,9 +815,6 @@ def cmd_failed_clear(args, config: dict) -> int:
     if not args.all and not targets_from_args:
         print("error: specify package name(s) or --all")
         return 2
-    if not args.dry_run and _service_active():
-        print(_STOPPED_MSG)
-        return 2
 
     lock_ctx = _queue_lock(config) if not args.dry_run else nullcontext()
     with lock_ctx:
@@ -868,7 +840,7 @@ def cmd_fsck(args, config: dict) -> int:
     and physical package files. Repairs SIGKILL-race divergences automatically.
     Requires the service to be stopped (unless --force is given).
     """
-    if not getattr(args, "force", False) and _service_active():
+    if not getattr(args, "force", False) and _service_active(config):
         print(_STOPPED_MSG)
         return 2
     dry_run = getattr(args, "dry_run", False)
@@ -1105,8 +1077,7 @@ def main():
         formatter_class=_HelpFormatter,
         description="Re-queue failed package(s) for another build attempt.  "
                     "If a package is not in the failed list it is force-queued for "
-                    "a fresh rebuild (its built.json entry is cleared first).  "
-                    "Requires the service to be stopped first.")
+                    "a fresh rebuild (its built.json entry is cleared first).")
     p_retry.add_argument("packages", nargs="*", metavar="PKG")
     p_retry.add_argument("--all", action="store_true",
         help="re-queue every failed package")
@@ -1116,8 +1087,7 @@ def main():
     p_clear = sub.add_parser("clear",
         usage="buildbot clear <PKG> [--all] [--dry-run]",
         formatter_class=_HelpFormatter,
-        description="Remove package(s) from the failed list without re-queuing them.  "
-                    "Requires the service to be stopped first.")
+        description="Remove package(s) from the failed list without re-queuing them.")
     p_clear.add_argument("packages", nargs="*", metavar="PKG")
     p_clear.add_argument("--all", action="store_true",
         help="clear the entire failed list")
@@ -1130,7 +1100,7 @@ def main():
         description="Diff the installed package list against built.json and queue any "
                     "new or updated packages.  When the daemon is running it is signalled "
                     "to build immediately; when stopped, the queue is written for the next "
-                    "start.  Use --reset only when the daemon is stopped.")
+                    "start.")
     p_sync.add_argument("--reset", action="store_true",
         help="clear the existing queue first, then rebuild from scratch")
     p_sync.add_argument("--dry-run", action="store_true",

@@ -92,6 +92,7 @@ def resolve_pkgbuild(
     _tried_pkgbase: bool = False,
     tier_sources: dict = None,
     version_select: str = "priority",
+    build_user: str = "buildbot",
 ) -> tuple[str, str]:
     """
     Resolve a PKGBUILD from configured tier priority.
@@ -124,7 +125,7 @@ def resolve_pkgbuild(
             return None
         log.info("[%s] pkgname not found, trying pkgbase: %s", pkgname, pkgbase)
         try:
-            return resolve_pkgbuild(pkgbase, pkgbuilds_dir, pkgbase_map, priority, True, tier_sources, version_select)
+            return resolve_pkgbuild(pkgbase, pkgbuilds_dir, pkgbase_map, priority, True, tier_sources, version_select, build_user)
         except FileNotFoundError:
             return None
 
@@ -139,7 +140,7 @@ def resolve_pkgbuild(
             try:
                 upstream_dir, _ = resolve_pkgbuild(
                     pkgname, pkgbuilds_dir, pkgbase_map, upstream_priority,
-                    _tried_pkgbase, tier_sources, version_select,
+                    _tried_pkgbase, tier_sources, version_select, build_user,
                 )
             except FileNotFoundError:
                 raise FileNotFoundError(

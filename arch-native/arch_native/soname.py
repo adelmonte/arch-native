@@ -4,11 +4,12 @@ import logging
 import os
 import re
 import subprocess
+import tarfile
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .state import _DEFERRED_STATUSES, _queue_item_for, get_built_state, load_pending, save_built_state, save_pending
+from .state import _DEFERRED_STATUSES, _queue_item_for, _queue_lock, get_built_state, load_pending, save_built_state, save_pending
 from .util import _load_json_file, _pkgname_from_filename, _save_json_file, _ver_from_pkg_path, vercmp
 
 log = logging.getLogger("buildbot")
@@ -260,37 +261,39 @@ def _queue_soname_repairs(config: dict, manifest_map: dict) -> int:
             len(blocked), ", ".join(libs), ", ".join(sorted(blocked)[:8]),
         )
 
-    pending = load_pending(config["pending_path"])
-    pending_names = {p.get("name") for p in pending}
     queued = 0
-    for name, kinds in sorted(broken.items()):
-        # Only rebuild when every dangling link is one a rebuild can fix.
-        if kinds["ahead"] or not kinds["stale"]:
-            continue
-        if name in pending_names:
-            continue
-        entry = index.get(name, {})
-        missing = kinds["stale"]
-        prior = entry.get("repair")
-        # Already rebuilt against this exact gap and still broken, with the
-        # file unchanged since: rebuilding again would only loop. Leave it.
-        if prior and prior.get("stamp") == entry.get("stamp") \
-                and prior.get("missing") == missing:
-            continue
-        item = _queue_item_for(name, manifest_map, entry.get("version", "unknown"))
-        item["build_reason"] = "soname"
-        item["queued_at"] = datetime.now(timezone.utc).isoformat()
-        pending.append(item)
-        pending_names.add(name)
-        entry["repair"] = {"version": entry.get("version"),
-                           "stamp": entry.get("stamp"), "missing": missing}
-        index[name] = entry
-        queued += 1
-        log.warning("[%s] links missing soname(s) %s — queued rebuild",
-                    name, ", ".join(missing[:3]) + ("..." if len(missing) > 3 else ""))
+    with _queue_lock(config):
+        pending = load_pending(config["pending_path"])
+        pending_names = {p.get("name") for p in pending}
+        for name, kinds in sorted(broken.items()):
+            # Only rebuild when every dangling link is one a rebuild can fix.
+            if kinds["ahead"] or not kinds["stale"]:
+                continue
+            if name in pending_names:
+                continue
+            entry = index.get(name, {})
+            missing = kinds["stale"]
+            prior = entry.get("repair")
+            # Already rebuilt against this exact gap and still broken, with the
+            # file unchanged since: rebuilding again would only loop. Leave it.
+            if prior and prior.get("stamp") == entry.get("stamp") \
+                    and prior.get("missing") == missing:
+                continue
+            item = _queue_item_for(name, manifest_map, entry.get("version", "unknown"))
+            item["build_reason"] = "soname"
+            item["queued_at"] = datetime.now(timezone.utc).isoformat()
+            pending.append(item)
+            pending_names.add(name)
+            entry["repair"] = {"version": entry.get("version"),
+                               "stamp": entry.get("stamp"), "missing": missing}
+            index[name] = entry
+            queued += 1
+            log.warning("[%s] links missing soname(s) %s — queued rebuild",
+                        name, ", ".join(missing[:3]) + ("..." if len(missing) > 3 else ""))
+        if queued:
+            save_pending(config["pending_path"], pending)
 
     if queued:
-        save_pending(config["pending_path"], pending)
         _save_json_file(_soname_index_path(config), index)
         log.info("Soname repair: queued %d package(s)", queued)
     return queued
@@ -318,147 +321,127 @@ def _soname_provides_from_pkg(pkg_file: str) -> set:
     return provides
 
 
-def _world_has_soname(soname: str, repo_name: str) -> bool:
-    """Return True if any non-forge pacman sync DB provides the exact soname."""
-    import tarfile as _tarfile
-    sync_dir = "/var/lib/pacman/sync"
-    if not os.path.isdir(sync_dir):
-        return True  # can't check — assume safe to publish
-    for fname in os.listdir(sync_dir):
-        if not fname.endswith(".db") or fname[:-3] == repo_name:
-            continue
-        db_path = os.path.join(sync_dir, fname)
-        try:
-            with _tarfile.open(db_path) as tf:
-                for m in tf.getmembers():
-                    if not m.name.endswith("/desc"):
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    content = f.read().decode("utf-8", errors="replace")
-                    in_provides = False
-                    for line in content.splitlines():
-                        stripped = line.strip()
-                        if stripped == "%PROVIDES%":
-                            in_provides = True
+class SyncIndex:
+    """Soname PROVIDES and DEPENDS of every distro sync DB, parsed once.
+
+    "World" here means every repo pacman syncs on this host except forge
+    itself. Only entries naming a .so are kept.
+    """
+
+    def __init__(self, repo_name: str, sync_dir: str = "/var/lib/pacman/sync"):
+        self.available = os.path.isdir(sync_dir)
+        self.provides: set = set()
+        self.provided_bases: set = set()
+        self.depends_by_base: dict = {}
+        if not self.available:
+            return
+        for fname in sorted(os.listdir(sync_dir)):
+            if not fname.endswith(".db") or fname[:-3] == repo_name:
+                continue
+            try:
+                with tarfile.open(os.path.join(sync_dir, fname)) as tf:
+                    for m in tf.getmembers():
+                        if not m.name.endswith("/desc"):
                             continue
-                        if in_provides:
-                            if not stripped or stripped.startswith("%"):
-                                in_provides = False
-                                continue
-                            if stripped == soname:
-                                return True
-        except Exception:
-            continue
-    return False
+                        f = tf.extractfile(m)
+                        if f is not None:
+                            self._add_desc(f.read().decode("utf-8", errors="replace"))
+            except Exception:
+                continue
 
+    def _add_desc(self, content: str):
+        section = None
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("%") and line.endswith("%"):
+                section = line
+                continue
+            if not line:
+                section = None
+                continue
+            if ".so" not in line:
+                continue
+            base = line.split("=", 1)[0]
+            if section == "%PROVIDES%":
+                self.provides.add(line)
+                self.provided_bases.add(base)
+            elif section == "%DEPENDS%":
+                self.depends_by_base.setdefault(base, set()).add(line)
 
-def _world_has_lib(lib_base: str, repo_name: str) -> bool:
-    """Return True if any non-forge pacman sync DB has any soname for lib_base (e.g. 'libfoo.so').
-    Used to distinguish a soname bump (world has old version) from a brand-new library."""
-    import tarfile as _tarfile
-    sync_dir = "/var/lib/pacman/sync"
-    if not os.path.isdir(sync_dir):
+    def has_soname(self, soname: str) -> bool:
+        """Any distro package provides exactly this soname. True when unknowable."""
+        return soname in self.provides if self.available else True
+
+    def has_lib(self, lib_base: str) -> bool:
+        """Any distro package provides some soname of lib_base ('libfoo.so').
+
+        Distinguishes a soname bump (the distro has the old one) from a
+        library the distro doesn't ship at all.
+        """
+        return self.available and lib_base in self.provided_bases
+
+    def depends_on_old_soname(self, lib_base: str, new_soname: str) -> bool:
+        """Some distro package still depends on an older soname of lib_base.
+
+        The second gate: even once a distro repo provides the new soname, the
+        cascade isn't done until every repo has rebuilt its reverse-deps (e.g.
+        CachyOS still had chrony linked against the old libnettle.so=8-64).
+        """
+        for dep in self.depends_by_base.get(lib_base, ()):
+            if dep == new_soname:
+                continue
+            # Bare soname dep (no version) — not a concrete ABI conflict
+            if "=" not in dep:
+                continue
+            # Different ELF class (32-bit vs 64-bit) — not a conflict
+            new_cls = new_soname.rsplit("-", 1)[-1] if "-" in new_soname.split("=", 1)[-1] else ""
+            dep_cls = dep.rsplit("-", 1)[-1] if "-" in dep.split("=", 1)[-1] else ""
+            if new_cls and dep_cls and new_cls != dep_cls:
+                continue
+            # Same ABI version, dep just omits ELF class suffix
+            # (e.g. libalpm.so=16 vs libalpm.so=16-64) — not a conflict
+            if new_soname.split("=", 1)[1].rsplit("-", 1)[0] == dep.split("=", 1)[1].rsplit("-", 1)[0]:
+                continue
+            # Old soname is covered by a compat package in world (e.g. nettle3
+            # provides libnettle.so=8-64 while nettle has moved to =9) — the
+            # reverse-dep is already satisfied, so publishing our build is safe
+            if self.has_soname(dep):
+                continue
+            return True
         return False
-    for fname in os.listdir(sync_dir):
-        if not fname.endswith(".db") or fname[:-3] == repo_name:
-            continue
-        db_path = os.path.join(sync_dir, fname)
-        try:
-            with _tarfile.open(db_path) as tf:
-                for m in tf.getmembers():
-                    if not m.name.endswith("/desc"):
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    content = f.read().decode("utf-8", errors="replace")
-                    in_provides = False
-                    for line in content.splitlines():
-                        stripped = line.strip()
-                        if stripped == "%PROVIDES%":
-                            in_provides = True
-                            continue
-                        if in_provides:
-                            if not stripped or stripped.startswith("%"):
-                                in_provides = False
-                                continue
-                            if stripped.split("=", 1)[0] == lib_base:
-                                return True
-        except Exception:
-            continue
-    return False
+
+    def soname_ready(self, soname: str) -> bool:
+        """A staged build carrying soname can be published without breaking the distro."""
+        return self.has_soname(soname) and not self.depends_on_old_soname(soname.split("=", 1)[0], soname)
 
 
-def _world_depends_on_old_soname(lib_base: str, new_soname: str, repo_name: str) -> bool:
-    """Return True if any world repo package still depends on an old soname for lib_base.
-    Used as a second gate: even if world *provides* the new soname (e.g. Arch's extra),
-    the cascade isn't done until every repo has finished rebuilding its reverse-deps
-    (e.g. CachyOS still has chrony linked against the old libnettle.so=8-64)."""
-    import tarfile as _tarfile
-    sync_dir = "/var/lib/pacman/sync"
-    if not os.path.isdir(sync_dir):
-        return False
-    for fname in os.listdir(sync_dir):
-        if not fname.endswith(".db") or fname[:-3] == repo_name:
-            continue
-        db_path = os.path.join(sync_dir, fname)
-        try:
-            with _tarfile.open(db_path) as tf:
-                for m in tf.getmembers():
-                    if not m.name.endswith("/desc"):
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    content = f.read().decode("utf-8", errors="replace")
-                    in_depends = False
-                    for line in content.splitlines():
-                        stripped = line.strip()
-                        if stripped == "%DEPENDS%":
-                            in_depends = True
-                            continue
-                        if in_depends:
-                            if not stripped or stripped.startswith("%"):
-                                in_depends = False
-                                continue
-                            if stripped.split("=", 1)[0] == lib_base and stripped != new_soname:
-                                # Bare soname dep (no version) — not a concrete ABI conflict
-                                if "=" not in stripped:
-                                    continue
-                                # Different ELF class (32-bit vs 64-bit) — not a conflict
-                                new_cls = new_soname.rsplit("-", 1)[-1] if "-" in new_soname.split("=", 1)[-1] else ""
-                                dep_cls = stripped.rsplit("-", 1)[-1] if "-" in stripped.split("=", 1)[-1] else ""
-                                if new_cls and dep_cls and new_cls != dep_cls:
-                                    continue
-                                # Same ABI version, dep just omits ELF class suffix
-                                # (e.g. libalpm.so=16 vs libalpm.so=16-64) — not a conflict
-                                new_ver = new_soname.split("=", 1)[1].rsplit("-", 1)[0]
-                                dep_ver = stripped.split("=", 1)[1].rsplit("-", 1)[0]
-                                if new_ver == dep_ver:
-                                    continue
-                                # Old soname is covered by a compat package in world
-                                # (e.g. nettle3 provides libnettle.so=8-64 while nettle
-                                # has moved to =9) — the reverse-dep is already satisfied,
-                                # so publishing our build is safe
-                                if _world_has_soname(stripped, repo_name):
-                                    continue
-                                return True
-        except Exception:
-            continue
-    return False
+_sync_index_cache: tuple = (None, None)
+
+
+def sync_index(repo_name: str, sync_dir: str = "/var/lib/pacman/sync") -> SyncIndex:
+    """SyncIndex for the current sync DBs, rebuilt only when one of them changes."""
+    global _sync_index_cache
+    try:
+        key = (repo_name, tuple(sorted(
+            (f, os.stat(os.path.join(sync_dir, f)).st_mtime)
+            for f in os.listdir(sync_dir) if f.endswith(".db"))))
+    except OSError:
+        key = None
+    if key is not None and _sync_index_cache[0] == key:
+        return _sync_index_cache[1]
+    index = SyncIndex(repo_name, sync_dir)
+    _sync_index_cache = (key, index)
+    return index
 
 
 def _resolve_pending_cascades(config: dict):
     """Publish staged packages whose sonames are now available in world repos."""
     built = get_built_state(config["state_path"])
-    repo_name = config["repo_name"]
-
     cascade_pkgs = {n: r for n, r in built.items()
                     if r.get("status") == "pending_world_cascade"}
     if not cascade_pkgs:
         return
+    world = sync_index(config["repo_name"])
 
     # Group sibling subpackages by their shared file set so we run repo-add once per build
     groups: dict = {}
@@ -466,19 +449,14 @@ def _resolve_pending_cascades(config: dict):
         key = frozenset(rec.get("pkg_files", []))
         groups.setdefault(key, []).append(name)
 
-    changed = False
+    published = []
     for files_key, names in groups.items():
-        rec = cascade_pkgs[names[0]]
-        cascade_sonames = set(rec.get("cascade_sonames", []))
-
-        not_ready = [s for s in cascade_sonames
-                     if not _world_has_soname(s, repo_name)
-                     or _world_depends_on_old_soname(s.split("=", 1)[0], s, repo_name)]
+        cascade_sonames = set(cascade_pkgs[names[0]].get("cascade_sonames", []))
+        not_ready = [s for s in cascade_sonames if not world.soname_ready(s)]
         if not_ready:
             log.debug("[%s] world cascade still in progress: %s", names[0], ", ".join(not_ready))
             continue
 
-        # World has all sonames — promote staged files to the live repo
         abs_files = [
             os.path.join(config["repo_dir"], f) for f in files_key
             if os.path.exists(os.path.join(config["repo_dir"], f))
@@ -495,12 +473,19 @@ def _resolve_pending_cascades(config: dict):
                 continue
             log.info("[%s] world cascade complete — published (%s)",
                      ", ".join(names), ", ".join(cascade_sonames))
+        published.append((files_key, names))
 
-        for name in names:
-            r = built[name]
-            built[name] = {k: v for k, v in r.items()
-                           if k not in ("status", "cascade_sonames")}
-        changed = True
-
-    if changed:
+    if not published:
+        return
+    with _queue_lock(config):
+        built = get_built_state(config["state_path"])
+        for files_key, names in published:
+            for name in names:
+                r = built.get(name)
+                # Skip an entry a rebuild replaced while we were publishing
+                if not r or r.get("status") != "pending_world_cascade" \
+                        or frozenset(r.get("pkg_files", [])) != files_key:
+                    continue
+                built[name] = {k: v for k, v in r.items()
+                               if k not in ("status", "cascade_sonames")}
         save_built_state(config["state_path"], built)

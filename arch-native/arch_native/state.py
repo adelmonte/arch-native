@@ -183,18 +183,19 @@ def prune_stale_queue_entries(config: dict, manifest_names: set) -> tuple[int, i
     Remove pending and failed entries for packages no longer in the manifest.
     Returns (pruned_pending, pruned_failed).
     """
-    pending = load_pending(config["pending_path"])
-    new_pending = [p for p in pending if p.get("name") in manifest_names]
-    pruned_pending = len(pending) - len(new_pending)
+    with _queue_lock(config):
+        pending = load_pending(config["pending_path"])
+        new_pending = [p for p in pending if p.get("name") in manifest_names]
+        pruned_pending = len(pending) - len(new_pending)
 
-    failed = load_failed(config["failed_path"])
-    new_failed = {k: v for k, v in failed.items() if k in manifest_names}
-    pruned_failed = len(failed) - len(new_failed)
+        failed = load_failed(config["failed_path"])
+        new_failed = {k: v for k, v in failed.items() if k in manifest_names}
+        pruned_failed = len(failed) - len(new_failed)
 
-    if pruned_pending:
-        save_pending(config["pending_path"], new_pending)
-    if pruned_failed:
-        save_failed(config["failed_path"], new_failed)
+        if pruned_pending:
+            save_pending(config["pending_path"], new_pending)
+        if pruned_failed:
+            save_failed(config["failed_path"], new_failed)
 
     return pruned_pending, pruned_failed
 
@@ -250,8 +251,27 @@ def clear_in_progress(config: dict):
         pass
 
 
+_lock_depth = 0
+
+
 @contextmanager
-def _queue_lock(config: dict, timeout: int = 10):
+def _queue_lock(config: dict, timeout: int = 60):
+    """Hold the lock over built.json, pending.json and failed.json.
+
+    Every read-modify-write of those files, by the daemon or the CLI, happens
+    inside this lock, so `buildbot retry` and friends are safe while the daemon
+    runs. Nests within a process: a function that takes it may call another
+    that does. Never hold it across a build or a network fetch.
+    """
+    global _lock_depth
+    if _lock_depth:
+        _lock_depth += 1
+        try:
+            yield
+        finally:
+            _lock_depth -= 1
+        return
+
     lock_path = os.path.join(os.path.dirname(config["state_path"]), "queue.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "w") as lockf:
@@ -264,10 +284,54 @@ def _queue_lock(config: dict, timeout: int = 10):
                 if time.time() - start > timeout:
                     raise RuntimeError("timed out waiting for queue lock")
                 time.sleep(0.1)
+        _lock_depth = 1
         try:
             yield
         finally:
+            _lock_depth = 0
             fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+
+def _daemon_lock_path(config: dict) -> str:
+    return os.path.join(os.path.dirname(config["state_path"]), "daemon.pid")
+
+
+def acquire_daemon_lock(config: dict):
+    """Claim the daemon slot for this process and record its PID.
+
+    Returns the open lock file, which must stay open for the daemon's lifetime,
+    or None if another daemon already holds it. The lock is what the CLI checks
+    to tell whether the daemon is running, on any init system.
+    """
+    path = _daemon_lock_path(config)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    f = open(path, "a+")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    return f
+
+
+def daemon_pid(config: dict) -> int:
+    """PID of the running daemon, or 0 if none holds the daemon lock."""
+    try:
+        f = open(_daemon_lock_path(config))
+    except OSError:
+        return 0
+    with f:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pid = f.read().strip()
+            return int(pid) if pid.isdigit() else 0
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return 0
 
 
 def _queue_item_for(name: str, manifest_map: dict, fallback_version: str = "unknown") -> dict:
@@ -337,21 +401,24 @@ def _retry_due(rec: dict, config: dict) -> bool:
     return (datetime.now(timezone.utc) - last) >= timedelta(hours=schedule[idx])
 
 
-def _record_failure(failed: dict, name: str, version: str, reason: str,
-                    error_type: str, failed_path: str,
-                    failed_tier: str = None, log_path: str = None) -> None:
-    _now = datetime.now(timezone.utc).isoformat()
-    rec = {
-        "version": version,
-        "reason": reason,
-        "timestamp": _now,
-        "first_failed_at": failed.get(name, {}).get("first_failed_at", _now),
-        "retries": failed.get(name, {}).get("retries", 0) + 1,
-        "error_type": error_type,
-    }
-    if failed_tier is not None:
-        rec["failed_tier"] = failed_tier
-    if log_path is not None:
-        rec["log_path"] = log_path
-    failed[name] = rec
-    save_failed(failed_path, failed)
+def _record_failure(config: dict, name: str, version: str, reason: str,
+                    error_type: str, failed_tier: str = None,
+                    log_path: str = None) -> None:
+    with _queue_lock(config):
+        failed = load_failed(config["failed_path"])
+        prior = failed.get(name, {})
+        _now = datetime.now(timezone.utc).isoformat()
+        rec = {
+            "version": version,
+            "reason": reason,
+            "timestamp": _now,
+            "first_failed_at": prior.get("first_failed_at", _now),
+            "retries": prior.get("retries", 0) + 1,
+            "error_type": error_type,
+        }
+        if failed_tier is not None:
+            rec["failed_tier"] = failed_tier
+        if log_path is not None:
+            rec["log_path"] = log_path
+        failed[name] = rec
+        save_failed(config["failed_path"], failed)
