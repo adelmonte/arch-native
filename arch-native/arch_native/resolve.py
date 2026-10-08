@@ -89,7 +89,7 @@ _PKGCTL_URL = "https://gitlab.archlinux.org/archlinux/packaging/packages/{pkgnam
 
 # Serializes clones and pulls between the build loop and the upstream-check
 # thread, which otherwise race on the same per-package checkouts.
-git_lock = threading.Lock()
+git_lock = threading.RLock()
 
 _monorepo_cache: dict = {}
 
@@ -241,7 +241,8 @@ def resolve_pkgbuild(
                     f"[{pkgname}] local patch exists but no upstream PKGBUILD "
                     f"found in tiers: {upstream}"
                 )
-            return _apply_local_patch(pkgname, patch_file, upstream_dir, local, build_user), "local"
+            with git_lock:
+                return _apply_local_patch(pkgname, patch_file, upstream_dir, local, build_user), "local"
         if os.path.isfile(os.path.join(local, "PKGBUILD")):
             log.warning(
                 "[%s] local/ contains a full PKGBUILD copy — consider converting to a "

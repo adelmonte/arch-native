@@ -127,3 +127,24 @@ def test_cli_writes_during_a_build_survive(config, fake_build):
     # retried, built, failed again: one fresh record, not the stale retries=3
     assert failed["broken"]["retries"] == 1
     assert "slow" in _built(config)
+
+
+def test_refresh_queue_and_upstream_updates(config):
+    import json as _json
+    from arch_native.state import save_built_state
+    manifest = [_pkg("new"), _pkg("known"), _pkg("legacy", "1-1")]
+    for p in manifest:
+        p.pop("build_reason")
+    save_built_state(config["state_path"], {
+        "known": {"version": "1.0-1", "pkg_files": []},
+        "legacy": {"version": "1-1", "status": "ineligible"},
+    })
+
+    daemon._refresh_queue(config, manifest, {})
+
+    assert [p["name"] for p in load_pending(config["pending_path"])] == ["new", "legacy"]
+    assert "legacy" not in _json.load(open(config["state_path"]))
+
+    daemon._queue_upstream_updates(config, [{**manifest[1], "build_reason": "update"}],
+                                   {"known": {"version": "1.0-1"}})
+    assert [p["name"] for p in load_pending(config["pending_path"])] == ["new", "legacy", "known"]
