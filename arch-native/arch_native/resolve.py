@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import threading
 
-from .pacman import released_versions
+from .pacman import released_in_chroot
 from .state import strip_local_pkgrel_bump
 from .util import _fix_ownership, _git, _in_blacklist, ignore_special_files, vercmp
 
@@ -378,8 +378,7 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
     # What the distro has actually released, as the build chroot sees it.
     # Packaging git trees run ahead of the repos (staging, testing), and a
     # build from there can pin deps the client's repos cannot satisfy yet.
-    released = released_versions(
-        os.path.join(config["chroot_root"], "var/lib/pacman/sync"), config["repo_name"])
+    released = released_in_chroot(config)
 
     for pkg in manifest:
         if should_stop and should_stop():
@@ -423,6 +422,15 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
         if not upstream_ver or "$" in upstream_ver or "{" in upstream_ver:
             continue
         normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
+
+        # Deferred because the PKGBUILD ran ahead of the repos: rebuild once
+        # the distro releases that version.
+        if built[name].get("status") == "pending_release":
+            rel = released.get(name)
+            if not rel or vercmp(normalized_upstream, strip_local_pkgrel_bump(rel)) <= 0:
+                log.info("[%s] %s released — queuing rebuild", name, normalized_upstream)
+                updates.append({**pkg, "build_reason": "update"})
+            continue
 
         # Deferred because the PKGBUILD was older than installed: rebuild once
         # it reaches the installed version, not only once it passes it.

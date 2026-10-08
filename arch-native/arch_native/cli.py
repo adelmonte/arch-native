@@ -711,6 +711,17 @@ def cmd_why(args, config: dict) -> int:
         print()
         return 0
 
+    if status == "pending_release":
+        print(f"  Status    waiting for the distro to release {built_rec.get('pkgbuild', 'a newer version')}")
+        if installed_ver:
+            print(f"  Installed {installed_ver}")
+        print()
+        print("  The PKGBUILD is ahead of what the distro repos have released. Forge")
+        print("  builds it once the release lands, so your system never runs ahead of")
+        print("  the packages that depend on it.")
+        print()
+        return 0
+
     if status == "pending_upstream":
         print(f"  Status    waiting for upstream PKGBUILD to catch up")
         print(f"  Forge had {forge_ver}")

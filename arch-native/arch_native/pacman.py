@@ -205,3 +205,22 @@ def released_versions(sync_dir: str, exclude: str = "") -> dict[str, str]:
         except Exception as e:
             log.debug("Error reading sync DB %s: %s", fname, e)
     return versions
+
+
+_released_cache: dict = {}
+
+
+def released_in_chroot(config: dict) -> dict[str, str]:
+    """released_versions of the build chroot's repos, reparsed only when they change."""
+    sync_dir = os.path.join(config["chroot_root"], "var/lib/pacman/sync")
+    try:
+        key = tuple(sorted((f, os.stat(os.path.join(sync_dir, f)).st_mtime)
+                           for f in os.listdir(sync_dir) if f.endswith(".db")))
+    except OSError:
+        return {}
+    cached = _released_cache.get(sync_dir)
+    if cached and cached[0] == key:
+        return cached[1]
+    versions = released_versions(sync_dir, config["repo_name"])
+    _released_cache[sync_dir] = (key, versions)
+    return versions

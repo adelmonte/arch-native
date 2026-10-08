@@ -148,3 +148,17 @@ def test_refresh_queue_and_upstream_updates(config):
     daemon._queue_upstream_updates(config, [{**manifest[1], "build_reason": "update"}],
                                    {"known": {"version": "1.0-1"}})
     assert [p["name"] for p in load_pending(config["pending_path"])] == ["new", "legacy", "known"]
+
+
+def test_waits_for_distro_release(config, fake_build):
+    import os
+    from test_resolve import _desc_db
+    sync = os.path.join(config["chroot_root"], "var/lib/pacman/sync")
+    _desc_db(os.path.join(sync, "extra.db"), [("ahead", "0.9-1"), ("released", "1.0-1.1")])
+    save_pending(config["pending_path"], [_pkg("ahead", "0.9-1"), _pkg("released")])
+
+    daemon._process_queue(config, {})
+
+    built = _built(config)
+    assert built["ahead"]["status"] == "pending_release" and built["ahead"]["pkgbuild"] == "1.0-1"
+    assert "status" not in built["released"]

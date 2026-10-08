@@ -106,3 +106,22 @@ def test_upstream_waits_for_release(tiers):
     built = {"foo": {"version": "1.0-1"}, "bar": {"version": "1.0-1"}}
     # arch git has foo 2.0 but the repos only released 1.5; bar 3.0 is out
     assert [u["name"] for u in check_upstream_updates(manifest, built, config, skip_pulls=True)] == ["bar"]
+
+
+def test_pending_release_queued_once_released(tiers):
+    sync = os.path.join(tiers, "chroot2", "var/lib/pacman/sync")
+    config = {
+        "pkgbuilds_dir": tiers, "repo_priority": ["local", "arch"],
+        "tier_sources": SOURCES, "tier_version_select": "priority", "build_user": "buildbot",
+        "package_tier_overrides": {}, "blacklist": [],
+        "chroot_root": os.path.join(tiers, "chroot2"), "repo_name": "forge",
+    }
+    manifest = [{"name": "bar", "version": "2.0-1", "repo": "extra"}]
+    built = {"bar": {"version": "2.0-1", "status": "pending_release"}}
+    _desc_db(os.path.join(sync, "extra.db"), [("bar", "2.0-1")])
+    assert check_upstream_updates(manifest, built, config, skip_pulls=True) == []
+    import time
+    time.sleep(0.01)
+    _desc_db(os.path.join(sync, "extra.db"), [("bar", "3.0-1")])
+    os.utime(os.path.join(sync, "extra.db"), (time.time() + 5, time.time() + 5))
+    assert [u["name"] for u in check_upstream_updates(manifest, built, config, skip_pulls=True)] == ["bar"]

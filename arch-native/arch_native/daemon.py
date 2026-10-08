@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from .build import build_package, generate_makepkg_conf, import_pgp_keys, prepare_gnupg_home, sign_packages, upgrade_chroot
 from .config import load_config
-from .pacman import build_pkgbase_map, load_manifest, read_local_packages
+from .pacman import build_pkgbase_map, load_manifest, read_local_packages, released_in_chroot
 from .patches import write_patch_status
 from .repo import _prune_cycle, _run_fsck, add_to_repo, stage_packages
 from .resolve import check_upstream_updates, is_eligible, parse_srcinfo, resolve_pkgbuild
@@ -618,6 +618,17 @@ def _build_one(pkg: dict, config: dict, pkgbase_map: dict, stats: dict):
         log.debug("[%s] PKGBUILD %s is older than installed %s — deferring until upstream catches up",
                   name, _fmt_srcinfo_ver(srcinfo), pkg["version"])
         _set_status(config, name, pkg["version"], "pending_upstream")
+        return
+
+    # Packaging trees run ahead of the repos (staging, testing). A build from
+    # there can pin deps the client's repos cannot satisfy yet, which fails
+    # the client's whole native-sync transaction, so wait for the release.
+    released = released_in_chroot(config).get(name)
+    pkgbuild_ver = strip_local_pkgrel_bump(_fmt_srcinfo_ver(srcinfo))
+    if released and vercmp(pkgbuild_ver, strip_local_pkgrel_bump(released)) > 0:
+        log.info("[%s] PKGBUILD %s is ahead of the released %s — waiting for the release",
+                 name, pkgbuild_ver, released)
+        _set_status(config, name, pkg["version"], "pending_release", pkgbuild=pkgbuild_ver)
         return
 
     pgp_skipped = False

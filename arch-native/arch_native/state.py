@@ -27,6 +27,7 @@ def save_built_state(state_path: str, state: dict):
 _DEFERRED_STATUSES = frozenset({
     "ineligible",           # arch=any or otherwise not rebuildable
     "pending_upstream",     # PKGBUILD is older than installed; waiting for upstream
+    "pending_release",      # PKGBUILD is newer than the distro has released
     "pending_world_cascade",# built and staged; waiting for soname to land in world repos
 })
 
