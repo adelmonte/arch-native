@@ -296,7 +296,14 @@ def cmd_status(args, config: dict) -> int:
         if blacklisted_count:
             row("blacklisted", f"{blacklisted_count} / {installed_total}  ({blacklisted_count / installed_total * 100:.0f}%)  {DIM}(see /etc/arch-native.conf){R}")
         if ineligible_count:
-            row("ineligible", f"{ineligible_count} / {installed_total}  ({ineligible_count / installed_total * 100:.0f}%)  {DIM}(arch=any — not rebuilt){R}")
+            reasons = {}
+            for p in manifest:
+                e = built.get(p["name"])
+                if e and e.get("status") == "ineligible":
+                    r = e.get("reason") or "unknown"
+                    reasons[r] = reasons.get(r, 0) + 1
+            why = " · ".join(f"{n} {r}" for r, n in sorted(reasons.items(), key=lambda kv: -kv[1]))
+            row("ineligible", f"{ineligible_count} / {installed_total}  ({ineligible_count / installed_total * 100:.0f}%)  {DIM}({why}){R}")
         always_build_count = sum(1 for n in config.get("always_build", []) if n in built)
         if always_build_count:
             row("always-build", f"{always_build_count}  {DIM}(built + kept, not installed){R}")
@@ -745,11 +752,20 @@ def cmd_why(args, config: dict) -> int:
         return 0
 
     if status == "ineligible":
-        print(f"  Status    not rebuilt (arch=any or explicitly excluded)")
+        reason = built_rec.get("reason")
+        print(f"  Status    not rebuilt — {reason or 'ineligible'}")
         print(f"  Version   {forge_ver or '—'}")
         print()
-        print("  This package is architecture-independent (arch=any) and doesn't benefit")
-        print("  from native CPU optimisation, so forge skips it.")
+        if reason == "arch=any":
+            print("  This package is architecture-independent (arch=any) and doesn't benefit")
+            print("  from native CPU optimisation, so forge skips it.")
+        elif reason == "haskell":
+            print("  Haskell packages are locked to the exact GHC they were built with, so")
+            print("  forge leaves them to the distro.")
+        elif reason:
+            print("  Its pkgbase is blacklisted in /etc/arch-native.conf.")
+        else:
+            print("  Recorded before reasons were kept; it is re-checked on the next cycle.")
         print()
         return 0
 

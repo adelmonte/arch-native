@@ -17,7 +17,7 @@ from .patches import write_patch_status
 from .repo import _prune_cycle, _run_fsck, add_to_repo, stage_packages
 from .resolve import check_upstream_updates, is_eligible, parse_srcinfo, resolve_pkgbuild
 from .soname import _queue_soname_repairs, _resolve_pending_cascades, _soname_provides_from_pkg, sync_index
-from .state import _is_stalled, _queue_lock, _record_failure, _retry_due, acquire_daemon_lock, clear_in_progress, daemon_pid, diff_manifest, get_built_state, inject_always_build, load_failed, load_in_progress, load_pending, prune_stale_queue_entries, save_built_state, save_failed, save_pending, strip_local_pkgrel_bump, update_built_state, write_in_progress, write_metrics
+from .state import _is_stalled, eligibility_fingerprint, release_stale_ineligible, _queue_lock, _record_failure, _retry_due, acquire_daemon_lock, clear_in_progress, daemon_pid, diff_manifest, get_built_state, inject_always_build, load_failed, load_in_progress, load_pending, prune_stale_queue_entries, save_built_state, save_failed, save_pending, strip_local_pkgrel_bump, update_built_state, write_in_progress, write_metrics
 from .util import _fmt_srcinfo_ver, _git, _sanitize_reason, vercmp
 
 log = logging.getLogger("buildbot")
@@ -306,6 +306,11 @@ def _refresh_queue(config: dict, manifest: list, pkgbase_map: dict):
 
     with _queue_lock(config):
         built = get_built_state(config["state_path"])
+        released = release_stale_ineligible(built, eligibility_fingerprint(config))
+        if released:
+            save_built_state(config["state_path"], built)
+            log.info("Re-checking %d package(s) ruled ineligible under different rules: %s",
+                     len(released), ", ".join(sorted(released)[:10]) + ("..." if len(released) > 10 else ""))
         built = _prune_cycle(config, effective, names, built)
         _queue_from_manifest(config, effective, built, pkgbase_map)
 
@@ -603,7 +608,8 @@ def _build_one(pkg: dict, config: dict, pkgbase_map: dict, stats: dict):
     if not eligible:
         stats["skipped_ineligible"] += 1
         log.info("[%s] not eligible: %s", name, reason)
-        _set_status(config, name, pkg["version"], "ineligible", reason=reason)
+        _set_status(config, name, pkg["version"], "ineligible", reason=reason,
+                    rules=eligibility_fingerprint(config))
         return
 
     # The installed version's dotted pkgrel (a vendor's local rebuild) never

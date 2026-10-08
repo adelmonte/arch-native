@@ -68,3 +68,19 @@ def test_queue_item_for():
     assert _queue_item_for("zz", m, "3-1") == {
         "name": "zz", "version": "3-1", "repo": "unknown", "reason": "unknown",
         "build_reason": "retry"}
+
+
+def test_release_stale_ineligible():
+    from arch_native.state import eligibility_fingerprint, release_stale_ineligible
+    fp = eligibility_fingerprint({"blacklist": ["gcc"]})
+    assert fp == eligibility_fingerprint({"blacklist": ["gcc"]})
+    assert fp != eligibility_fingerprint({"blacklist": ["gcc", "llvm"]})
+    built = {
+        "legacy": {"status": "ineligible"},
+        "any": {"status": "ineligible", "reason": "arch=any"},
+        "same": {"status": "ineligible", "reason": "haskell", "rules": fp},
+        "moved": {"status": "ineligible", "reason": "pkgbase 'gcc' is blacklisted", "rules": "old"},
+        "ok": {"version": "1-1"},
+    }
+    assert sorted(release_stale_ineligible(built, fp)) == ["legacy", "moved"]
+    assert set(built) == {"any", "same", "ok"}

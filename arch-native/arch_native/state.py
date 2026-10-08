@@ -31,6 +31,37 @@ _DEFERRED_STATUSES = frozenset({
 })
 
 
+# Bump when is_eligible's built-in rules change, so packages ruled out under
+# the old rules get looked at again.
+_ELIGIBILITY_RULES_VERSION = 1
+
+
+def eligibility_fingerprint(config: dict) -> str:
+    """Identifies the rules an 'ineligible' verdict was reached under."""
+    import hashlib
+    rules = f"{_ELIGIBILITY_RULES_VERSION}:" + ",".join(sorted(config.get("blacklist", [])))
+    return hashlib.sha256(rules.encode()).hexdigest()[:16]
+
+
+def release_stale_ineligible(built: dict, fingerprint: str) -> list[str]:
+    """Drop 'ineligible' verdicts reached under different rules. Returns the names.
+
+    A verdict used to stand until the package's version changed, so ~80
+    compiled packages ruled out by an old rule sat unbuilt for six weeks.
+    arch=any is a fact about the PKGBUILD rather than a rule, so it stands;
+    every other verdict is re-checked once the blacklist or the rules move.
+    Dropped packages read as never built and are queued again.
+    """
+    released = [
+        name for name, e in built.items()
+        if isinstance(e, dict) and e.get("status") == "ineligible"
+        and e.get("reason") != "arch=any" and e.get("rules") != fingerprint
+    ]
+    for name in released:
+        del built[name]
+    return released
+
+
 def strip_local_pkgrel_bump(version: str) -> str:
     """Normalize a dot-bumped pkgrel back to upstream version form.
 
