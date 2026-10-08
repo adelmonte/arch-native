@@ -13,3 +13,9 @@ REMOTE_PATH="/var/lib/arch-native/manifests/client.json"
 
 # SSH private key to use for the rsync connection (leave empty to use ssh-agent / default key)
 # SSH_KEY="/home/user/.ssh/id_ed25519"
+
+# Packages forge doesn't build (blacklisted, or unbuildable on your server),
+# taken from the CachyOS x86-64-v3 repos instead of your first repo's generic
+# build. A v3 build that depends on systemd is never taken, and packages forge
+# does build always come from forge.
+# PREFER_V3=(firefox deno)

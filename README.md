@@ -256,6 +256,20 @@ Packages in `IgnorePkg` or `IgnoreGroup` are never touched.
 If you renamed the repo, set `REPO_NAME="myrepo"` in
 `/etc/arch-native-client.conf`.
 
+**Packages forge doesn't build.** Some packages can't usefully be built on your
+server: firefox, for example, runs the browser during its build, which a build
+host with an older CPU can't do at your `march`. If CachyOS's x86-64-v3 repos
+are configured, `native-sync` can take those packages from there instead of
+your first repo's generic build. List them in `/etc/arch-native-client.conf`:
+
+```bash
+PREFER_V3=(firefox deno)
+```
+
+A v3 build that depends on systemd is never taken, and a package forge does
+build always comes from forge. `sudo native-sync --dry-run` shows what would be
+installed without installing it.
+
 ### Checking on the server
 
 `buildbot` is both the daemon (run with no subcommand) and the CLI. Full

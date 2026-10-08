@@ -3,10 +3,18 @@
 #
 # The repository name comes from REPO_NAME in /etc/arch-native-client.conf
 # (default: forge); the FORGE_REPO environment variable overrides it.
+# Packages listed in PREFER_V3 there that forge doesn't build are taken from
+# the CachyOS x86-64-v3 repos instead.
+#
+# Usage: native-sync [-n|--dry-run]
 
 set -euo pipefail
 
+DRY_RUN=0
+[[ "${1:-}" == "-n" || "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+
 REPO_NAME=forge
+PREFER_V3=()
 # shellcheck source=/dev/null
 [[ -f /etc/arch-native-client.conf ]] && source /etc/arch-native-client.conf
 FORGE_REPO="${FORGE_REPO:-$REPO_NAME}"
@@ -82,11 +90,6 @@ printf '\033[1mnative-sync:\033[0m %d / %d  (%d%%)\n' \
 
 print_patch_health
 
-if [[ "$installed_count" -eq 0 ]]; then
-    printf '\033[1mnative-sync:\033[0m nothing to upgrade\n'
-    exit 0
-fi
-
 # Build packager map from the local pacman DB (faster and more reliable than pacman -Qi).
 declare -A packager_map
 while IFS=$'\t' read -r pkg packager; do
@@ -122,12 +125,47 @@ for pkg in "${!forge_installed[@]}"; do
     fi
 done
 
-if [[ ${#upgrades[@]} -eq 0 ]]; then
+# CachyOS v3 builds for PREFER_V3 packages forge doesn't build. Artix's repos
+# come first in pacman.conf, so pacman alone never picks these. A v3 build
+# that depends on systemd is never taken.
+v3_picks=()
+if (( ${#PREFER_V3[@]} )); then
+    v3_repos=()
+    while read -r repo; do
+        [[ "$repo" == *-v3 ]] && v3_repos+=("$repo")
+    done < <(pacman-conf --repo-list 2>/dev/null)
+    for pkg in "${PREFER_V3[@]}"; do
+        [[ -n "${forge_versions[$pkg]:-}" || -n "${ignored[$pkg]:-}" ]] && continue
+        inst_ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}') || true
+        [[ -n "$inst_ver" ]] || continue
+        for repo in "${v3_repos[@]}"; do
+            info=$(pacman -Si "$repo/$pkg" 2>/dev/null) || continue
+            v3_ver=$(awk -F' : ' '/^Version/ {print $2; exit}' <<<"$info")
+            deps=$(awk -F' : ' '/^Depends On/ {print $2; exit}' <<<"$info")
+            if grep -qwE 'systemd|systemd-libs|libsystemd' <<<"$deps"; then
+                printf '\033[1mnative-sync:\033[0m %s: %s build needs systemd, skipped\n' "$pkg" "$repo"
+            elif (( $(vercmp "$v3_ver" "$inst_ver") > 0 )); then
+                v3_picks+=("$repo/$pkg")
+            fi
+            break
+        done
+    done
+fi
+
+if [[ ${#upgrades[@]} -eq 0 && ${#v3_picks[@]} -eq 0 ]]; then
     printf '\033[1mnative-sync:\033[0m nothing to upgrade\n'
     exit 0
 fi
 
-printf '\033[1mnative-sync:\033[0m upgrading %d package(s) from forge\n' "${#upgrades[@]}"
+(( ${#upgrades[@]} )) && printf '\033[1mnative-sync:\033[0m upgrading %d package(s) from forge\n' "${#upgrades[@]}"
+(( ${#v3_picks[@]} )) && printf '\033[1mnative-sync:\033[0m upgrading %d package(s) from CachyOS v3: %s\n' \
+    "${#v3_picks[@]}" "${v3_picks[*]#*/}"
+upgrades+=("${v3_picks[@]}")
+
+if (( DRY_RUN )); then
+    printf '  %s\n' "${upgrades[@]}"
+    exit 0
+fi
 
 # Clear cached packages before installing — a cached upstream build at the same
 # version has a different checksum than the forge build, causing pacman to abort.
