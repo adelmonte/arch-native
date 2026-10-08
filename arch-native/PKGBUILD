@@ -18,7 +18,9 @@ package() {
     install -Dm755 "$startdir/buildbot"         "$pkgdir/usr/bin/buildbot"
 
     # Library
-    install -Dm644 "$startdir/buildbot_lib.py"  "$pkgdir/usr/lib/arch-native/buildbot_lib.py"
+    for f in "$startdir"/arch_native/*.py; do
+        install -Dm644 "$f" "$pkgdir/usr/lib/arch-native/arch_native/$(basename "$f")"
+    done
 
     # Systemd service
     install -Dm644 "$startdir/arch-native.service" \

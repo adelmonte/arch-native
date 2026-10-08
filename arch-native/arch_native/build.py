@@ -1,0 +1,676 @@
+"""makepkg.conf generation, chroot builds, PGP keys, signing."""
+
+import logging
+import os
+import re
+import shutil
+import signal
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+from .util import _in_blacklist
+
+log = logging.getLogger("buildbot")
+
+
+RE_LD_ERROR = re.compile(r"(?mi).*collect2: error: ld returned \d+ exit status.*")
+
+
+RE_RUST_LTO_ERROR = re.compile(
+    r"(?m)^error: options `-C (.+)` and `-C lto` are incompatible$"
+)
+
+
+# Patterns that indicate a transient download/network failure rather than a
+# compile error.  Builds matching these should be re-queued, not added to
+# failed.json.
+RE_DOWNLOAD_FAILURE = re.compile(
+    r"(?mi)"
+    r"Could not download sources"
+    r"|Failure while downloading"
+    r"|failed to download"
+    r"|curl: \(\d+\)"
+    r"|Unable to connect to"
+    r"|Failed to connect"
+    r"|Connection reset by peer"
+    r"|429 Too Many Requests"
+    r"|SSL certificate problem"
+    r"|error: Could not resolve host"
+    r"|Network is unreachable"
+)
+
+
+# PGP source signature could not be *checked* — the key is missing, invalid, or
+# untrusted in the build keyring. Safe to fall back from: the source still has to
+# match the PKGBUILD checksums. makepkg also prints "Could not download sources"
+# for this, so it must be detected before RE_DOWNLOAD_FAILURE.
+RE_PGP_UNVERIFIABLE = re.compile(
+    r"(?mi)FAILED \((?:unknown public key|invalid public key)"
+    r"|the public key .* is not trusted"
+)
+
+
+# Verification actively FAILED — a bad signature (tampering/corruption) or a
+# revoked key (compromised/retired). Never fall back to --skippgpcheck on these.
+RE_PGP_BADSIG = re.compile(r"(?mi)bad signature from public key|has been revoked")
+
+
+# Missing makedep — pacman can't find a required build dependency in any repo.
+# This is tier-specific, not transient: retrying on the same tier will always fail.
+RE_DEP_NOT_FOUND = re.compile(r"error: target not found: (\S+)")
+
+
+# Missing source file — the PKGBUILD lists a local file that isn't in the directory.
+RE_SOURCE_NOT_FOUND = re.compile(r"was not found in the build directory and is not a URL")
+
+
+# Defaults for the optimization knobs, used when the config leaves them blank.
+DEFAULT_CFLAGS_BASE = (
+    "-pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 "
+    "-fstack-clash-protection -fcf-protection -fno-semantic-interposition"
+)
+
+
+DEFAULT_LDFLAGS = (
+    "-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now "
+    "-Wl,-z,pack-relative-relocs"
+)
+
+
+DEFAULT_LTOFLAGS = "-flto=auto -falign-functions=32"
+
+
+def _rust_opt_level(opt: str) -> str:
+    """Map a GCC -O level to a valid Rust -C opt-level (rustc accepts 0-3, s, z)."""
+    return {"fast": "3", "g": "1"}.get(opt, opt)
+
+
+def _write_nolto_conf(src_conf: str) -> str:
+    """Write a copy of src_conf with LTO disabled (LTOFLAGS="" and OPTIONS !lto).
+    Returns the path to the new <src_conf>.nolto file."""
+    dst = src_conf + ".nolto"
+    with open(src_conf, "r") as f:
+        text = f.read()
+    text = re.sub(r'^LTOFLAGS=".*"$', 'LTOFLAGS=""', text, flags=re.MULTILINE)
+    text = re.sub(r"\blto\b", "!lto", text)
+    with open(dst, "w") as f:
+        f.write(text)
+    return dst
+
+
+def generate_makepkg_conf(config: dict, output_path: str):
+    """
+    Write a makepkg.conf to output_path based on config values.
+    Handles local vs remote mode differences:
+      - local: march=native, target-cpu=native in RUSTFLAGS, check enabled
+      - remote: explicit march, no target-cpu in RUSTFLAGS, !check
+    """
+    march = config.get("march", "native")
+    mode  = config.get("mode", "remote")
+    local = (mode == "local")
+
+    # Optimization knobs — each falls back to the long-standing default when the
+    # config leaves it unset (empty string), so behavior is unchanged out of the box.
+    opt_level   = str(config.get("opt_level") or "3").strip()
+    cflags_base = (config.get("cflags_base") or DEFAULT_CFLAGS_BASE).strip()
+    ldflags     = (config.get("ldflags") or DEFAULT_LDFLAGS).strip()
+    ltoflags    = (config.get("ltoflags") or DEFAULT_LTOFLAGS).strip()
+    lto_enabled = config.get("lto", True)
+
+    extra = config.get("extra_cflags", "").strip()
+    cflags = (
+        f"-march={march} -O{opt_level} {cflags_base}"
+        + (f" {extra}" if extra else "")
+    )
+
+    rust_opt = _rust_opt_level(opt_level)
+    if local:
+        rustflags = f"-C opt-level={rust_opt} -C target-cpu=native"
+        check_flag = "check"
+        mode_comment = "local mode — building and running on the same machine"
+    else:
+        rustflags = f"-C opt-level={rust_opt}"
+        check_flag = "!check"
+        mode_comment = (
+            "remote mode — !check: test suites may SIGILL if march != build host CPU"
+        )
+
+    # LTO is a master toggle: when disabled, clear LTOFLAGS and flip OPTIONS to !lto.
+    lto_option    = "lto" if lto_enabled else "!lto"
+    ltoflags_line = ltoflags if lto_enabled else ""
+
+    content = f"""\
+#!/hint/bash
+# makepkg configuration generated by buildbot ({mode_comment})
+
+CARCH="x86_64"
+CHOST="x86_64-pc-linux-gnu"
+
+CFLAGS="{cflags}"
+CXXFLAGS="$CFLAGS -Wp,-D_GLIBCXX_ASSERTIONS"
+LDFLAGS="{ldflags}"
+LTOFLAGS="{ltoflags_line}"
+RUSTFLAGS="{rustflags}"
+MAKEFLAGS="-j$(nproc)"
+# On-disk, not /tmp: nspawn mounts /tmp as a small tmpfs, and stripping the
+# huge unstripped libxul.so (firefox/thunderbird) overflows it — objcopy then
+# truncates the .so to 0 bytes. /var/tmp lives on the chroot's real filesystem.
+BUILDDIR=/var/tmp/makepkg
+SRCDEST=/var/tmp/makepkg-src
+PACKAGER="Buildbot <buildbot@{config.get('repo_name', 'arch-native')}>"
+
+BUILDENV=(!distcc color !ccache {check_flag} !sign)
+OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge debug {lto_option})
+
+DLAGENTS=("file::/usr/bin/curl -qgC - -o %o %u"
+          "ftp::/usr/bin/curl -qfC - --ftp-pasv --retry 3 --retry-delay 3 -o %o %u"
+          "http::/usr/bin/curl -qb "" -fLC - --retry 3 --retry-delay 3 -o %o %u"
+          "https::/usr/bin/curl -qb "" -fLC - --retry 3 --retry-delay 3 -o %o %u"
+          "rsync::/usr/bin/rsync --no-motd -z %u %o"
+          "scp::/usr/bin/scp -C %u %o")
+VCSCLIENTS=("bzr::breezy"
+            "fossil::fossil"
+            "git::git"
+            "hg::mercurial"
+            "svn::subversion")
+
+INTEGRITY_CHECK=(sha256)
+
+COMPRESSGZ=(gzip -c -f -n)
+COMPRESSBZ2=(bzip2 -c -f)
+COMPRESSXZ=(xz -c -z -)
+COMPRESSZST=(zstd -c -T0 -9 -)
+COMPRESSLRZ=(lrzip -q)
+COMPRESSLZO=(lzop -q)
+COMPRESSLZ4=(lz4 -q)
+COMPRESSLZ=(lzip -c -f)
+PKGEXT=".pkg.tar.zst"
+SRCEXT=".src.tar.gz"
+
+STRIP_BINARIES="--strip-all"
+STRIP_SHARED="--strip-unneeded"
+STRIP_STATIC="--strip-debug"
+
+MAN_DIRS=({{usr{{,/local}}{{,/share}},opt/*}}/{{man,info}})
+DOC_DIRS=(usr/{{,local/}}{{,share/}}{{doc,gtk-doc}} opt/*/{{doc,gtk-doc}})
+PURGE_TARGETS=(usr/{{,share}}/info/dir .packlist *.pod)
+DBGSRCDIR="/usr/src/debug"
+"""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write(content)
+    log.info("Generated makepkg.conf at %s (march=%s, mode=%s)", output_path, march, mode)
+
+
+def prepare_gnupg_home(gnupg_home: str, build_user: str = "buildbot"):
+    """Ensure GNUPGHOME ownership and permissions are compatible with build user."""
+    import pwd
+    import stat
+
+    os.makedirs(gnupg_home, exist_ok=True)
+    try:
+        pw = pwd.getpwnam(build_user)
+        uid, gid = pw.pw_uid, pw.pw_gid
+    except KeyError:
+        log.warning("build user '%s' not found; skipping GNUPGHOME ownership prep", build_user)
+        return
+
+    for root, dirs, files in os.walk(gnupg_home):
+        try:
+            os.chown(root, uid, gid)
+            os.chmod(root, 0o700)
+        except PermissionError:
+            pass
+        for d in dirs:
+            dpath = os.path.join(root, d)
+            try:
+                os.chown(dpath, uid, gid)
+                os.chmod(dpath, 0o700)
+            except PermissionError:
+                pass
+        for f in files:
+            fpath = os.path.join(root, f)
+            try:
+                st = os.lstat(fpath)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISSOCK(st.st_mode):
+                continue
+            try:
+                os.chown(fpath, uid, gid)
+                os.chmod(fpath, 0o600)
+            except PermissionError:
+                pass
+
+
+def import_pgp_keys(validpgpkeys: list[str], gnupg_home: str, build_user: str = "buildbot") -> list[str]:
+    """Import PGP keys as build user with keyserver fallbacks. Returns missing keys."""
+    if not validpgpkeys:
+        return []
+
+    keyservers = [
+        "hkps://keyserver.ubuntu.com",
+        "hkp://keyserver.ubuntu.com:80",
+        "hkps://keys.openpgp.org",
+    ]
+
+    missing = []
+    for key in validpgpkeys:
+        imported = False
+        last_err = ""
+        for keyserver in keyservers:
+            if os.getuid() == 0:
+                cmd = [
+                    "runuser", "-u", build_user, "--",
+                    "gpg", "--homedir", gnupg_home,
+                    "--keyserver", keyserver,
+                    "--recv-keys", key,
+                ]
+            else:
+                cmd = [
+                    "gpg", "--homedir", gnupg_home,
+                    "--keyserver", keyserver,
+                    "--recv-keys", key,
+                ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+            )
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            if result.returncode == 0 and "No data" not in stderr and "not found" not in stderr.lower():
+                log.info("Imported PGP key %s via %s", key, keyserver)
+                imported = True
+                break
+            last_err = (result.stderr or result.stdout or "").strip()
+        if not imported:
+            log.warning("Failed to import PGP key %s: %s", key, last_err)
+            missing.append(key)
+
+    return missing
+
+
+def _cleanup_build(chroot_dir: str, chroot_names: list[str], pkgbuild_dir: str, pkgname: str,
+                   remove_packages: bool = False):
+    """Remove chroot copies and build artifacts after a build.
+
+    remove_packages=True only on failure — on success the caller still needs
+    the .pkg.tar.zst files for signing and repo-add.
+    """
+    for name in chroot_names:
+        chroot_path = os.path.join(chroot_dir, name)
+        if os.path.isdir(chroot_path):
+            log.debug("[%s] removing chroot copy %s", pkgname, name)
+            shutil.rmtree(chroot_path, ignore_errors=True)
+        lock_path = chroot_path + ".lock"
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+    # Clean source/build artifacts from PKGBUILD dir
+    for subdir in ("src", "pkg"):
+        p = os.path.join(pkgbuild_dir, subdir)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+    # Only remove package files when the build failed (partial/leftover artifacts).
+    # On success, the caller needs them for signing; pre-build cleanup handles
+    # leftovers from any previous run.
+    if remove_packages:
+        for pattern in ("*.pkg.tar.zst", "*.pkg.tar.zst.sig"):
+            for f in Path(pkgbuild_dir).glob(pattern):
+                try:
+                    f.unlink()
+                    log.debug("[%s] removed leftover package file %s", pkgname, f.name)
+                except OSError:
+                    pass
+
+
+def build_package(
+    pkg: dict, pkgbuild_dir: str, config: dict, skippgpcheck: bool = False
+) -> tuple[bool, list[str], str | None]:
+    """
+    Build via makechrootpkg with the pantherlake config.
+    Returns (success, [pkg_file_paths], failure_type).
+    failure_type is None on success, "download" for transient network errors,
+    "timeout" for hung builds, or None for compile failures.
+    On LTO failure, retries once with LTO disabled.
+    skippgpcheck: pass --skippgpcheck to makepkg (source hashes still verified).
+    """
+    import uuid as _uuid
+
+    chroot_name = "build-" + str(_uuid.uuid4())[:8]
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = os.path.join(config["log_dir"], pkg["name"])
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"{timestamp}.log")
+
+    # Clean any leftover package files before building
+    for pattern in ("*.pkg.tar.zst", "*.pkg.tar.zst.sig"):
+        for f in Path(pkgbuild_dir).glob(pattern):
+            try:
+                f.unlink()
+                log.debug("[%s] cleaned leftover package file before build: %s", pkg["name"], f.name)
+            except OSError:
+                pass
+
+    # Use the generated conf if available, otherwise fall back to the named file
+    makepkg_conf = config.get("_makepkg_conf") or os.path.join(
+        config["makepkg_configs_dir"],
+        f"makepkg.{config.get('march', 'pantherlake')}.conf",
+    )
+
+    if skippgpcheck:
+        log.warning("[%s] PGP key import failed — building with --skippgpcheck (source hashes still verified)", pkg["name"])
+
+    def _run_build(conf_path, chroot_id, logpath, skippgp=skippgpcheck):
+        cmd = [
+            "makechrootpkg",
+            "-c",
+            "-U", config.get("build_user", "buildbot"),
+            "-D", config["makepkg_configs_dir"],
+            "-l", chroot_id,
+            "-r", config["chroot_dir"],
+            "--",
+            "--config", conf_path,
+            "-f",
+            "-m",
+            "--noprogressbar",
+        ]
+        if skippgp:
+            cmd.append("--skippgpcheck")
+        env = os.environ.copy()
+        env["GNUPGHOME"] = config["gnupg_home"]
+        # CMake 4.x removed compat with cmake_minimum_required < 3.5.
+        # This env var lets old packages configure without PKGBUILD patches.
+        env["CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
+
+        log.info("[%s] running: %s", pkg["name"], " ".join(cmd))
+
+        pkg_timeouts = config.get("package_timeouts") or {}
+        timeout = pkg_timeouts.get(pkg["name"]) or config.get("build_timeout")
+        with open(logpath, "w") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=pkgbuild_dir,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                proc.communicate(timeout=timeout)
+                return proc.returncode
+            except subprocess.TimeoutExpired:
+                # Kill the entire process group so the container and compiler
+                # inside the chroot die too, not just the makechrootpkg child.
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                lf.write(f"\n=== BUILD TIMED OUT after {timeout}s ===\n")
+                lf.flush()
+                log.error("[%s] build timed out after %ds", pkg["name"], timeout)
+                return -2  # sentinel: timeout
+
+    # Packages known to break under LTO are built with it off from the start,
+    # skipping the doomed first attempt. Only meaningful when LTO is globally on.
+    lto_disabled = (
+        config.get("lto", True)
+        and _in_blacklist(pkg["name"], config.get("lto_blacklist", []))
+    )
+    primary_conf = makepkg_conf
+    if lto_disabled:
+        log.info("[%s] in lto_blacklist — building with LTO disabled", pkg["name"])
+        primary_conf = _write_nolto_conf(makepkg_conf)
+
+    chroots_used = [chroot_name]
+    rc = _run_build(primary_conf, chroot_name, log_file)
+
+    if lto_disabled:
+        try:
+            os.remove(primary_conf)
+        except OSError:
+            pass
+
+    if rc != 0:
+        # Check for LTO errors
+        with open(log_file, "r", errors="replace") as lf:
+            build_output = lf.read()
+
+        # PGP source signature couldn't be checked (key missing/invalid/untrusted)
+        # and import_pgp_keys couldn't fix it. When skip_pgp_on_import_failure is
+        # set, retry once with --skippgpcheck — source hashes are still verified
+        # and the build is signed with buildbot's own key. A genuinely bad
+        # signature or a revoked key (RE_PGP_BADSIG) is never skipped: that is a
+        # tampering/compromise signal, so it stays a hard failure. Must run before
+        # the download check, which would mislabel this as a transient failure.
+        if (not skippgpcheck and config.get("skip_pgp_on_import_failure")
+                and RE_PGP_UNVERIFIABLE.search(build_output)
+                and not RE_PGP_BADSIG.search(build_output)):
+            log.warning("[%s] PGP verification failed; retrying with --skippgpcheck "
+                        "(source hashes still verified)", pkg["name"])
+            retry_conf = _write_nolto_conf(makepkg_conf) if lto_disabled else makepkg_conf
+            timestamp_pgp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_file = os.path.join(log_dir, f"{timestamp_pgp}-skippgp.log")
+            pgp_chroot = chroot_name + "-skippgp"
+            chroots_used.append(pgp_chroot)
+            rc = _run_build(retry_conf, pgp_chroot, log_file, skippgp=True)
+            if lto_disabled:
+                try:
+                    os.remove(retry_conf)
+                except OSError:
+                    pass
+            with open(log_file, "r", errors="replace") as lf:
+                build_output = lf.read()
+
+        # Missing makedep — tier-specific, retrying won't help. Return a typed
+        # error so the daemon can skip this tier and try the next one.
+        dep_match = RE_DEP_NOT_FOUND.search(build_output)
+        if dep_match:
+            missing = dep_match.group(1)
+            log.warning("[%s] missing makedep '%s' — will try next tier", pkg["name"], missing)
+            _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                           remove_packages=True)
+            return False, [], f"dep:{missing}"
+
+        # Missing source file listed in PKGBUILD — also tier-specific.
+        if RE_SOURCE_NOT_FOUND.search(build_output):
+            log.warning("[%s] source file not found in PKGBUILD directory", pkg["name"])
+            _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                           remove_packages=True)
+            return False, [], "missing_source"
+
+        # Check for download failure before LTO retry (download failures are
+        # transient — no point retrying with LTO disabled).
+        if RE_DOWNLOAD_FAILURE.search(build_output):
+            log.warning("[%s] download failure detected (exit %d), see %s", pkg["name"], rc, log_file)
+            _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                           remove_packages=True)
+            return False, [], "download"
+
+        if rc == -2:
+            # Timeout sentinel — don't bother with LTO retry
+            _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                           remove_packages=True)
+            return False, [], "timeout"
+
+        if not lto_disabled and (
+            RE_LD_ERROR.search(build_output) or RE_RUST_LTO_ERROR.search(build_output)
+        ):
+            log.warning(
+                "[%s] LTO error detected, retrying with LTO disabled", pkg["name"]
+            )
+            nolto_conf = _write_nolto_conf(makepkg_conf)
+
+            timestamp2 = datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_file_retry = os.path.join(log_dir, f"{timestamp2}-nolto.log")
+            nolto_chroot = chroot_name + "-nolto"
+            chroots_used.append(nolto_chroot)
+            rc = _run_build(nolto_conf, nolto_chroot, log_file_retry)
+            log_file = log_file_retry
+
+            try:
+                os.remove(nolto_conf)
+            except OSError:
+                pass
+
+        if rc != 0:
+            log.error("[%s] build failed (exit %d), see %s", pkg["name"], rc, log_file)
+            _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                           remove_packages=True)
+            return False, [], None
+
+    # Collect built package files
+    pkg_files = [str(p) for p in Path(pkgbuild_dir).glob("*.pkg.tar.zst")]
+
+    if not pkg_files:
+        log.error("[%s] build succeeded but no .pkg.tar.zst files found", pkg["name"])
+        return False, [], None
+
+    log.info("[%s] build produced %d package(s)", pkg["name"], len(pkg_files))
+
+    # Reject packages containing 0-byte shared libraries or executables before
+    # they can be signed and published. A truncated libxul.so otherwise sails
+    # through as a "success" because makepkg still emits a .pkg.tar.zst.
+    offenders = _validate_package_contents(pkg_files)
+    if offenders:
+        for pkg_base, member in offenders:
+            log.error("[%s] content validation FAILED: 0-byte %s in %s",
+                      pkg["name"], member, pkg_base)
+        _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"],
+                       remove_packages=True)
+        return False, [], None
+
+    # Cleanup chroot copies and build artifacts
+    _cleanup_build(config["chroot_dir"], chroots_used, pkgbuild_dir, pkg["name"])
+
+    return True, pkg_files, None
+
+
+# Suffixes that are legitimately zero bytes, so an empty file carrying one is
+# never a truncated binary. Python namespace markers (__init__.py) and typing
+# markers (py.typed) are the common case; bazel-built wheels ship them 0755,
+# which matched the executable test below and failed protobuf's python
+# subpackage on every build after a successful 8-minute compile.
+_LEGITIMATELY_EMPTY_SUFFIXES = (
+    ".py", ".pyi", ".typed", ".sh", ".txt", ".json", ".cfg", ".conf",
+    ".keep", ".gitkeep", ".placeholder",
+)
+
+
+def _validate_package_contents(pkg_files: list[str]) -> list[tuple[str, str]]:
+    """Detect packages that contain 0-byte shared libraries or executables.
+
+    A build can exit 0 and still emit a .pkg.tar.zst whose libxul.so (or other
+    binary) was truncated to 0 bytes by an interrupted strip/link step. Such a
+    package installs cleanly but the file is unusable ("file too short"). Catch
+    that class before signing/repo-add. Returns a list of (package_basename,
+    member_path) offenders; empty means the packages are OK.
+    """
+    offenders = []
+    for f in pkg_files:
+        try:
+            result = subprocess.run(
+                ["bsdtar", "-tvf", f],
+                capture_output=True, text=True, timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("content validation: listing %s timed out — skipping", f)
+            continue
+        if result.returncode != 0:
+            log.warning("content validation: cannot list %s: %s", f, result.stderr.strip())
+            continue
+        for line in result.stdout.splitlines():
+            # libarchive tvf: "perms links owner group size month day time name"
+            fields = line.split(None, 8)
+            if len(fields) < 9:
+                continue
+            perms, _, _, _, size, _, _, _, name = fields
+            if not perms.startswith("-") or size != "0":
+                continue  # only zero-byte regular files
+            is_lib = name.endswith(".so") or ".so." in name
+            is_exec = (
+                "x" in perms
+                and name.startswith(("usr/bin/", "usr/lib/", "usr/sbin/"))
+                and not name.endswith(_LEGITIMATELY_EMPTY_SUFFIXES)
+            )
+            if is_lib or is_exec:
+                offenders.append((os.path.basename(f), name))
+    return offenders
+
+
+def sign_packages(pkg_files: list[str], gnupg_home: str, build_user: str = "buildbot"):
+    """Detach-sign each .pkg.tar.zst file as the build user."""
+    for f in pkg_files:
+        if os.getuid() == 0:
+            cmd = ["runuser", "-u", build_user, "--",
+                   "gpg", "--homedir", gnupg_home, "--batch", "--detach-sign", f]
+        else:
+            cmd = ["gpg", "--homedir", gnupg_home, "--batch", "--detach-sign", f]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to sign {f}: {result.stderr}")
+        log.info("Signed %s", os.path.basename(f))
+
+
+def upgrade_chroot(chroot_root: str, extra_packages: list[str] = None, timeout: int = 600):
+    """
+    Upgrade the clean chroot and install any extra packages.
+
+    extra_packages: installed with -Sd --overwrite '*' after the main upgrade.
+    For Artix this is ['libelogind', 'libudev', 'elogind']; for Arch it's empty.
+    Common build deps (socat, gperf) are always installed.
+    Returns False if any step times out or critically fails, True otherwise.
+    """
+    log.info("Upgrading chroot at %s", chroot_root)
+    try:
+        result = subprocess.run(
+            ["arch-nspawn", chroot_root, "pacman", "-Syu", "--noconfirm"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            log.warning("Chroot upgrade warnings: %s", result.stderr.strip())
+        else:
+            log.info("Chroot upgrade complete")
+    except subprocess.TimeoutExpired:
+        log.error("Chroot upgrade timed out after %ds — proceeding with existing chroot state", timeout)
+        return False
+
+    if extra_packages:
+        try:
+            result = subprocess.run(
+                [
+                    "arch-nspawn", chroot_root,
+                    "pacman", "-Sd", "--noconfirm", "--overwrite", "*",
+                ] + extra_packages,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if result.returncode != 0:
+                log.warning("Extra package install warnings: %s", result.stderr.strip())
+            else:
+                log.info("Extra packages installed in chroot: %s", " ".join(extra_packages))
+        except subprocess.TimeoutExpired:
+            log.error("Extra package install timed out after %ds — proceeding without them", timeout)
+
+    # Always install common build dependencies
+    try:
+        result = subprocess.run(
+            [
+                "arch-nspawn", chroot_root,
+                "pacman", "-S", "--needed", "--noconfirm",
+                "socat", "gperf",
+            ],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            log.warning("socat/gperf install warnings: %s", result.stderr.strip())
+        else:
+            log.info("socat/gperf installed in chroot")
+    except subprocess.TimeoutExpired:
+        log.error("socat/gperf install timed out after %ds", timeout)
+
+    return True
