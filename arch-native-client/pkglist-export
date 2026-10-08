@@ -16,7 +16,8 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-: "${REMOTE_HOST:?REMOTE_HOST not set in $CONFIG_FILE}"
+# No build server configured (local mode): nothing to sync.
+[[ -n "${REMOTE_HOST:-}" ]] || exit 0
 : "${REMOTE_PATH:?REMOTE_PATH not set in $CONFIG_FILE}"
 
 EXPORT_FILE=$(mktemp /tmp/pkglist-export-XXXXXX.json)

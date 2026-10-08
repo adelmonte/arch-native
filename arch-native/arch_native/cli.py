@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -865,51 +866,97 @@ def cmd_fsck(args, config: dict) -> int:
     return 1 if (dry_run and found) else 0
 
 
+_DEVTOOLS_PACMAN_CONF = "/usr/share/devtools/pacman.conf.d/extra.conf"
+_CACHYOS_KEY = "882DCFE48E2051D48E2562ABF3B607488DB35A47"
+
+
+def _default_chroot_pacman_conf(distro: str) -> str:
+    """The build chroot's pacman.conf when chroot_pacman_conf is unset."""
+    if distro == "artix":
+        candidates = ["/etc/arch-native/chroot-pacman.conf",
+                      "/usr/share/arch-native/chroot-pacman.conf"]
+    else:
+        candidates = ["/etc/arch-native/chroot-pacman.conf", _DEVTOOLS_PACMAN_CONF]
+    return next((c for c in candidates if os.path.isfile(c)), "")
+
+
+def _gpg_cmd(config: dict) -> list[str]:
+    cmd = ["gpg", "--homedir", config["gnupg_home"], "--batch"]
+    if os.getuid() == 0:
+        cmd = ["runuser", "-u", config["build_user"], "--"] + cmd
+    return cmd
+
+
+def _ensure_signing_key(config: dict) -> str:
+    """Create the repo signing key if there is none and export its public half.
+
+    Returns the key fingerprint, or "" if gpg failed.
+    """
+    gpg = _gpg_cmd(config)
+
+    def fingerprint():
+        r = subprocess.run(gpg + ["--list-secret-keys", "--with-colons"],
+                           capture_output=True, text=True)
+        fprs = [l.split(":")[9] for l in r.stdout.splitlines() if l.startswith("fpr:")]
+        return fprs[0] if fprs else ""
+
+    fpr = fingerprint()
+    if fpr:
+        print(f"  skip signing key exists: {fpr}")
+    else:
+        params = ("%no-protection\nKey-Type: EdDSA\nKey-Curve: ed25519\n"
+                  "Name-Real: arch-native\nName-Email: arch-native@localhost\n"
+                  "Expire-Date: 0\n%commit\n")
+        r = subprocess.run(gpg + ["--gen-key"], input=params, capture_output=True, text=True)
+        fpr = fingerprint()
+        if r.returncode != 0 or not fpr:
+            print(f"  error: signing key generation failed: {r.stderr.strip()[:200]}")
+            return ""
+        print(f"  ok  signing key created: {fpr}")
+
+    out = os.path.join(config["repo_dir"], "buildbot-public.asc")
+    r = subprocess.run(gpg + ["--export", "--armor", fpr], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout:
+        with open(out, "w") as f:
+            f.write(r.stdout)
+        print(f"  ok  public key exported: {out}")
+    else:
+        print(f"  warning: could not export the public key: {r.stderr.strip()[:200]}")
+    return fpr
+
+
 def cmd_init(args, config: dict) -> int:
     """
     Bootstrap a new arch-native installation:
       1. Create /var/lib/arch-native directory layout
       2. Create the makechrootpkg chroot with mkarchroot
       3. Initialize the chroot's pacman keyring
-      4. Set up the build user's GPG homedir
+      4. Set up the build user's GPG homedir and signing key
     Safe to re-run — skips steps that are already done.
     """
-    import shutil
-
     chroot_root = config["chroot_root"]
-    chroot_dir  = config["chroot_dir"]
-    repo_dir    = config["repo_dir"]
-    log_dir     = config["log_dir"]
     gnupg_home  = config["gnupg_home"]
     build_user  = config["build_user"]
     distro      = config["distro"]
 
     # 1. Create directory layout
-    for d in [chroot_dir, repo_dir, log_dir, gnupg_home,
+    for d in [config["chroot_dir"], config["repo_dir"], config["log_dir"], gnupg_home,
               config["pkgbuilds_dir"], config["makepkg_configs_dir"],
               os.path.dirname(config["manifest_path"])]:
         os.makedirs(d, exist_ok=True)
         print(f"  dir  {d}")
 
     # 2. Create chroot with mkarchroot if it doesn't exist
+    pacman_conf = config.get("chroot_pacman_conf") or _default_chroot_pacman_conf(distro)
     if os.path.isdir(chroot_root):
         print(f"  skip chroot already exists: {chroot_root}")
     else:
-        pacman_conf = config.get("chroot_pacman_conf", "")
-        if not pacman_conf:
-            for candidate in [
-                "/etc/arch-native/chroot-pacman.conf",
-                "/usr/share/arch-native/chroot-pacman.conf",
-            ]:
-                if os.path.isfile(candidate):
-                    pacman_conf = candidate
-                    break
         if not pacman_conf or not os.path.isfile(pacman_conf):
-            print("error: no chroot pacman.conf found")
-            print("  Set chroot_pacman_conf in buildbot.conf, e.g.:")
-            print("    chroot_pacman_conf = /etc/arch-native/chroot-pacman.conf")
+            print("error: no pacman.conf for the build chroot")
+            print("  set chroot_pacman_conf in /etc/arch-native.conf, e.g.:")
+            print(f"    chroot_pacman_conf = {_DEVTOOLS_PACMAN_CONF}")
             return 1
-        print(f"  creating chroot at {chroot_root} ...")
+        print(f"  creating chroot at {chroot_root} from {pacman_conf} ...")
         result = subprocess.run(
             ["mkarchroot", "-C", pacman_conf, chroot_root, "base-devel"],
             text=True,
@@ -921,48 +968,48 @@ def cmd_init(args, config: dict) -> int:
 
     # 3. Initialize chroot pacman keyring
     print("  initializing chroot pacman keyring ...")
-    CACHYOS_KEY = "882DCFE48E2051D48E2562ABF3B607488DB35A47"
-    for cmd in [
-        ["arch-nspawn", chroot_root, "pacman-key", "--init"],
-        ["arch-nspawn", chroot_root, "pacman-key", "--populate"],
-        ["arch-nspawn", chroot_root, "pacman-key", "--recv-keys", CACHYOS_KEY],
-        ["arch-nspawn", chroot_root, "pacman-key", "--lsign-key", CACHYOS_KEY],
-    ]:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+    keyring_cmds = [["pacman-key", "--init"], ["pacman-key", "--populate"]]
+    chroot_conf = os.path.join(chroot_root, "etc/pacman.conf")
+    try:
+        uses_cachyos = "[cachyos" in open(chroot_conf).read()
+    except OSError:
+        uses_cachyos = False
+    if uses_cachyos:
+        keyring_cmds += [["pacman-key", "--recv-keys", _CACHYOS_KEY],
+                         ["pacman-key", "--lsign-key", _CACHYOS_KEY]]
+    for cmd in keyring_cmds:
+        result = subprocess.run(["arch-nspawn", chroot_root] + cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"  warning: {' '.join(cmd[2:])} returned {result.returncode}")
+            print(f"  warning: {' '.join(cmd)} returned {result.returncode}")
             print(f"    {result.stderr.strip()[:200]}")
         else:
-            print(f"  ok  {' '.join(cmd[2:])}")
+            print(f"  ok  {' '.join(cmd)}")
 
-    # 4. Set up build user GPG homedir
+    # 4. Build user GPG homedir and the repo signing key
     prepare_gnupg_home(gnupg_home, build_user)
     print(f"  gnupg homedir ready: {gnupg_home}")
+    fpr = _ensure_signing_key(config)
 
-    # 5. Artix-specific: deploy artix-meson if distro=artix
+    # 5. Artix-specific: deploy artix-meson
     if distro == "artix":
-        for src_candidate in [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "artix-meson"),
+        for src in [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "artix-meson"),
             "/usr/share/arch-native/artix-meson",
         ]:
-            if os.path.isfile(src_candidate):
+            if os.path.isfile(src):
                 dest = os.path.join(chroot_root, "usr/local/bin/artix-meson")
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
-                shutil.copy2(src_candidate, dest)
+                shutil.copy2(src, dest)
                 os.chmod(dest, 0o755)
                 print("  deployed artix-meson into chroot")
                 break
 
-    print("\narch-native init complete. Next steps:")
-    if distro == "artix":
-        print("  1. Ensure /etc/arch-native.conf has correct paths and march=")
-    else:
-        print("  1. Set chroot_pacman_conf in /etc/arch-native.conf to your pacman.conf")
-        print("     (must include [core] [extra] repos)")
-    print("  2. Import your signing key into the build user's GPG homedir")
-    print(f"     gpg --homedir {gnupg_home} --import /path/to/key.gpg")
-    print("  3. Start the service: sudo systemctl enable --now arch-native")
-    return 0
+    print("\narch-native init complete. Next:")
+    print("  1. Check the blacklist in /etc/arch-native.conf")
+    print("  2. Start the daemon: sudo systemctl enable --now arch-native")
+    print("  3. On each client, add the repo to pacman.conf and trust the key:")
+    print(f"       sudo pacman-key --add buildbot-public.asc && sudo pacman-key --lsign-key {fpr or 'arch-native@localhost'}")
+    return 0 if fpr else 1
 
 
 def run_cli(args, config: dict) -> int:
@@ -1139,8 +1186,8 @@ def main():
         formatter_class=_HelpFormatter,
         description="Initialise a new arch-native installation: create the directory "
                     "layout under /var/lib/arch-native/, build the clean devtools chroot, "
-                    "initialise the pacman keyring, and prepare the GPG home directory.  "
-                    "Generate the signing key manually afterwards (see README).  "
+                    "initialise the pacman keyring, and create the repo signing key "
+                    "(exported to the repo as buildbot-public.asc).  "
                     "Safe to re-run — skips steps already complete.")
 
     p_patch = sub.add_parser("patch",

@@ -1,6 +1,10 @@
 # arch-native-client configuration
 # Copy this file to /etc/arch-native-client.conf and fill in your values.
 
+# Name of the forge repo in pacman.conf (repo_name on the server)
+REPO_NAME="forge"
+
+# Remote mode only — leave REMOTE_HOST unset in local mode.
 # SSH user and host (or IP) of the arch-native build server
 REMOTE_HOST="user@build-server"
 

@@ -85,7 +85,7 @@ If a package is not in the failed list it is force\-queued for a fresh rebuild
 (its
 .I built.json
 entry is cleared first so the daemon does not skip it as already built).
-Requires the service to be stopped first.
+Safe while the daemon is running.
 .TP
 .B \-\-all
 Re\-queue every failed package.
@@ -94,7 +94,7 @@ Re\-queue every failed package.
 Show what would be re\-queued without writing.
 .SS clear \fIPKG\fR [\-\-all] [\-\-dry\-run]
 Remove package(s) from the failed list without re\-queuing them.
-Requires the service to be stopped first.
+Safe while the daemon is running.
 .TP
 .B \-\-all
 Clear the entire failed list.
@@ -114,8 +114,6 @@ writes the queue so the next start picks it up.
 .TP
 .B \-\-reset
 Clear the existing queue first, then rebuild from scratch.
-Stop the service first when using
-.BR \-\-reset .
 .TP
 .B \-\-dry\-run
 Show what would be queued without writing.
@@ -124,15 +122,17 @@ Initialise a new arch\-native installation: create the directory layout
 under
 .IR /var/lib/arch\-native/ ,
 build the clean devtools chroot, initialise the pacman keyring, and
-set up the GPG home directory for the build user.
+create the repo signing key, exporting its public half to
+.IR buildbot\-public.asc
+in the repo directory.
+Without
+.BR chroot_pacman_conf ,
+the chroot uses the bundled Artix config when
+.B distro = artix
+and devtools'
+.I extra.conf
+otherwise.
 Safe to re\-run \(em skips steps already complete.
-After running
-.BR init ,
-generate the signing key manually (see
-.IR /usr/share/doc/arch\-native/README.md
-or the project README for the
-.B gpg \-\-gen\-key
-invocation).
 .SS why \fIPKG\fR
 Explain in plain English why
 .I PKG
@@ -284,9 +284,7 @@ Re\-queue a single failed package (or force\-rebuild any package):
 .PP
 .RS 4
 .EX
-sudo systemctl stop arch\-native
 sudo buildbot retry networkmanager
-sudo systemctl start arch\-native
 .EE
 .RE
 .PP
@@ -294,9 +292,7 @@ Rebuild the pending queue after a large package sync:
 .PP
 .RS 4
 .EX
-sudo systemctl stop arch\-native
 sudo buildbot sync \-\-reset
-sudo systemctl start arch\-native
 .EE
 .RE
 .PP

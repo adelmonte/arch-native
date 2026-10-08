@@ -75,11 +75,11 @@ def load_config(path: str) -> dict:
     cfg["tier_version_select"] = raw_vs
 
     # Mode: local = build on the same machine you run the packages on.
-    # remote = dedicated build server (current/default setup).
-    mode = sec.get("mode", "remote").strip().lower()
+    # remote = dedicated build server.
+    mode = sec.get("mode", "local").strip().lower()
     if mode not in ("local", "remote"):
-        log.warning("Unknown mode '%s', defaulting to 'remote'", mode)
-        mode = "remote"
+        log.warning("Unknown mode '%s', defaulting to 'local'", mode)
+        mode = "local"
     cfg["mode"] = mode
 
     # In local mode default march to native if not explicitly set
@@ -89,10 +89,10 @@ def load_config(path: str) -> dict:
     # Distro: controls Artix-specific chroot fixups.
     # "artix" installs libelogind/elogind/libudev and deploys artix-meson.
     # "arch" skips all of that for a clean Arch chroot.
-    distro = sec.get("distro", "artix").strip().lower()
+    distro = sec.get("distro", "arch").strip().lower()
     if distro not in ("artix", "arch"):
-        log.warning("Unknown distro '%s', defaulting to 'artix'", distro)
-        distro = "artix"
+        log.warning("Unknown distro '%s', defaulting to 'arch'", distro)
+        distro = "arch"
     cfg["distro"] = distro
 
     # chroot_extra_packages: additional packages installed in the chroot each cycle.
@@ -106,8 +106,8 @@ def load_config(path: str) -> dict:
     else:
         cfg["chroot_extra_packages"] = []
 
-    # Path to pacman.conf deployed into the chroot. Defaults to the bundled
-    # Artix-specific config; Arch users should supply their own.
+    # pacman.conf for the build chroot. Empty lets `buildbot init` pick one by
+    # distro: the bundled Artix config, or devtools' extra.conf for Arch.
     cfg["chroot_pacman_conf"] = sec.get("chroot_pacman_conf", "")
 
     repo_priority_str = sec.get("repo_priority", "local,arch")

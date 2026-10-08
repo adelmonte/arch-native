@@ -79,9 +79,6 @@ mode      = local          # or: remote
 march     = native         # remote: your target CPU, e.g. znver4, pantherlake
 distro    = arch           # or: artix
 
-# Arch only: the bundled chroot pacman.conf is set up for Artix + CachyOS.
-chroot_pacman_conf = /usr/share/devtools/pacman.conf.d/extra.conf
-
 blacklist = gcc,glibc,binutils,coreutils,linux-api-headers,
             ttf-*,otf-*,font-*,*-icon-theme,*-cursors,
             linux-firmware,linux-firmware-*,*-keyring,*-bin
@@ -96,23 +93,15 @@ lto_blacklist = llvm,rust
 To find a remote target's `march`, run this on the target machine:
 `gcc -march=native -Q --help=target | grep -m1 march`.
 
-### 2. Initialize and create a signing key
+### 2. Initialize
 
 ```bash
-sudo buildbot init          # data dir, clean build chroot, chroot keyring; safe to re-run
-
-sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg --batch --gen-key <<'EOF'
-%no-protection
-Key-Type: EdDSA
-Key-Curve: ed25519
-Name-Real: arch-native
-Name-Email: arch-native@localhost
-Expire-Date: 0
-EOF
-
-sudo -u buildbot gpg --homedir /var/lib/arch-native/gnupg --export --armor \
-    | sudo tee /var/lib/arch-native/repo/buildbot-public.asc >/dev/null
+sudo buildbot init
 ```
+
+This creates the data directory and the clean build chroot, and generates the
+repo signing key, exporting it to `/var/lib/arch-native/repo/buildbot-public.asc`.
+It is safe to re-run.
 
 ### 3. Remote mode only: serve the repo over HTTP
 
@@ -173,6 +162,7 @@ sudoedit /etc/arch-native-client.conf
 ```
 
 ```bash
+REPO_NAME="forge"
 REMOTE_HOST="user@build-host"
 REMOTE_PATH="/var/lib/arch-native/manifests/client.json"
 # SSH_KEY="/root/.ssh/id_ed25519"     # omit to use the default key
@@ -218,8 +208,8 @@ The first line shows how many of your installed packages forge has built. The
 When the distro releases a newer version, `pacman -Syu` installs it first. Once
 buildbot rebuilds that version, `native-sync` swaps the forge build back in.
 
-If you renamed the repo, pass the name on the sudo line so it isn't stripped:
-`sudo FORGE_REPO=myrepo native-sync`.
+If you renamed the repo, set `REPO_NAME="myrepo"` in
+`/etc/arch-native-client.conf`.
 
 ### Checking on the server
 
@@ -266,17 +256,14 @@ Repo  forge
 
 ### Fixing the queue
 
-`buildbot sync` rescans your packages and starts building immediately, whether
-or not the daemon is running. Every other queue change needs the service
-**stopped**:
+All of these work while the daemon is running:
 
 ```bash
-sudo systemctl stop arch-native
+sudo buildbot sync                   # rescan installed packages and start building now
 sudo buildbot retry firefox          # retry a failed package, or force-rebuild any package
 sudo buildbot retry --all            # retry every failed package (--dry-run to preview)
 sudo buildbot clear firefox          # drop from the failed list without retrying
 sudo buildbot sync --reset           # discard the queue and rebuild it from scratch
-sudo systemctl start arch-native
 ```
 
 Failed packages are retried automatically on a backoff. A package that keeps
@@ -397,8 +384,8 @@ overrides some of these defaults. Inline `# comments` are allowed.
 | Key | Default | Meaning |
 |---|---|---|
 | `repo_name` | `forge` | repo DB name, also used in the `PACKAGER` field |
-| `mode` | `remote` | `local` or `remote` |
-| `distro` | `artix` | `artix` installs elogind/libudev into the chroot and deploys an `artix-meson` wrapper |
+| `mode` | `local` | `local` or `remote` |
+| `distro` | `arch` | `artix` installs elogind/libudev into the chroot and deploys an `artix-meson` wrapper |
 | `build_user` | `buildbot` | unprivileged user that runs builds |
 
 #### Compiler flags
@@ -468,7 +455,7 @@ firefox = 28800
 
 | Key | Default | Meaning |
 |---|---|---|
-| `chroot_pacman_conf` | bundled (Artix + CachyOS) | the build chroot's `pacman.conf` |
+| `chroot_pacman_conf` | by `distro` | the build chroot's `pacman.conf`. `artix`: the bundled Artix + CachyOS config. `arch`: devtools' `extra.conf` |
 | `chroot_extra_packages` | artix: `libelogind,libudev,elogind` | installed into the chroot on every upgrade |
 
 Every path defaults to a location under `/var/lib/arch-native/`. The overridable
@@ -487,7 +474,8 @@ every poll_interval (5 min):
   1. upgrade the clean chroot
   2. diff installed packages against built.json → queue new and changed packages
      queue rebuilds for forge packages that link a soname forge no longer ships
-  3. every upstream_check_interval (1 h): git pull PKGBUILDs, queue upstream bumps
+  3. every upstream_check_interval (1 h), in the background:
+       git pull PKGBUILDs, queue upstream bumps
   4. drain the queue:
        resolve PKGBUILD (local patch → tiers) → parse .SRCINFO → eligibility check
        → import PGP keys → makechrootpkg → sign → repo-add
@@ -566,6 +554,7 @@ would fail checksum verification.
 ├── failed.json           failures with reason, retry count, backoff
 ├── in_progress.json      the current build; re-queued if the daemon dies
 ├── sonames.json          ELF soname cache
+├── daemon.pid            held by the running daemon; the CLI checks it
 ├── metrics.json          last-cycle stats, for Prometheus etc.
 ├── manifests/client.json package list from the client (remote mode)
 ├── chroots/root/         clean base chroot
@@ -611,9 +600,6 @@ error_log=/var/log/arch-native.log
 #!/bin/sh
 exec /usr/bin/buildbot --config /etc/arch-native.conf 2>&1
 ```
-
-`buildbot sync` and the "service must be stopped" checks rely on systemd. With
-another init system, stop the daemon yourself before running `retry` or `clear`.
 
 </details>
 

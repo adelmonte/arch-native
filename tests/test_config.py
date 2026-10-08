@@ -23,3 +23,11 @@ bad = x
     assert c["opt_level"] == "3"
     assert c["package_tier_overrides"] == {"python": ["local", "arch"]}
     assert c["package_timeouts"] == {"firefox": 28800}
+
+
+def test_defaults_match_shipped_config(tmp_path):
+    from arch_native.config import load_config
+    conf = tmp_path / "c.conf"
+    conf.write_text("[arch-native]\n")
+    c = load_config(str(conf))
+    assert (c["mode"], c["distro"], c["chroot_extra_packages"]) == ("local", "arch", [])

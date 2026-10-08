@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # native-sync — Upgrade installed packages where the forge repo has a newer build.
 #
-# Set FORGE_REPO to override the repository name (default: forge).
+# The repository name comes from REPO_NAME in /etc/arch-native-client.conf
+# (default: forge); the FORGE_REPO environment variable overrides it.
 
 set -euo pipefail
 
-FORGE_REPO="${FORGE_REPO:-forge}"
+REPO_NAME=forge
+# shellcheck source=/dev/null
+[[ -f /etc/arch-native-client.conf ]] && source /etc/arch-native-client.conf
+FORGE_REPO="${FORGE_REPO:-$REPO_NAME}"
 FORGE_PACKAGER_TAG="<buildbot@${FORGE_REPO}>"
 
 # Show patch health published by the build server, if available.
