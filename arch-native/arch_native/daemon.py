@@ -18,7 +18,7 @@ from .repo import _prune_cycle, _run_fsck, add_to_repo, stage_packages
 from .resolve import check_upstream_updates, is_eligible, parse_srcinfo, resolve_pkgbuild
 from .soname import _queue_soname_repairs, _resolve_pending_cascades, _soname_provides_from_pkg, sync_index
 from .state import _is_stalled, eligibility_fingerprint, release_stale_ineligible, _queue_lock, _record_failure, _retry_due, acquire_daemon_lock, clear_in_progress, daemon_pid, diff_manifest, get_built_state, inject_always_build, load_failed, load_in_progress, load_pending, prune_stale_queue_entries, save_built_state, save_failed, save_pending, strip_local_pkgrel_bump, update_built_state, write_in_progress, write_metrics
-from .util import _fmt_srcinfo_ver, _git, _sanitize_reason, vercmp
+from .util import _fmt_srcinfo_ver, _git, _pkgname_from_filename, _sanitize_reason, vercmp
 
 log = logging.getLogger("buildbot")
 
@@ -446,7 +446,10 @@ def _publish(pkg: dict, srcinfo: dict, pkg_files: list, config: dict, pgp_skippe
     """Sign a successful build and publish it, or stage it behind a soname cascade."""
     name = pkg["name"]
     new_version = _fmt_srcinfo_ver(srcinfo)
-    all_subpkgs = srcinfo.get("packages", [])
+    # Every package the build produced, -debug included: .SRCINFO doesn't list
+    # those, and an unrecorded package can't be pruned once nobody needs it.
+    all_subpkgs = sorted(set(srcinfo.get("packages", []))
+                         | {_pkgname_from_filename(f) for f in pkg_files})
 
     sign_packages(pkg_files, config["gnupg_home"], config["build_user"])
     log.info("[%s] signed %d package(s)", name, len(pkg_files))

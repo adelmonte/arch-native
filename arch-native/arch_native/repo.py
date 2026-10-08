@@ -85,6 +85,23 @@ def stage_packages(pkg_files: list[str], repo_dir: str) -> list[str]:
     return staged
 
 
+def _delete_own_files(names: list, built: dict, repo_dir: str):
+    """Delete the package files (and signatures) that belong to names.
+
+    Every subpackage of a split build lists the build's full set of files, so
+    ownership is decided by the file name, not the list: removing aom-docs
+    deletes aom-docs-*.pkg.tar.zst and never the aom file beside it.
+    """
+    doomed = set(names)
+    for name in names:
+        for fname in built[name].get("pkg_files", []):
+            if _pkgname_from_filename(fname) not in doomed:
+                continue
+            for path in (os.path.join(repo_dir, fname), os.path.join(repo_dir, fname + ".sig")):
+                if os.path.exists(path):
+                    os.remove(path)
+
+
 def prune_blacklisted_from_repo(
     blacklist: list[str],
     built: dict,
@@ -127,25 +144,7 @@ def prune_blacklisted_from_repo(
     if result.returncode not in (0, 1):
         log.warning("repo-remove returned %d: %s", result.returncode, result.stderr)
 
-    # Split packages share the full pkg_files list across all subpackage entries.
-    # Only delete a file if no non-blacklisted entry still references it — otherwise
-    # removing a blacklisted subpackage (e.g. libudev) would delete the main
-    # package file (udev-*.pkg.tar.zst) that the non-blacklisted udev entry also lists.
-    protected = set()
-    for name in built:
-        if name not in to_remove:
-            for fname in built[name].get("pkg_files", []):
-                protected.add(fname)
-
-    for name in to_remove:
-        pkg_files = built[name].get("pkg_files", [])
-        for fname in pkg_files:
-            if fname in protected:
-                continue
-            for path in [os.path.join(repo_dir, fname),
-                         os.path.join(repo_dir, fname + ".sig")]:
-                if os.path.exists(path):
-                    os.remove(path)
+    _delete_own_files(to_remove, built, repo_dir)
 
     log.info("Removed %d blacklisted package(s) from repo: %s", len(to_remove), ", ".join(to_remove))
     return to_remove
@@ -176,25 +175,7 @@ def prune_uninstalled_from_repo(
     if result.returncode not in (0, 1):
         log.warning("repo-remove returned %d: %s", result.returncode, result.stderr)
 
-    # Split packages share the full pkg_files list across all subpackage entries.
-    # Only delete a file if no installed package still references it — otherwise
-    # removing an uninstalled subpackage (e.g. aom-docs) would delete the main
-    # package file (aom-3.x.pkg.tar.zst) that the installed aom entry also lists.
-    protected = set()
-    for name in built:
-        if name in manifest_names:
-            for fname in built[name].get("pkg_files", []):
-                protected.add(fname)
-
-    for name in to_remove:
-        pkg_files = built[name].get("pkg_files", [])
-        for fname in pkg_files:
-            if fname in protected:
-                continue
-            for path in [os.path.join(repo_dir, fname),
-                         os.path.join(repo_dir, fname + ".sig")]:
-                if os.path.exists(path):
-                    os.remove(path)
+    _delete_own_files(to_remove, built, repo_dir)
 
     log.info("Removed %d uninstalled package(s) from repo: %s", len(to_remove), ", ".join(to_remove))
     return to_remove
