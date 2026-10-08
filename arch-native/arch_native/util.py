@@ -4,6 +4,7 @@ import fnmatch
 import json
 import logging
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -89,6 +90,9 @@ def ignore_special_files(src: str, names: list[str]) -> set[str]:
     return skip
 
 
+_GIT_TIMEOUT = 600
+
+
 def _git(args: list, build_user: str = "buildbot", **kwargs) -> subprocess.CompletedProcess:
     """Run git as build_user when the daemon runs as root.
 
@@ -96,11 +100,28 @@ def _git(args: list, build_user: str = "buildbot", **kwargs) -> subprocess.Compl
     user (safe.directory). Since pkgbuilds/ is owned by buildbot but the
     daemon runs as root, every pull silently fails unless we drop privileges.
     """
-    if os.getuid() == 0:
-        cmd = ["runuser", "-u", build_user, "--", "git"] + args
-    else:
-        cmd = ["git"] + args
-    return subprocess.run(cmd, **kwargs)
+    # A stalled HTTPS transfer otherwise waits out the kernel's TCP
+    # retransmission limit (~15 min); one did, and held up the daemon.
+    git = ["git", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"]
+    cmd = (["runuser", "-u", build_user, "--"] if os.getuid() == 0 else []) + git + args
+    timeout = kwargs.pop("timeout", _GIT_TIMEOUT)
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
+    with subprocess.Popen(cmd, start_new_session=True, **kwargs) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # git runs under runuser; kill its whole session, not just runuser
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            out, err = proc.communicate()
+            log.warning("git %s timed out after %ds", " ".join(args[:3]), timeout)
+            msg = f"timed out after {timeout}s"
+            err = (err or "") + msg if kwargs.get("text") else (err or b"") + msg.encode()
+            return subprocess.CompletedProcess(cmd, 124, out, err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def _pkgname_from_filename(filename: str) -> str:

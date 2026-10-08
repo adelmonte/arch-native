@@ -38,3 +38,15 @@ def test_json_roundtrip_and_corrupt_fallback(tmp_path):
     assert _load_json_file(str(p), {}, "x") == {}
     p.write_text("[1]")
     assert _load_json_file(str(p), {}, "x") == {}
+
+
+def test_git_timeout_kills_the_whole_group():
+    import subprocess
+    import time
+    from arch_native.util import _git
+    start = time.time()
+    r = _git(["-c", "alias.hang=!sleep 31.7", "hang"], capture_output=True, timeout=1)
+    assert r.returncode == 124 and b"timed out" in r.stderr
+    assert time.time() - start < 5
+    assert subprocess.run(["pgrep", "-f", "^sleep 31.7$"], capture_output=True).returncode == 1
+    assert _git(["--version"], capture_output=True, text=True).stdout.startswith("git version")
