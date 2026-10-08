@@ -62,6 +62,7 @@ def test_check_upstream_updates(tiers):
         "tier_sources": SOURCES, "tier_version_select": "priority", "build_user": "buildbot",
         "package_tier_overrides": {"foo": ["local", "arch"]},
         "blacklist": ["ba*"],
+        "chroot_root": os.path.join(tiers, "chroot"), "repo_name": "forge",
     }
     manifest = [{"name": n, "version": "0-1", "repo": "extra"} for n in ("foo", "bar", "same")]
     _pkgbuild(os.path.join(tiers, "arch", "same"), "5.0", "1.1")
@@ -77,3 +78,31 @@ def test_check_upstream_updates(tiers):
     assert check_upstream_updates(manifest, built, config, skip_pulls=True) == []
     built["foo"] = {"version": "2.0-1", "status": "pending_upstream"}
     assert [u["name"] for u in check_upstream_updates(manifest, built, config, skip_pulls=True)] == ["foo"]
+
+
+def _desc_db(path, pkgs):
+    import io
+    import tarfile
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tarfile.open(path, "w:gz") as tf:
+        for name, ver in pkgs:
+            data = f"%NAME%\n{name}\n\n%VERSION%\n{ver}\n".encode()
+            info = tarfile.TarInfo(f"{name}-{ver}/desc")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+
+def test_upstream_waits_for_release(tiers):
+    sync = os.path.join(tiers, "chroot", "var/lib/pacman/sync")
+    _desc_db(os.path.join(sync, "extra.db"), [("foo", "1.5-1"), ("bar", "3.0-1.1")])
+    _desc_db(os.path.join(sync, "forge.db"), [("foo", "9.0-1")])
+    config = {
+        "pkgbuilds_dir": tiers, "repo_priority": ["local", "arch"],
+        "tier_sources": SOURCES, "tier_version_select": "priority", "build_user": "buildbot",
+        "package_tier_overrides": {}, "blacklist": [],
+        "chroot_root": os.path.join(tiers, "chroot"), "repo_name": "forge",
+    }
+    manifest = [{"name": n, "version": "0-1", "repo": "extra"} for n in ("foo", "bar")]
+    built = {"foo": {"version": "1.0-1"}, "bar": {"version": "1.0-1"}}
+    # arch git has foo 2.0 but the repos only released 1.5; bar 3.0 is out
+    assert [u["name"] for u in check_upstream_updates(manifest, built, config, skip_pulls=True)] == ["bar"]

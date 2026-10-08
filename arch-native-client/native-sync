@@ -59,12 +59,19 @@ if [[ ${#forge_versions[@]} -eq 0 ]]; then
     exit 0
 fi
 
+# Packages pinned with IgnorePkg/IgnoreGroup. pacman -S --noconfirm would
+# answer "install anyway?" with yes, so they are filtered out here.
+declare -A ignored
+while read -r pkg; do
+    [[ -n "$pkg" ]] && ignored["$pkg"]=1
+done < <(pacman-conf IgnorePkg 2>/dev/null; pacman-conf IgnoreGroup 2>/dev/null | xargs -r pacman -Sgq 2>/dev/null)
+
 # Collect installed packages that forge has a build for.
 declare -A forge_installed  # pkg → inst_ver
 total_installed=0
 while IFS=' ' read -r pkg inst_ver; do
     (( ++total_installed ))
-    [[ -n "${forge_versions[$pkg]:-}" ]] && forge_installed["$pkg"]="$inst_ver"
+    [[ -n "${forge_versions[$pkg]:-}" && -z "${ignored[$pkg]:-}" ]] && forge_installed["$pkg"]="$inst_ver"
 done < <(pacman -Q 2>/dev/null)
 
 installed_count=${#forge_installed[@]}

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 
+from .pacman import released_versions
 from .state import strip_local_pkgrel_bump
 from .util import _fix_ownership, _git, _in_blacklist, ignore_special_files, vercmp
 
@@ -374,6 +375,11 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
     updates = []
     pkgbuilds_dir = config["pkgbuilds_dir"]
     fetch = "none" if skip_pulls else "pull"
+    # What the distro has actually released, as the build chroot sees it.
+    # Packaging git trees run ahead of the repos (staging, testing), and a
+    # build from there can pin deps the client's repos cannot satisfy yet.
+    released = released_versions(
+        os.path.join(config["chroot_root"], "var/lib/pacman/sync"), config["repo_name"])
 
     for pkg in manifest:
         if should_stop and should_stop():
@@ -428,6 +434,11 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
             continue
 
         if vercmp(normalized_upstream, base_ver) > 0:
+            rel = released.get(name)
+            if rel and vercmp(normalized_upstream, strip_local_pkgrel_bump(rel)) > 0:
+                log.debug("[%s] upstream %s not released yet (repos have %s)",
+                          name, normalized_upstream, rel)
+                continue
             log.info("[%s] upstream update detected: %s -> %s", name, base_ver, normalized_upstream)
             updates.append({**pkg, "build_reason": "update"})
         elif vercmp(upstream_ver, base_ver) > 0:

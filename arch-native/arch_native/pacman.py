@@ -177,3 +177,31 @@ def _installed_names(config: dict):
         return {pkg["name"] for pkg in manifest}
     except (FileNotFoundError, ValueError):
         return None
+
+
+def released_versions(sync_dir: str, exclude: str = "") -> dict[str, str]:
+    """{pkgname: highest version} across the sync DBs in sync_dir, minus one repo."""
+    import tarfile
+    from .util import vercmp
+    versions: dict[str, str] = {}
+    if not os.path.isdir(sync_dir):
+        return versions
+    for fname in os.listdir(sync_dir):
+        if not fname.endswith(".db") or fname[:-3] == exclude:
+            continue
+        try:
+            with tarfile.open(os.path.join(sync_dir, fname)) as tf:
+                for m in tf.getmembers():
+                    if not m.name.endswith("/desc"):
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    content = f.read().decode("utf-8", errors="replace")
+                    name = _parse_desc_field(content, "NAME")
+                    ver = _parse_desc_field(content, "VERSION")
+                    if name and ver and (name not in versions or vercmp(ver, versions[name]) > 0):
+                        versions[name] = ver
+        except Exception as e:
+            log.debug("Error reading sync DB %s: %s", fname, e)
+    return versions
