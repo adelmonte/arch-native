@@ -10,7 +10,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from .pacman import _installed_names
-from .resolve import resolve_pkgbuild
+from .resolve import locate_pkgbuild, upstream_priority
 from .util import ignore_special_files
 
 log = logging.getLogger("buildbot")
@@ -32,6 +32,15 @@ def cmd_patch(args, config: dict) -> int:
     return 2
 
 
+def _locate_upstream(pkgname: str, config: dict, fetch: str = "full") -> tuple[str, str]:
+    """(directory, tier) of the upstream PKGBUILD a patch for pkgname applies to."""
+    return locate_pkgbuild(
+        pkgname, config["pkgbuilds_dir"], upstream_priority(pkgname, config),
+        config["tier_sources"], config.get("tier_version_select", "priority"),
+        fetch, config["build_user"],
+    )
+
+
 def _cmd_patch_create(args, config: dict) -> int:
     """Interactively create a local patch by editing the upstream PKGBUILD."""
     import shutil as _shutil
@@ -49,14 +58,8 @@ def _cmd_patch_create(args, config: dict) -> int:
         print(f"warning: {local_dir} already contains a full PKGBUILD copy.")
         print(f"  after creating the patch, remove the PKGBUILD file to avoid confusion.")
 
-    pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
-    upstream_priority = [t for t in pkg_priority if t != "local"]
     try:
-        upstream_dir, tier = resolve_pkgbuild(
-            pkgname, pkgbuilds_dir, None, upstream_priority,
-            tier_sources=config["tier_sources"],
-            version_select=config.get("tier_version_select", "priority"),
-        )
+        upstream_dir, tier = _locate_upstream(pkgname, config)
     except FileNotFoundError as e:
         print(f"error: {e}")
         return 1
@@ -190,13 +193,7 @@ def _write_patch_header(patch_file: str, pkgver: str, pkgrel: str,
 
 def _upstream_pkgver_for(pkgname: str, config: dict) -> tuple:
     """(pkgver, pkgrel, tier) read statically from the resolved upstream PKGBUILD."""
-    pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
-    upstream_priority = [t for t in pkg_priority if t != "local"]
-    upstream_dir, tier = resolve_pkgbuild(
-        pkgname, config["pkgbuilds_dir"], None, upstream_priority,
-        tier_sources=config["tier_sources"],
-        version_select=config.get("tier_version_select", "priority"),
-    )
+    upstream_dir, tier = _locate_upstream(pkgname, config)
     content = open(os.path.join(upstream_dir, "PKGBUILD")).read()
     pv = re.search(r'^pkgver\s*=\s*(\S+)', content, re.MULTILINE)
     pr = re.search(r'^pkgrel\s*=\s*(\S+)', content, re.MULTILINE)
@@ -270,23 +267,9 @@ def _check_one_patch(pkgname: str, config: dict, installed=None, no_clone: bool 
     if installed is not None and pkgname not in installed:
         return ("orphaned", "not installed", None)
 
-    pkg_priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
-    upstream_priority = [t for t in pkg_priority if t != "local"]
-
-    if no_clone:
-        has_clone = any(
-            os.path.isdir(os.path.join(pkgbuilds_dir, tier, pkgname))
-            for tier in upstream_priority
-        )
-        if not has_clone:
-            return ("not_found", "upstream not cloned", None)
 
     try:
-        upstream_dir, tier = resolve_pkgbuild(
-            pkgname, pkgbuilds_dir, None, upstream_priority,
-            tier_sources=config["tier_sources"],
-            version_select=config.get("tier_version_select", "priority"),
-        )
+        upstream_dir, tier = _locate_upstream(pkgname, config, "none" if no_clone else "full")
     except FileNotFoundError:
         return ("not_found", "upstream not found", None)
 
@@ -444,6 +427,9 @@ def _cmd_patch_check(args, config: dict) -> int:
             any_failed = True
         elif status == "orphaned":
             print(f"  {pkgname:<28} orphaned  ({detail})")
+            any_failed = True
+        elif status == "obsolete":
+            print(f"  {pkgname:<28} obsolete  ({detail})")
             any_failed = True
         elif status == "not_found":
             print(f"  {pkgname:<28} upstream not found")

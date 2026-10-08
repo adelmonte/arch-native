@@ -320,7 +320,8 @@ def _refresh_queue(config: dict, manifest: list, pkgbase_map: dict):
 def _start_upstream_check(config: dict, manifest: list, results: _thread_queue.Queue):
     """Kick off the upstream PKGBUILD check in a thread. Returns (thread, built snapshot)."""
     # Monorepos are pulled here in the main thread, before the build loop, so
-    # no build reads a tree mid-pull.
+    # no build reads a tree mid-pull. Per-package checkouts are pulled by the
+    # thread under resolve.git_lock.
     try:
         for tier, src in config["tier_sources"].items():
             if src["type"] != "monorepo":
@@ -346,8 +347,7 @@ def _start_upstream_check(config: dict, manifest: list, results: _thread_queue.Q
     def worker():
         try:
             results.put(check_upstream_updates(thread_manifest, snapshot, config,
-                                               should_stop=lambda: shutdown_flag,
-                                               skip_pulls=True))
+                                               should_stop=lambda: shutdown_flag))
         except Exception as exc:
             log.error("Upstream check thread error: %s", exc)
             results.put([])

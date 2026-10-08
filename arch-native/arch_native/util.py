@@ -63,16 +63,15 @@ def _parse_desc_field(content: str, field: str) -> str | None:
     return None
 
 
-def _fix_ownership(path: str):
-    """Ensure buildbot user owns the resolved PKGBUILD directory."""
+def _fix_ownership(path: str, user: str = "buildbot"):
+    """Ensure the build user owns the resolved PKGBUILD directory."""
     try:
         import pwd
-        buildbot_uid = pwd.getpwnam("buildbot").pw_uid
-        buildbot_gid = pwd.getpwnam("buildbot").pw_gid
+        pw = pwd.getpwnam(user)
         for root, dirs, files in os.walk(path):
-            os.chown(root, buildbot_uid, buildbot_gid)
+            os.chown(root, pw.pw_uid, pw.pw_gid)
             for f in files:
-                os.chown(os.path.join(root, f), buildbot_uid, buildbot_gid)
+                os.chown(os.path.join(root, f), pw.pw_uid, pw.pw_gid)
     except (KeyError, PermissionError):
         pass
 

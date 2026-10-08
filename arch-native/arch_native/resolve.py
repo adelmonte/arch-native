@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 
 from .state import strip_local_pkgrel_bump
 from .util import _fix_ownership, _git, _in_blacklist, ignore_special_files, vercmp
@@ -12,7 +13,8 @@ from .util import _fix_ownership, _git, _in_blacklist, ignore_special_files, ver
 log = logging.getLogger("buildbot")
 
 
-def _apply_local_patch(pkgname: str, patch_file: str, upstream_dir: str, local_dir: str) -> str:
+def _apply_local_patch(pkgname: str, patch_file: str, upstream_dir: str, local_dir: str,
+                       build_user: str = "buildbot") -> str:
     """
     Copy upstream_dir to local_dir/_patched/, apply patch_file with patch -p1.
     Raises RuntimeError if the patch does not apply cleanly — this is intentional:
@@ -40,7 +42,7 @@ def _apply_local_patch(pkgname: str, patch_file: str, upstream_dir: str, local_d
         ["patch", "-p1", "--input", patch_file],
         check=True, capture_output=True, cwd=work_dir,
     )
-    _fix_ownership(work_dir)
+    _fix_ownership(work_dir, build_user)
     log.info("[%s] applied local patch from %s", pkgname, os.path.basename(patch_file))
     return work_dir
 
@@ -83,6 +85,125 @@ _DEFAULT_TIER_SOURCES: dict = {
     "arch":    {"type": "pkgctl"},
 }
 
+_PKGCTL_URL = "https://gitlab.archlinux.org/archlinux/packaging/packages/{pkgname}.git"
+
+# Serializes clones and pulls between the build loop and the upstream-check
+# thread, which otherwise race on the same per-package checkouts.
+git_lock = threading.Lock()
+
+_monorepo_cache: dict = {}
+
+
+def _monorepo_dirs(tier_base: str) -> dict:
+    """{dirname: path} of every PKGBUILD directory in a monorepo checkout.
+
+    Walking a large monorepo once per package dominated the upstream check, so
+    the walk is cached until git next touches the checkout.
+    """
+    try:
+        stamp = os.stat(os.path.join(tier_base, ".git", "index")).st_mtime
+    except OSError:
+        stamp = None
+    cached = _monorepo_cache.get(tier_base)
+    if stamp is not None and cached and cached[0] == stamp:
+        return cached[1]
+    dirs = {}
+    for root, subdirs, files in os.walk(tier_base):
+        subdirs[:] = [d for d in subdirs if d != ".git"]
+        if "PKGBUILD" in files:
+            dirs.setdefault(os.path.basename(root), root)
+    _monorepo_cache[tier_base] = (stamp, dirs)
+    return dirs
+
+
+def _tier_dir(pkgname: str, tier: str, src: dict, pkgbuilds_dir: str,
+              fetch: str, build_user: str) -> str | None:
+    """The directory holding pkgname's PKGBUILD in one non-local tier, or None.
+
+    fetch controls the network:
+      "full" — clone a missing checkout and pull an existing one (builds)
+      "pull" — pull existing checkouts only (the hourly upstream check, which
+               must not try a clone of every package from every tier)
+      "none" — read what is on disk (status and reporting)
+    """
+    tier_base = os.path.join(pkgbuilds_dir, tier)
+    if src["type"] == "monorepo":
+        return _monorepo_dirs(tier_base).get(pkgname)
+
+    pkg_dir = os.path.join(tier_base, pkgname)
+    url = (src["url"] if src["type"] == "clone" else _PKGCTL_URL).format(pkgname=pkgname)
+    if fetch != "none":
+        with git_lock:
+            if not os.path.isdir(pkg_dir):
+                if fetch == "full":
+                    os.makedirs(tier_base, exist_ok=True)
+                    r = _git(["clone", "--depth=1", url, pkg_dir], build_user, capture_output=True)
+                    if r.returncode != 0:
+                        log.debug("[%s] %s: not in this tier (clone failed)", pkgname, tier)
+            else:
+                _git(["-C", pkg_dir, "checkout", "--", "PKGBUILD"], build_user, capture_output=True)
+                r = _git(["-C", pkg_dir, "pull", "--ff-only"], build_user, capture_output=True)
+                if r.returncode != 0:
+                    log.debug("[%s] %s pull failed: %s", pkgname, tier,
+                              r.stderr.decode(errors="replace").strip()[:120])
+    for subdir in ("", "trunk"):
+        candidate = os.path.join(pkg_dir, subdir) if subdir else pkg_dir
+        if os.path.isfile(os.path.join(candidate, "PKGBUILD")):
+            return candidate
+    return None
+
+
+def locate_pkgbuild(
+    pkgname: str,
+    pkgbuilds_dir: str,
+    priority: list[str],
+    tier_sources: dict,
+    version_select: str = "priority",
+    fetch: str = "full",
+    build_user: str = "buildbot",
+) -> tuple[str, str]:
+    """(directory, tier) of pkgname's upstream PKGBUILD. "local" is ignored here.
+
+    version_select:
+      "priority" — first tier in priority that has the package wins
+      "highest"  — every tier is checked and the highest pkgver wins
+    Raises FileNotFoundError when no tier has it.
+    """
+    candidates: list[tuple[str, str]] = []
+    for tier in priority:
+        src = tier_sources.get(tier)
+        if tier == "local" or src is None:
+            continue
+        found = _tier_dir(pkgname, tier, src, pkgbuilds_dir, fetch, build_user)
+        if not found:
+            log.debug("[%s] %s: no PKGBUILD found in this tier", pkgname, tier)
+            continue
+        candidates.append((found, tier))
+        if version_select == "priority":
+            break
+
+    if not candidates:
+        raise FileNotFoundError(f"No PKGBUILD found for {pkgname} in enabled tiers: {priority}")
+
+    best_dir, best_tier = candidates[0]
+    best_ver = _quick_pkgver(best_dir)
+    for pkgbuild_dir, tier in candidates[1:]:
+        ver = _quick_pkgver(pkgbuild_dir)
+        if ver and (not best_ver or vercmp(ver, best_ver) > 0):
+            best_dir, best_tier, best_ver = pkgbuild_dir, tier, ver
+    if best_tier != candidates[0][1]:
+        log.info("[%s] resolved PKGBUILD from tier: %s (pkgver %s > %s from %s)",
+                 pkgname, best_tier, best_ver, _quick_pkgver(candidates[0][0]), candidates[0][1])
+    else:
+        log.info("[%s] resolved PKGBUILD from tier: %s", pkgname, best_tier)
+    return best_dir, best_tier
+
+
+def upstream_priority(pkgname: str, config: dict) -> list[str]:
+    """The non-local tiers to take pkgname's upstream PKGBUILD from."""
+    priority = config["package_tier_overrides"].get(pkgname) or config["repo_priority"]
+    return [t for t in priority if t != "local"]
+
 
 def resolve_pkgbuild(
     pkgname: str,
@@ -93,64 +214,35 @@ def resolve_pkgbuild(
     tier_sources: dict = None,
     version_select: str = "priority",
     build_user: str = "buildbot",
+    fetch: str = "full",
 ) -> tuple[str, str]:
     """
-    Resolve a PKGBUILD from configured tier priority.
-
-    tier_sources maps tier name → source dict:
-      {"type": "clone",   "url": "https://host/{pkgname}.git"}
-      {"type": "monorepo"}   — walks pkgbuilds/<tier>/ directory tree
-      {"type": "pkgctl"}     — uses Arch devtools pkgctl
-    Falls back to _DEFAULT_TIER_SOURCES when tier_sources is None.
-
-    version_select controls how multiple matching tiers are resolved:
-      "priority" — first tier in repo_priority wins (safe default)
-      "highest"  — all tiers are checked; the one with the highest pkgver wins
+    Resolve the PKGBUILD to build pkgname from: a local patch applied over
+    upstream, a full local PKGBUILD, or the first upstream tier that has it.
+    Falls back to the pkgbase for split packages.
     """
     sources = tier_sources if tier_sources is not None else _DEFAULT_TIER_SOURCES
     known = {"local"} | set(sources)
-
-    if repo_priority:
-        priority = [t for t in repo_priority if t in known]
-        if not priority:
-            priority = ["local"] + list(sources)
-    else:
-        priority = ["local"] + list(sources)
-
-    def _try_pkgbase_fallback() -> tuple[str, str] | None:
-        if _tried_pkgbase or not pkgbase_map or pkgname not in pkgbase_map:
-            return None
-        pkgbase = pkgbase_map[pkgname]
-        if not pkgbase or pkgbase == pkgname:
-            return None
-        log.info("[%s] pkgname not found, trying pkgbase: %s", pkgname, pkgbase)
-        try:
-            return resolve_pkgbuild(pkgbase, pkgbuilds_dir, pkgbase_map, priority, True, tier_sources, version_select, build_user)
-        except FileNotFoundError:
-            return None
+    priority = [t for t in (repo_priority or []) if t in known] or ["local"] + list(sources)
 
     # Local tier always wins immediately if present.
     if "local" in priority:
         local = os.path.join(pkgbuilds_dir, "local", pkgname)
         patch_file = os.path.join(local, f"{pkgname}.patch")
-        pkgbuild_file = os.path.join(local, "PKGBUILD")
-
         if os.path.isfile(patch_file):
-            upstream_priority = [t for t in priority if t != "local"]
+            upstream = [t for t in priority if t != "local"]
             try:
                 upstream_dir, _ = resolve_pkgbuild(
-                    pkgname, pkgbuilds_dir, pkgbase_map, upstream_priority,
-                    _tried_pkgbase, tier_sources, version_select, build_user,
+                    pkgname, pkgbuilds_dir, pkgbase_map, upstream,
+                    _tried_pkgbase, tier_sources, version_select, build_user, fetch,
                 )
             except FileNotFoundError:
                 raise FileNotFoundError(
                     f"[{pkgname}] local patch exists but no upstream PKGBUILD "
-                    f"found in tiers: {upstream_priority}"
+                    f"found in tiers: {upstream}"
                 )
-            patched_dir = _apply_local_patch(pkgname, patch_file, upstream_dir, local)
-            return patched_dir, "local"
-
-        elif os.path.isfile(pkgbuild_file):
+            return _apply_local_patch(pkgname, patch_file, upstream_dir, local, build_user), "local"
+        if os.path.isfile(os.path.join(local, "PKGBUILD")):
             log.warning(
                 "[%s] local/ contains a full PKGBUILD copy — consider converting to a "
                 ".patch file (buildbot patch create %s). Full copies go stale silently.",
@@ -159,106 +251,19 @@ def resolve_pkgbuild(
             log.info("[%s] resolved PKGBUILD from tier: local (full copy)", pkgname)
             return local, "local"
 
-    # Collect candidates from all non-local tiers, then return the one with
-    # the highest pkgver so a stale tier doesn't shadow a newer one.
-    candidates: list[tuple[str, str]] = []  # (pkgbuild_dir, tier)
-
-    for tier in priority:
-        if tier == "local":
-            continue
-        src = sources.get(tier)
-        if src is None:
-            continue
-        kind = src["type"]
-
-        candidates_before = len(candidates)
-
-        if kind == "clone":
-            tier_dir = os.path.join(pkgbuilds_dir, tier, pkgname)
-            if not os.path.isdir(tier_dir):
-                url = src["url"].format(pkgname=pkgname)
-                log.debug("[%s] attempting %s clone: %s", pkgname, tier, url)
-                result = _git(["clone", "--depth=1", url, tier_dir],
-                              capture_output=True, text=True)
-                if result.returncode != 0:
-                    log.debug("[%s] %s: not in this tier (clone failed)", pkgname, tier)
-            else:
-                r = _git(["-C", tier_dir, "pull", "--ff-only"], capture_output=True)
-                if r.returncode != 0:
-                    log.debug("[%s] %s pull failed: %s", pkgname, tier,
-                              r.stderr.decode(errors="replace").strip()[:120])
-            for subdir in ("", "trunk"):
-                candidate = (os.path.join(tier_dir, subdir, "PKGBUILD") if subdir
-                             else os.path.join(tier_dir, "PKGBUILD"))
-                if os.path.isfile(candidate):
-                    resolved = os.path.dirname(candidate)
-                    _fix_ownership(resolved)
-                    candidates.append((resolved, tier))
-                    break
-
-        elif kind == "monorepo":
-            monorepo_dir = os.path.join(pkgbuilds_dir, tier)
-            for root, dirs, files in os.walk(monorepo_dir):
-                dirs[:] = [d for d in dirs if d != ".git"]
-                if os.path.basename(root) == pkgname and "PKGBUILD" in files:
-                    _fix_ownership(root)
-                    candidates.append((root, tier))
-                    break
-
-        elif kind == "pkgctl":
-            tier_root = os.path.join(pkgbuilds_dir, tier)
-            tier_dir = os.path.join(tier_root, pkgname)
-            if not os.path.isdir(tier_dir):
-                log.debug("[%s] fetching via pkgctl repo clone", pkgname)
-                os.makedirs(tier_root, exist_ok=True)
-                result = _git(["clone", "--depth=1",
-                               f"https://gitlab.archlinux.org/archlinux/packaging/packages/{pkgname}.git",
-                               tier_dir],
-                              capture_output=True, text=True)
-                if result.returncode != 0:
-                    log.debug("[%s] %s: not found via pkgctl (clone failed)", pkgname, tier)
-            else:
-                r = _git(["-C", tier_dir, "pull", "--ff-only"], capture_output=True)
-                if r.returncode != 0:
-                    log.debug("[%s] arch pull failed: %s", pkgname,
-                              r.stderr.decode(errors="replace").strip()[:120])
-            if os.path.isfile(os.path.join(tier_dir, "PKGBUILD")):
-                _fix_ownership(tier_dir)
-                candidates.append((tier_dir, tier))
-
-        if len(candidates) == candidates_before:
-            log.debug("[%s] %s: no PKGBUILD found in this tier", pkgname, tier)
-
-        if candidates and version_select == "priority":
-            break  # first tier match wins
-
-    if not candidates:
-        fallback_result = _try_pkgbase_fallback()
-        if fallback_result is not None:
-            return fallback_result
-        raise FileNotFoundError(f"No PKGBUILD found for {pkgname} in enabled tiers: {priority}")
-
-    if len(candidates) == 1:
-        pkgbuild_dir, tier = candidates[0]
-        log.info("[%s] resolved PKGBUILD from tier: %s", pkgname, tier)
-        return pkgbuild_dir, tier
-
-    # Multiple candidates — pick the one with the highest pkgver.
-    best_dir, best_tier = candidates[0]
-    best_ver = _quick_pkgver(best_dir)
-    for pkgbuild_dir, tier in candidates[1:]:
-        ver = _quick_pkgver(pkgbuild_dir)
-        if ver and (not best_ver or vercmp(ver, best_ver) > 0):
-            best_dir, best_tier = pkgbuild_dir, tier
-            best_ver = ver
-    if best_tier != candidates[0][1]:
-        log.info(
-            "[%s] resolved PKGBUILD from tier: %s (pkgver %s > %s from %s)",
-            pkgname, best_tier, best_ver, _quick_pkgver(candidates[0][0]), candidates[0][1],
-        )
-    else:
-        log.info("[%s] resolved PKGBUILD from tier: %s", pkgname, best_tier)
-    return best_dir, best_tier
+    try:
+        found, tier = locate_pkgbuild(pkgname, pkgbuilds_dir, priority, sources,
+                                      version_select, fetch, build_user)
+    except FileNotFoundError:
+        pkgbase = (pkgbase_map or {}).get(pkgname)
+        if _tried_pkgbase or not pkgbase or pkgbase == pkgname:
+            raise
+        log.info("[%s] pkgname not found, trying pkgbase: %s", pkgname, pkgbase)
+        return resolve_pkgbuild(pkgbase, pkgbuilds_dir, pkgbase_map, priority, True,
+                                tier_sources, version_select, build_user, fetch)
+    if fetch != "none":
+        _fix_ownership(found, build_user)
+    return found, tier
 
 
 def parse_srcinfo(pkgbuild_dir: str, build_user: str = "buildbot") -> dict:
@@ -366,145 +371,65 @@ def check_upstream_updates(manifest, built, config, should_stop=None, skip_pulls
     received during the upstream check can interrupt it cleanly.
     """
     updates = []
-    default_priority = config.get("repo_priority", ["local", "arch"])
-    tier_overrides = config.get("package_tier_overrides", {})
-    tier_sources = config.get("tier_sources", {})
     pkgbuilds_dir = config["pkgbuilds_dir"]
+    fetch = "none" if skip_pulls else "pull"
 
-    blacklist = config.get("blacklist", [])
     for pkg in manifest:
         if should_stop and should_stop():
             log.info("Upstream check interrupted by shutdown signal")
             break
         name = pkg["name"]
-        if pkg.get("repo") == "unknown":
+        if pkg.get("repo") == "unknown" or name not in built:
             continue
-        if name in blacklist:
+        if _in_blacklist(name, config.get("blacklist", [])):
             continue
-        if name not in built:
+        # Staged behind a soname cascade: _resolve_pending_cascades owns these
+        if built[name].get("status") == "pending_world_cascade":
             continue
 
-        built_ver = built[name]["version"]
-        ver_parts = built_ver.rsplit("-", 1)
-        if len(ver_parts) == 2 and "." in ver_parts[1]:
-            base_ver = ver_parts[0] + "-" + ver_parts[1].split(".")[0]
+        base_ver = strip_local_pkgrel_bump(built[name]["version"])
+
+        # Same tier selection as the build: a full local copy, otherwise the
+        # upstream a patch (if any) applies to, honoring per-package overrides.
+        local_dir = os.path.join(pkgbuilds_dir, "local", name)
+        priority = config["package_tier_overrides"].get(name) or config["repo_priority"]
+        best_dir = None
+        if ("local" in priority
+                and os.path.isfile(os.path.join(local_dir, "PKGBUILD"))
+                and not os.path.isfile(os.path.join(local_dir, f"{name}.patch"))):
+            best_dir = local_dir
         else:
-            base_ver = built_ver
-
-        # Honor per-package tier overrides, exactly like the build path does.
-        # Otherwise the upstream check can flag an "update" from a tier the build
-        # is configured to skip (e.g. python is pinned to arch because the CachyOS
-        # PKGBUILD needs a blacklisted dep) — producing an endless rebuild loop.
-        repo_priority = tier_overrides.get(name) or default_priority
-
-        version_select = config.get("tier_version_select", "priority")
-        best_dir = best_tier = None
-        best_quick_ver = ""
-
-        for tier in repo_priority:
-            if tier == "local":
-                local_dir = os.path.join(pkgbuilds_dir, "local", name)
-                if os.path.isfile(os.path.join(local_dir, "PKGBUILD")):
-                    best_dir, best_tier = local_dir, "local"
-                    break  # local always wins
+            try:
+                best_dir, _ = locate_pkgbuild(
+                    name, pkgbuilds_dir, upstream_priority(name, config),
+                    config.get("tier_sources", {}),
+                    config.get("tier_version_select", "priority"),
+                    fetch, config["build_user"],
+                )
+            except FileNotFoundError:
                 continue
 
-            src = tier_sources.get(tier)
-            if src is None:
-                continue
-            kind = src["type"]
-            tier_base = os.path.join(pkgbuilds_dir, tier)
-            tier_dir = None
+        # A static read of pkgver/pkgrel/epoch: makepkg --printsrcinfo costs
+        # ~0.5 s/pkg, minutes across a full manifest. VCS packages (pkgver()
+        # function) read as "" and are skipped.
+        upstream_ver = _quick_pkgver(best_dir)
+        if not upstream_ver or "$" in upstream_ver or "{" in upstream_ver:
+            continue
+        normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
 
-            if kind == "clone":
-                pkg_dir = os.path.join(tier_base, name)
-                if os.path.isdir(pkg_dir) and not skip_pulls:
-                    _git(["-C", pkg_dir, "checkout", "--", "PKGBUILD"],
-                         config["build_user"], capture_output=True)
-                    r = _git(["-C", pkg_dir, "pull", "--ff-only"],
-                             config["build_user"], capture_output=True)
-                    if r.returncode != 0:
-                        log.debug("[%s] %s pull failed: %s", name, tier,
-                                  r.stderr.decode(errors="replace").strip()[:120])
-                for subdir in ("", "trunk"):
-                    candidate = (os.path.join(pkg_dir, subdir, "PKGBUILD") if subdir
-                                 else os.path.join(pkg_dir, "PKGBUILD"))
-                    if os.path.isfile(candidate):
-                        tier_dir = os.path.dirname(candidate)
-                        break
-
-            elif kind == "monorepo":
-                for root, dirs, files in os.walk(tier_base):
-                    dirs[:] = [d for d in dirs if d != ".git"]
-                    if os.path.basename(root) == name and "PKGBUILD" in files:
-                        tier_dir = root
-                        break
-
-            elif kind == "pkgctl":
-                pkg_dir = os.path.join(tier_base, name)
-                if not skip_pulls:
-                    if not os.path.isdir(pkg_dir):
-                        # Create clone on demand so version checks aren't permanently blind
-                        # to packages whose initial build used a different tier (e.g. artix).
-                        url = f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git"
-                        r = _git(["clone", "--depth=1", url, pkg_dir],
-                                 config["build_user"], capture_output=True)
-                        if r.returncode != 0:
-                            log.debug("[%s] arch clone failed: %s", name,
-                                      r.stderr.decode(errors="replace").strip()[:120])
-                    if os.path.isdir(pkg_dir):
-                        _git(["-C", pkg_dir, "checkout", "--", "PKGBUILD"],
-                             config["build_user"], capture_output=True)
-                        r = _git(["-C", pkg_dir, "pull", "--ff-only"],
-                                 config["build_user"], capture_output=True)
-                        if r.returncode != 0:
-                            log.debug("[%s] arch pull failed: %s", name,
-                                      r.stderr.decode(errors="replace").strip()[:120])
-                if os.path.isdir(pkg_dir) and os.path.isfile(os.path.join(pkg_dir, "PKGBUILD")):
-                    tier_dir = pkg_dir
-
-            if tier_dir:
-                if version_select == "priority":
-                    best_dir, best_tier = tier_dir, tier
-                    break  # first tier match wins
-                ver = _quick_pkgver(tier_dir)
-                if ver and (not best_quick_ver or vercmp(ver, best_quick_ver) > 0):
-                    best_dir, best_tier, best_quick_ver = tier_dir, tier, ver
-
-        # Cheap version read — just grep pkgver/pkgrel/epoch from the PKGBUILD.
-        # parse_srcinfo (runs makepkg --printsrcinfo per package) would be more
-        # accurate for complex expressions, but costs ~0.5 s/pkg × 800 pkgs ≈ 7 min.
-        # _quick_pkgver reads the file directly in <1 ms and is accurate for the
-        # static literal assignments used in almost all PKGBUILDs.  VCS packages
-        # (pkgver() function) return "" and are silently skipped.
-        upstream_ver = None
-        if best_dir:
-            upstream_ver = _quick_pkgver(best_dir) or None
-            # Reject bash variable placeholders ($var / ${var}) that _quick_pkgver
-            # might capture from unusual PKGBUILDs.
-            if upstream_ver and ("$" in upstream_ver or "{" in upstream_ver):
-                upstream_ver = None
-
-        if upstream_ver:
-            normalized_upstream = strip_local_pkgrel_bump(upstream_ver)
-
-            # Packages staged but awaiting world cascade: handled by _resolve_pending_cascades.
-            if built[name].get("status") == "pending_world_cascade":
-                continue
-
-            # Packages deferred because PKGBUILD was stale: rebuild once it catches up.
-            # Use >= so we trigger when PKGBUILD reaches the installed version, not only
-            # when it exceeds it (the normal > check would never fire in that case).
-            if built[name].get("status") == "pending_upstream":
-                if vercmp(normalized_upstream, base_ver) >= 0:
-                    log.info("[%s] PKGBUILD caught up (%s >= installed %s) — queuing rebuild", name, normalized_upstream, base_ver)
-                    updates.append({**pkg, "build_reason": "update"})
-                continue
-
-            if vercmp(upstream_ver, base_ver) > 0 and vercmp(normalized_upstream, base_ver) == 0:
-                log.debug("[%s] ignoring local pkgrel bump in source tree: %s", name, upstream_ver)
-            elif vercmp(normalized_upstream, base_ver) > 0:
-                log.info("[%s] upstream update detected: %s -> %s", name, base_ver, normalized_upstream)
+        # Deferred because the PKGBUILD was older than installed: rebuild once
+        # it reaches the installed version, not only once it passes it.
+        if built[name].get("status") == "pending_upstream":
+            if vercmp(normalized_upstream, base_ver) >= 0:
+                log.info("[%s] PKGBUILD caught up (%s >= installed %s) — queuing rebuild",
+                         name, normalized_upstream, base_ver)
                 updates.append({**pkg, "build_reason": "update"})
+            continue
+
+        if vercmp(normalized_upstream, base_ver) > 0:
+            log.info("[%s] upstream update detected: %s -> %s", name, base_ver, normalized_upstream)
+            updates.append({**pkg, "build_reason": "update"})
+        elif vercmp(upstream_ver, base_ver) > 0:
+            log.debug("[%s] ignoring local pkgrel bump in source tree: %s", name, upstream_ver)
 
     return updates

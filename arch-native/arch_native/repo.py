@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .pacman import _read_forge_db
+from .resolve import git_lock
 from .state import _DEFERRED_STATUSES, get_built_state, save_built_state
 from .util import _in_blacklist, _pkgname_from_filename, _ver_from_pkg_path, vercmp
 
@@ -462,6 +463,7 @@ def _prune_cycle(config: dict, manifest: list, manifest_names: set, built: dict)
             save_built_state(config["state_path"], built)
 
     if config.get("autoprune_pkgbuild_clones", True) and config.get("tier_sources"):
-        prune_stale_pkgbuild_clones(config["pkgbuilds_dir"], config["tier_sources"], manifest_names)
+        with git_lock:
+            prune_stale_pkgbuild_clones(config["pkgbuilds_dir"], config["tier_sources"], manifest_names)
 
     return built
